@@ -1,5 +1,7 @@
 //! Per-frame vision output.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{PointF, RectF};
@@ -40,8 +42,9 @@ pub struct HeadPose {
     pub confidence: f32,
 }
 
-/// One tracked face in one frame. Coordinates are normalised 0..1.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One tracked face in one frame. Coordinates are normalised 0..1. `Debug` redacts the
+/// embedding (a biometric template, NFR-PRIV-003) so `?report` logs never carry it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackObs {
     pub id: TrackId,
     pub bbox: RectF,
@@ -54,6 +57,45 @@ pub struct TrackObs {
     pub face_width_px: f32,
     pub age_ms: u64,
     pub embedding: Option<Vec<f32>>,
+}
+
+/// Stands in for an embedding in `Debug` output.
+struct Redacted(usize);
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} floats redacted>", self.0)
+    }
+}
+
+impl fmt::Debug for TrackObs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so a new field cannot be left out of the output by accident.
+        let TrackObs {
+            id,
+            bbox,
+            landmarks5,
+            det_score,
+            identity,
+            liveness,
+            head_pose,
+            face_width_px,
+            age_ms,
+            embedding,
+        } = self;
+        f.debug_struct("TrackObs")
+            .field("id", id)
+            .field("bbox", bbox)
+            .field("landmarks5", landmarks5)
+            .field("det_score", det_score)
+            .field("identity", identity)
+            .field("liveness", liveness)
+            .field("head_pose", head_pose)
+            .field("face_width_px", face_width_px)
+            .field("age_ms", age_ms)
+            .field("embedding", &embedding.as_ref().map(|e| Redacted(e.len())))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -174,6 +216,43 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let back: VisionReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, report);
+    }
+
+    #[test]
+    fn track_obs_debug_redacts_embedding() {
+        let obs = TrackObs {
+            id: TrackId(7),
+            bbox: RectF {
+                x: 0.1,
+                y: 0.2,
+                w: 0.3,
+                h: 0.4,
+            },
+            landmarks5: [PointF { x: 0.5, y: 0.5 }; 5],
+            det_score: 0.9,
+            identity: IdentityState::Pending,
+            liveness: LivenessState::Unknown,
+            head_pose: None,
+            face_width_px: 120.0,
+            age_ms: 0,
+            embedding: Some(vec![0.123_456_7, -7.654_321, 31.4159]),
+        };
+        let dbg = format!("{obs:?}");
+        for n in ["123456", "654321", "31.41"] {
+            assert!(!dbg.contains(n), "{dbg}");
+        }
+        assert!(
+            dbg.contains("embedding: Some(<3 floats redacted>)"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("TrackId(7)"), "{dbg}");
+        let report = format!("{:#?}", vec![obs.clone()]);
+        assert!(!report.contains("123456"), "{report}");
+        let none = TrackObs {
+            embedding: None,
+            ..obs
+        };
+        assert!(format!("{none:?}").contains("embedding: None"));
     }
 
     #[test]
