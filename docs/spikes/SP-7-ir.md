@@ -137,7 +137,9 @@ What this shows:
 - **Format:** `L8` (Gray8) 640x360 at 15 fps nominal. Frames arrive every 60-80 ms.
 - **Frames alternate:** IR-illuminated (mean about 41-71, falling over the first ~1 s as exposure
   settles) and non-illuminated (mean 0.0 to one decimal, so the driver seems to blank or subtract
-  ambient frames). `IsIlluminated` reports this correctly, so a liveness check can keep only
+  ambient frames). The probe reports mean 0.0 both for an all-black frame and for an empty
+  read (`count == 0`), so the "driver blanks alternate frames" reading is unconfirmed.
+  `IsIlluminated` reports this correctly, so a liveness check can keep only
   the illuminated frames, which gives about 7.5 usable fps.
 - **Pairing:** the `Rts-DMFT-Group` group pairs the RGB source (`MI_00`) and the IR source
   (`MI_02`) of the same USB device, and their instance ids share the parent `6&ead33bb&0`. This
