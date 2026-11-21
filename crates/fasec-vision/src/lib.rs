@@ -1,8 +1,10 @@
 //! Model runtime and vision pipeline: detect, track, recognize, liveness, attention.
 
+pub mod attention;
 pub mod detect;
 pub mod error;
 pub mod image_ops;
+pub mod liveness;
 pub mod runtime;
 pub mod track;
 pub mod traits;

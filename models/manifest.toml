@@ -22,12 +22,16 @@ license = "Apache-2.0"
 source = "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface"
 default = true
 
-# Upstream ships PyTorch weights only; pick or produce an ONNX export in M0 (SP-3).
+# Upstream ships PyTorch weights only (2.7_80x80_MiniFASNetV2.pth, 4_0_0_80x80_MiniFASNetV1SE.pth
+# at b6d5f04). These ONNX exports (UniFace weights mirror) match those weights: logits within
+# 2.4e-6 of the upstream PyTorch models on random 1x3x80x80 inputs. Input BGR 0..255, output logits.
 [[model]]
 id = "minifasnet-v2"
 task = "liveness"
-url = ""
-sha256 = ""
+url = "https://huggingface.co/yakhyo/uniface-weights/resolve/cbe2dcc059a4a4e36b786c30b06975efcc28039b/minifasnet_v2.onnx"
+sha256 = "b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907"
+file = "minifasnet_v2.onnx"
+size = 1743581
 license = "Apache-2.0"
 source = "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing"
 default = false
@@ -35,8 +39,10 @@ default = false
 [[model]]
 id = "minifasnet-v1se"
 task = "liveness"
-url = ""
-sha256 = ""
+url = "https://huggingface.co/yakhyo/uniface-weights/resolve/cbe2dcc059a4a4e36b786c30b06975efcc28039b/minifasnet_v1se.onnx"
+sha256 = "ebab7f90c7833fbccd46d3a555410e78d969db5438e169b6524be444862b3676"
+file = "minifasnet_v1se.onnx"
+size = 1742335
 license = "Apache-2.0"
 source = "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing"
 default = false
