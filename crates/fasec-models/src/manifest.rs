@@ -77,7 +77,15 @@ mod tests {
         let m = Manifest::parse(REPO_MANIFEST).unwrap();
         assert!(m.get("yunet-2023mar").is_some());
         let defaults: Vec<&str> = m.defaults().map(|e| e.id.as_str()).collect();
-        assert_eq!(defaults, ["yunet-2023mar", "sface-2021dec"]);
+        assert_eq!(
+            defaults,
+            [
+                "yunet-2023mar",
+                "sface-2021dec",
+                "minifasnet-v2",
+                "minifasnet-v1se"
+            ]
+        );
         assert!(m.defaults().all(ModelEntry::is_fetchable));
         assert!(!m.get("6drepnet").unwrap().is_fetchable());
     }

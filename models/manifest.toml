@@ -34,7 +34,7 @@ file = "minifasnet_v2.onnx"
 size = 1743581
 license = "Apache-2.0"
 source = "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing"
-default = false
+default = true
 
 [[model]]
 id = "minifasnet-v1se"
@@ -45,7 +45,7 @@ file = "minifasnet_v1se.onnx"
 size = 1742335
 license = "Apache-2.0"
 source = "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing"
-default = false
+default = true
 
 # Head pose: chosen in SP-4 (6DRepNet vs MediaPipe Face Landmarker + PnP).
 [[model]]
