@@ -1,0 +1,12 @@
+[package]
+name = "fasec-identity"
+description = "Enrolment flows, face gallery and encrypted template store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "fasec-actions"
+description = "Action trait, chain executor and built-in protection actions (Windows)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+/target
+
+# Model weights are downloaded at runtime, never committed (see models/manifest.toml)
+*.onnx
+*.tflite
+*.pth
+
+# Personal test recordings and any biometric data
+/recordings/
+*.mp4
+*.db
+*.pkl
+*.key
+
+.env
