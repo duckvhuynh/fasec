@@ -183,16 +183,25 @@ impl Pipeline {
             });
             st.last_seen_ms = now;
             // A new track has no state yet, so `None` covers `is_new`.
+            // A timestamp before the last run (camera restart) makes the stage due: a result
+            // from the old timeline cannot be trusted as fresh.
             let due = |at: Option<(u64, RectF)>, interval: u64| match at {
                 None => true,
                 Some((ts, b)) => {
-                    now.saturating_sub(ts) >= interval || d.bbox.iou(&b) < cfg.rerecog_iou
+                    now < ts || now - ts >= interval || d.bbox.iou(&b) < cfg.rerecog_iou
                 }
             };
 
             if due(st.embedded_at, cfg.recog_interval_ms) {
                 let t0 = Instant::now();
-                match self.emb.embed(frame, d) {
+                let res = self.emb.embed(frame, d).and_then(|e| {
+                    if e.iter().all(|v| v.is_finite()) {
+                        Ok(e)
+                    } else {
+                        Err(VisionError::Model("non-finite embedding".into()))
+                    }
+                });
+                match res {
                     Ok(e) => {
                         st.embedding = Some(e);
                         st.embedded_at = Some((now, d.bbox));
@@ -214,7 +223,14 @@ impl Pipeline {
                 // would score unrelated edge pixels.
                 if (0.0..=1.0).contains(&c.x) && (0.0..=1.0).contains(&c.y) {
                     let t0 = Instant::now();
-                    match self.live.score(frame, d) {
+                    let res = self.live.score(frame, d).and_then(|s| {
+                        if s.is_finite() {
+                            Ok(s)
+                        } else {
+                            Err(VisionError::Model(format!("non-finite liveness score {s}")))
+                        }
+                    });
+                    match res {
                         Ok(score) => {
                             let tier = self.live.tier();
                             st.liveness = if score >= cfg.liveness_threshold {
@@ -720,7 +736,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: backwards ts_ms (camera restart) keeps a stale Live verdict fresh until ts catches up (pipeline.rs due())"]
     fn backwards_timestamp_does_not_keep_stale_live() {
         let (mut p, _, ctl) = ctl_harness();
         assert!(matches!(
@@ -741,7 +756,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: backwards ts_ms keeps a stale embedding fresh (pipeline.rs due())"]
     fn backwards_timestamp_does_not_keep_stale_embedding() {
         let (mut p, _, ctl) = ctl_harness();
         assert_eq!(step(&mut p, 10_000).embedding, Some(vec![1.0; 4]));
@@ -754,7 +768,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: NaN liveness score is reported as Spoof{score: NaN} (pipeline.rs score >= threshold)"]
     fn nan_liveness_score_is_unknown_not_a_verdict() {
         let (mut p, _, ctl) = ctl_harness();
         *ctl.live.lock().unwrap() = Ok(f32::NAN);
@@ -762,7 +775,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: non-finite embedding is passed through unchecked (pipeline.rs embed Ok arm)"]
     fn non_finite_embedding_is_dropped() {
         let (mut p, _, ctl) = ctl_harness();
         *ctl.emb.lock().unwrap() = Ok(vec![1.0, f32::NAN, 0.0, 0.0]);
