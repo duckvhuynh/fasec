@@ -1,0 +1,36 @@
+# Public-domain test portraits (US government works: official NASA astronaut photos).
+# Same schema as models/manifest.toml. Downloaded into `.assets/` by
+# `cargo run -p fasec-models --example fetch`; never commit the images.
+
+# Person A (Sunita Williams), 2012.
+[[model]]
+id = "face-a-1"
+task = "test_image"
+url = "https://images-assets.nasa.gov/image/jsc2012e096604/jsc2012e096604~orig.jpg"
+sha256 = "74b3e83aa884cb7dc2cfd8b169ec48683117b0323e92ef91dbc9b9cc1bbef67a"
+file = "face-a-1.jpg"
+size = 842657
+license = "Public domain"
+source = "https://images.nasa.gov/details/jsc2012e096604"
+
+# Person A (Sunita Williams), official portrait 2004.
+[[model]]
+id = "face-a-2"
+task = "test_image"
+url = "https://images-assets.nasa.gov/image/jsc2005e02663/jsc2005e02663~orig.jpg"
+sha256 = "70e75f837c938a162693ea7c932b191ba57b33e5e3f8d66aab489779d6173467"
+file = "face-a-2.jpg"
+size = 1205138
+license = "Public domain"
+source = "https://images.nasa.gov/details/jsc2005e02663"
+
+# Person B (Peggy Whitson), official portrait 2001.
+[[model]]
+id = "face-b-1"
+task = "test_image"
+url = "https://images-assets.nasa.gov/image/JSC2001-03044/JSC2001-03044~orig.jpg"
+sha256 = "66dfbb7a390d062bc592a4a5e617637551aa744683431f8c467865e6db611a69"
+file = "face-b-1.jpg"
+size = 1580460
+license = "Public domain"
+source = "https://images.nasa.gov/details/JSC2001-03044"
