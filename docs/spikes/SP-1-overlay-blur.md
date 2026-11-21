@@ -24,10 +24,17 @@ Transparency effects = Settings > Personalization > Colors > Transparency effect
 (`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\EnableTransparency`; the
 program prints it).
 
-"Overlay inactive" = start the overlay with `--click-through`, then click/Alt-Tab into another
-app so it has focus while the overlay stays on top. The overlay is never active in normal use
-(`WS_EX_NOACTIVATE`), so this is the row that matters; DWM may drop to a flat fallback colour for
-inactive windows.
+**Another app has focus** (table axis). The overlay never takes focus itself (`WS_EX_NOACTIVATE`),
+so the axis is whether you have moved focus to a window behind it:
+- **no**: launch the overlay and touch nothing. The terminal that launched it keeps focus.
+- **yes**: after launch, give focus to a window behind the overlay. You can click into it, which
+  only works with `--click-through` because without it the overlay eats the click. Or you can
+  Alt-Tab to it, which works with or without `--click-through`.
+
+Record whether `--click-through` was used in its own column. It makes the window layered
+(`WS_EX_LAYERED`), which can change how DWM renders the blur, so the two cases must not be mixed.
+If you test a row both with and without `--click-through`, copy the row and fill in one copy for
+each. DWM may drop to a flat fallback colour once focus moves to another app.
 
 ## Automated run on the dev machine (2026-11-21, by the implementer, screen not observed)
 
@@ -54,28 +61,28 @@ Mark each cell `y` / `n`. **live blur?** = content behind is visibly blurred and
 **solid fallback?** = flat opaque/tinted colour, nothing behind readable. **transparent (bad)?** =
 content behind is readable (fails open, violates FR-OV-005).
 
-| OS (build) | Mode | Transparency | Overlay inactive (other app focused) | live blur? | solid fallback? | transparent (bad)? | Notes |
-|---|---|---|---|---|---|---|---|
-| Win10 | acrylic | on | no | | | | |
-| Win10 | acrylic | on | yes | | | | |
-| Win10 | acrylic | off | no | | | | |
-| Win10 | acrylic | off | yes | | | | |
-| Win10 | backdrop | on | no | | | | expected: unsupported, prints failure, stays black |
-| Win10 | backdrop | on | yes | | | | |
-| Win10 | backdrop | off | no | | | | |
-| Win10 | backdrop | off | yes | | | | |
-| Win11 (26300) | acrylic | on | no | | | | |
-| Win11 (26300) | acrylic | on | yes | | | | |
-| Win11 (26300) | acrylic | off | no | | | | |
-| Win11 (26300) | acrylic | off | yes | | | | |
-| Win11 (26300) | backdrop | on | no | | | | |
-| Win11 (26300) | backdrop | on | yes | | | | |
-| Win11 (26300) | backdrop | off | no | | | | |
-| Win11 (26300) | backdrop | off | yes | | | | |
+| OS (build) | Mode | Transparency | Another app has focus | `--click-through` (y/n) | live blur? | solid fallback? | transparent (bad)? | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Win10 | acrylic | on | no | | | | | |
+| Win10 | acrylic | on | yes | | | | | |
+| Win10 | acrylic | off | no | | | | | |
+| Win10 | acrylic | off | yes | | | | | |
+| Win10 | backdrop | on | no | | | | | expected: unsupported, prints failure, stays black |
+| Win10 | backdrop | on | yes | | | | | |
+| Win10 | backdrop | off | no | | | | | |
+| Win10 | backdrop | off | yes | | | | | |
+| Win11 (26300) | acrylic | on | no | | | | | |
+| Win11 (26300) | acrylic | on | yes | | | | | |
+| Win11 (26300) | acrylic | off | no | | | | | |
+| Win11 (26300) | acrylic | off | yes | | | | | |
+| Win11 (26300) | backdrop | on | no | | | | | |
+| Win11 (26300) | backdrop | on | yes | | | | | |
+| Win11 (26300) | backdrop | off | no | | | | | |
+| Win11 (26300) | backdrop | off | yes | | | | | |
 
-Also worth noting per row: does a screenshot (Win+Shift+S, OBS, Teams share) show the overlay
-(it should not: `WDA_EXCLUDEFROMCAPTURE`)? Does the blur survive `--click-through`
-(layered window)? Any lag dragging a window behind the overlay?
+Also worth noting per row: does a screenshot (Win+Shift+S, OBS, Teams share) show the overlay?
+It should not, because of `WDA_EXCLUDEFROMCAPTURE`. Is there any lag when you drag a window
+behind the overlay?
 
 ## Conclusion
 
