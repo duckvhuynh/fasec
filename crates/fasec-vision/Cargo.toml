@@ -17,6 +17,7 @@ fasec-core = { version = "0.0.1", path = "../fasec-core" }
 image = { version = "0.25.9", default-features = false }
 ndarray = "0.17"
 ort = "=2.0.0-rc.15"
+pathfinding = "4.16.0"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 

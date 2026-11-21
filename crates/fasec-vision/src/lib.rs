@@ -3,6 +3,7 @@
 pub mod error;
 pub mod image_ops;
 pub mod runtime;
+pub mod track;
 pub mod traits;
 
 pub use error::VisionError;
