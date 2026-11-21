@@ -183,16 +183,25 @@ impl Pipeline {
             });
             st.last_seen_ms = now;
             // A new track has no state yet, so `None` covers `is_new`.
+            // A timestamp before the last run (camera restart) makes the stage due: a result
+            // from the old timeline cannot be trusted as fresh.
             let due = |at: Option<(u64, RectF)>, interval: u64| match at {
                 None => true,
                 Some((ts, b)) => {
-                    now.saturating_sub(ts) >= interval || d.bbox.iou(&b) < cfg.rerecog_iou
+                    now < ts || now - ts >= interval || d.bbox.iou(&b) < cfg.rerecog_iou
                 }
             };
 
             if due(st.embedded_at, cfg.recog_interval_ms) {
                 let t0 = Instant::now();
-                match self.emb.embed(frame, d) {
+                let res = self.emb.embed(frame, d).and_then(|e| {
+                    if e.iter().all(|v| v.is_finite()) {
+                        Ok(e)
+                    } else {
+                        Err(VisionError::Model("non-finite embedding".into()))
+                    }
+                });
+                match res {
                     Ok(e) => {
                         st.embedding = Some(e);
                         st.embedded_at = Some((now, d.bbox));
@@ -214,7 +223,14 @@ impl Pipeline {
                 // would score unrelated edge pixels.
                 if (0.0..=1.0).contains(&c.x) && (0.0..=1.0).contains(&c.y) {
                     let t0 = Instant::now();
-                    match self.live.score(frame, d) {
+                    let res = self.live.score(frame, d).and_then(|s| {
+                        if s.is_finite() {
+                            Ok(s)
+                        } else {
+                            Err(VisionError::Model(format!("non-finite liveness score {s}")))
+                        }
+                    });
+                    match res {
                         Ok(score) => {
                             let tier = self.live.tier();
                             st.liveness = if score >= cfg.liveness_threshold {
@@ -602,6 +618,208 @@ mod tests {
         assert_eq!(t.landmarks5[0], PointF { x: 0.0, y: 1.0 });
         // face width comes from the unclamped box
         assert!((t.face_width_px - 0.3 * 64.0).abs() < 1e-4);
+    }
+
+    /// Liveness and embedding outputs the audit tests steer per frame.
+    #[derive(Clone)]
+    struct Ctl {
+        live: Arc<Mutex<Result<f32, ()>>>,
+        emb: Arc<Mutex<Result<Vec<f32>, ()>>>,
+    }
+
+    struct CtlEmb(Ctl);
+    impl FaceEmbedder for CtlEmb {
+        fn embed(&mut self, _: &Frame, _: &Detection) -> Result<Vec<f32>, VisionError> {
+            self.0
+                .emb
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(|()| VisionError::Input("emb".into()))
+        }
+        fn model_id(&self) -> &str {
+            "ctl"
+        }
+    }
+
+    struct CtlLive(Ctl);
+    impl LivenessModel for CtlLive {
+        fn score(&mut self, _: &Frame, _: &Detection) -> Result<f32, VisionError> {
+            (*self.0.live.lock().unwrap()).map_err(|()| VisionError::Input("live".into()))
+        }
+        fn tier(&self) -> LivenessTier {
+            LivenessTier::Rgb
+        }
+    }
+
+    /// Pipeline with a scripted detector and steerable embedder/liveness.
+    fn ctl_harness() -> (Pipeline, Script, Ctl) {
+        let script: Script = Arc::new(Mutex::new(Some(vec![face()])));
+        let ctl = Ctl {
+            live: Arc::new(Mutex::new(Ok(0.9))),
+            emb: Arc::new(Mutex::new(Ok(vec![1.0; 4]))),
+        };
+        let p = Pipeline::new(
+            Box::new(MockDet(Calls::default(), script.clone())),
+            Box::new(CtlEmb(ctl.clone())),
+            Box::new(CtlLive(ctl.clone())),
+            Box::new(MockPose(Calls::default())),
+            PipelineConfig::default(),
+        );
+        (p, script, ctl)
+    }
+
+    fn step(p: &mut Pipeline, ts: u64) -> TrackObs {
+        p.process(&frame(ts), CameraHealth::Ok)
+            .unwrap()
+            .tracks
+            .remove(0)
+    }
+
+    #[test]
+    fn liveness_threshold_boundary_is_inclusive() {
+        let (mut p, _, ctl) = ctl_harness();
+        *ctl.live.lock().unwrap() = Ok(0.75);
+        assert!(matches!(
+            step(&mut p, 0).liveness,
+            LivenessState::Live { .. }
+        ));
+        let (mut p, _, ctl) = ctl_harness();
+        *ctl.live.lock().unwrap() = Ok(0.749_999);
+        assert!(matches!(
+            step(&mut p, 0).liveness,
+            LivenessState::Spoof { .. }
+        ));
+    }
+
+    #[test]
+    fn live_track_turning_spoof_flips_after_interval() {
+        let (mut p, _, ctl) = ctl_harness();
+        assert!(matches!(
+            step(&mut p, 0).liveness,
+            LivenessState::Live { .. }
+        ));
+        *ctl.live.lock().unwrap() = Ok(0.1);
+        assert!(matches!(
+            step(&mut p, 1000).liveness,
+            LivenessState::Live { .. }
+        ));
+        assert!(matches!(
+            step(&mut p, 2000).liveness,
+            LivenessState::Spoof { .. }
+        ));
+    }
+
+    #[test]
+    fn liveness_error_drops_previous_live_verdict() {
+        let (mut p, _, ctl) = ctl_harness();
+        assert!(matches!(
+            step(&mut p, 0).liveness,
+            LivenessState::Live { .. }
+        ));
+        *ctl.live.lock().unwrap() = Err(());
+        // FR-LV-001: a failed re-score must not leave the stale Live verdict standing.
+        assert_eq!(step(&mut p, 2000).liveness, LivenessState::Unknown);
+        *ctl.live.lock().unwrap() = Ok(0.9);
+        assert!(matches!(
+            step(&mut p, 2033).liveness,
+            LivenessState::Live { .. }
+        ));
+    }
+
+    #[test]
+    fn embed_error_drops_previous_embedding() {
+        let (mut p, _, ctl) = ctl_harness();
+        assert!(step(&mut p, 0).embedding.is_some());
+        *ctl.emb.lock().unwrap() = Err(());
+        assert_eq!(step(&mut p, 1000).embedding, None);
+    }
+
+    #[test]
+    fn backwards_timestamp_does_not_keep_stale_live() {
+        let (mut p, _, ctl) = ctl_harness();
+        assert!(matches!(
+            step(&mut p, 10_000).liveness,
+            LivenessState::Live { .. }
+        ));
+        // Camera restarts at ts 0; the same-position face is now a spoof.
+        *ctl.live.lock().unwrap() = Ok(0.1);
+        let mut last = step(&mut p, 0);
+        for ts in (100..=2100).step_by(100) {
+            last = step(&mut p, ts);
+        }
+        assert!(
+            matches!(last.liveness, LivenessState::Spoof { .. }),
+            "{:?}",
+            last.liveness
+        );
+    }
+
+    #[test]
+    fn backwards_timestamp_does_not_keep_stale_embedding() {
+        let (mut p, _, ctl) = ctl_harness();
+        assert_eq!(step(&mut p, 10_000).embedding, Some(vec![1.0; 4]));
+        *ctl.emb.lock().unwrap() = Ok(vec![2.0; 4]);
+        let mut last = step(&mut p, 0);
+        for ts in (100..=1100).step_by(100) {
+            last = step(&mut p, ts);
+        }
+        assert_eq!(last.embedding, Some(vec![2.0; 4]));
+    }
+
+    #[test]
+    fn nan_liveness_score_is_unknown_not_a_verdict() {
+        let (mut p, _, ctl) = ctl_harness();
+        *ctl.live.lock().unwrap() = Ok(f32::NAN);
+        assert_eq!(step(&mut p, 0).liveness, LivenessState::Unknown);
+    }
+
+    #[test]
+    fn non_finite_embedding_is_dropped() {
+        let (mut p, _, ctl) = ctl_harness();
+        *ctl.emb.lock().unwrap() = Ok(vec![1.0, f32::NAN, 0.0, 0.0]);
+        assert_eq!(step(&mut p, 0).embedding, None);
+    }
+
+    #[test]
+    fn expired_track_state_is_pruned() {
+        let (mut p, script, _) = ctl_harness();
+        step(&mut p, 0);
+        assert_eq!(p.tracks.len(), 1);
+        *script.lock().unwrap() = Some(Vec::new());
+        p.process(&frame(500), CameraHealth::Ok).unwrap();
+        assert_eq!(p.tracks.len(), 1, "kept within the ttl");
+        p.process(&frame(1600), CameraHealth::Ok).unwrap();
+        assert!(p.tracks.is_empty(), "state outlived the tracker's ttl");
+    }
+
+    #[test]
+    fn face_outside_frame_is_never_live() {
+        for d in [
+            det(1.2, 0.3, 0.2, 0.9),
+            det(0.3, 1.2, 0.2, 0.9),
+            det(-0.5, 0.3, 0.2, 0.9),
+        ] {
+            let (mut p, script, _) = ctl_harness();
+            *script.lock().unwrap() = Some(vec![d]);
+            let t = step(&mut p, 0);
+            assert_eq!(t.liveness, LivenessState::Unknown, "{d:?}");
+            assert_eq!(t.bbox.w * t.bbox.h, 0.0, "{d:?}");
+        }
+    }
+
+    #[test]
+    fn zero_area_box_is_reported_finite_and_rechecked_each_frame() {
+        let mut h = Harness::new();
+        h.set(Some(vec![det(0.5, 0.5, 0.0, 0.9)]));
+        for k in 0..3 {
+            let r = h.run(k * 33);
+            let b = r.tracks[0].bbox;
+            assert!([b.x, b.y, b.w, b.h].iter().all(|v| v.is_finite()));
+        }
+        // IoU of empty boxes is 0 (< rerecog_iou): the re-recognition trigger is not
+        // suppressed, so the track is re-embedded every frame (fail-safe direction).
+        assert_eq!(h.calls.get()[1], 3);
     }
 
     fn models_dir() -> PathBuf {
