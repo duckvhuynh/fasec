@@ -10,3 +10,34 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+crossbeam-channel = "0.5.17"
+fasec-config = { version = "0.0.1", path = "../fasec-config" }
+fasec-core = { version = "0.0.1", path = "../fasec-core" }
+nokhwa = { version = "0.10.11", features = ["input-msmf"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+
+[target.'cfg(windows)'.dependencies]
+# Same major as nokhwa-bindings-windows uses, so no second copy is built.
+windows = { version = "0.62", features = [
+    "Devices_Enumeration",
+    "Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+] }
+
+[dev-dependencies]
+anyhow = "1.0.104"
+ctrlc = "3.5.3"
+
+[target.'cfg(windows)'.dev-dependencies]
+# Extra WinRT features for the ir_probe example only; the library build does not get them.
+windows = { version = "0.62", features = [
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Capture_Frames",
+    "Media_MediaProperties",
+    "Storage_Streams",
+] }
