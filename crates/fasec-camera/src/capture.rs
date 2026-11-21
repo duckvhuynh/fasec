@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType};
 
 use crate::device::{self, ComGuard};
+use crate::permission::{self, Access};
 use crate::{CameraError, LatestFrame, transform};
 
 /// How long `stop`/`Drop` waits for the capture thread before detaching it.
@@ -24,8 +25,15 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// `STOP_TIMEOUT` for the thread; a thread stuck in a blocking read is detached, not joined.
 pub struct Capture {
     stop: Arc<AtomicBool>,
-    last: Arc<Mutex<Option<Instant>>>,
+    status: Arc<Mutex<Status>>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// What the capture thread last saw, read by `last_frame_at` / `last_error`.
+#[derive(Default)]
+struct Status {
+    frame_at: Option<Instant>,
+    error: Option<CameraError>,
 }
 
 /// Where the capture thread gets raw RGB8 frames (`data, width, height`) from.
@@ -36,7 +44,10 @@ trait FrameSource {
 impl Capture {
     /// Opens camera `info_id` (a `CameraInfo::id`) on its own thread and starts streaming into
     /// `slot`. Returns once the first frame has arrived, or with the open/first-read error
-    /// (e.g. `Busy` when another process holds the camera).
+    /// (e.g. `Busy` when another process holds the camera; a vague error while Windows privacy
+    /// settings deny camera access becomes `PermissionDenied`).
+    ///
+    /// Blocks until then, up to ~7 s when the camera never delivers: never call it on a UI thread.
     pub fn start(
         info_id: &str,
         cfg: &CameraConfig,
@@ -44,6 +55,7 @@ impl Capture {
     ) -> Result<Capture, CameraError> {
         let (id, open_cfg) = (info_id.to_owned(), cfg.clone());
         Self::spawn(move || open_stream(&id, &open_cfg), cfg, slot)
+            .map_err(|e| explain(e, permission::desktop_camera_access()))
     }
 
     /// `open` runs on the capture thread (nokhwa's `Camera` is not `Send`).
@@ -53,10 +65,10 @@ impl Capture {
         slot: Arc<LatestFrame>,
     ) -> Result<Capture, CameraError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let last = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(Status::default()));
         let (tx, rx) = mpsc::sync_channel(1);
         let cfg = cfg.clone();
-        let (t_stop, t_last) = (Arc::clone(&stop), Arc::clone(&last));
+        let (t_stop, t_status) = (Arc::clone(&stop), Arc::clone(&status));
         let thread = std::thread::Builder::new()
             .name("fasec-camera".into())
             .spawn(move || {
@@ -69,7 +81,7 @@ impl Capture {
                 let mut src = match first {
                     Ok((src, frame)) => {
                         let _ = tx.send(Ok(()));
-                        deliver(frame, &slot, &t_last);
+                        deliver(frame, &slot, &t_status);
                         src
                     }
                     Err(e) => {
@@ -77,14 +89,14 @@ impl Capture {
                         return;
                     }
                 };
-                run(&mut src, &cfg, &slot, &t_stop, &t_last, t0);
+                run(&mut src, &cfg, &slot, &t_stop, &t_status, t0);
             })
             .map_err(|e| CameraError::Backend(format!("spawn capture thread: {e}")))?;
         let started = rx.recv_timeout(FIRST_FRAME_TIMEOUT);
         // Built before matching so every failure path stops the thread through Drop.
         let capture = Capture {
             stop,
-            last,
+            status,
             thread: Some(thread),
         };
         match started {
@@ -104,7 +116,17 @@ impl Capture {
 
     /// When the last frame was put into the slot; `None` before the first frame.
     pub fn last_frame_at(&self) -> Option<Instant> {
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+        self.status().frame_at
+    }
+
+    /// Latest error of the current error streak; cleared by the next good frame. Lets health
+    /// tell a stalled camera (no frames, `None`) from an erroring one (`Some`).
+    pub fn last_error(&self) -> Option<CameraError> {
+        self.status().error.clone()
+    }
+
+    fn status(&self) -> MutexGuard<'_, Status> {
+        self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -183,9 +205,21 @@ fn pick_format(formats: &[CameraFormat], w: u32, h: u32, fps: u32) -> Option<Cam
     })
 }
 
-fn deliver(frame: Frame, slot: &LatestFrame, last: &Mutex<Option<Instant>>) {
+/// A vague start error while Windows privacy settings deny camera access is a permission error.
+fn explain(e: CameraError, access: Access) -> CameraError {
+    match (e, access) {
+        (CameraError::Backend(_), Access::DeniedByUser | Access::DeniedBySystem) => {
+            CameraError::PermissionDenied
+        }
+        (e, _) => e,
+    }
+}
+
+fn deliver(frame: Frame, slot: &LatestFrame, status: &Mutex<Status>) {
     slot.put(frame);
-    *last.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    s.frame_at = Some(Instant::now());
+    s.error = None;
 }
 
 /// Frame loop after the first frame (seq 1) was delivered.
@@ -194,7 +228,7 @@ fn run(
     cfg: &CameraConfig,
     slot: &LatestFrame,
     stop: &AtomicBool,
-    last: &Mutex<Option<Instant>>,
+    status: &Mutex<Status>,
     t0: Instant,
 ) {
     let mut seq = 1u64;
@@ -204,13 +238,14 @@ fn run(
             Ok(frame) => {
                 seq = frame.seq;
                 errors = 0;
-                deliver(frame, slot, last);
+                deliver(frame, slot, status);
             }
             Err(e) => {
-                // Stall/loss health is derived from `last_frame_at`; log only the first error.
+                // Log only the first error of a streak; `last_error` always has the latest.
                 if errors == 0 {
                     tracing::warn!(error = %e, "camera frame failed");
                 }
+                status.lock().unwrap_or_else(PoisonError::into_inner).error = Some(e);
                 errors = errors.saturating_add(1);
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -264,6 +299,60 @@ mod tests {
             }
             Ok((vec![0; 3], 1, 1))
         }
+    }
+
+    /// Delivers frames every 5 ms, but fails with `Busy` while the flag is set.
+    struct FailsWhile(Arc<AtomicBool>);
+    impl FrameSource for FailsWhile {
+        fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
+            std::thread::sleep(Duration::from_millis(5));
+            if self.0.load(Ordering::Relaxed) {
+                Err(CameraError::Busy)
+            } else {
+                Ok((vec![0; 3], 1, 1))
+            }
+        }
+    }
+
+    #[test]
+    fn last_error_tracks_the_current_error_streak() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let src = FailsWhile(Arc::clone(&fail));
+        let cap = Capture::spawn(
+            move || Ok(src),
+            &CameraConfig::default(),
+            Arc::new(LatestFrame::new()),
+        )
+        .expect("start");
+        assert_eq!(cap.last_error(), None);
+        fail.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(cap.last_error(), Some(CameraError::Busy));
+        fail.store(false, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(cap.last_error(), None, "cleared by the next good frame");
+    }
+
+    #[test]
+    fn start_error_uses_privacy_setting_when_backend_is_vague() {
+        let vague = || CameraError::Backend("boom".into());
+        assert_eq!(
+            explain(vague(), Access::DeniedByUser),
+            CameraError::PermissionDenied
+        );
+        assert_eq!(
+            explain(vague(), Access::DeniedBySystem),
+            CameraError::PermissionDenied
+        );
+        assert_eq!(explain(vague(), Access::Allowed), vague());
+        assert_eq!(explain(vague(), Access::Unknown), vague());
+        // Specific errors are kept: they already say what happened.
+        assert_eq!(
+            explain(CameraError::Busy, Access::DeniedByUser),
+            CameraError::Busy
+        );
+        let nf = CameraError::NotFound { id: "x".into() };
+        assert_eq!(explain(nf.clone(), Access::DeniedByUser), nf);
     }
 
     struct Fails;
@@ -374,6 +463,20 @@ mod tests {
         println!("{n} frames in 2 s, last seq {last_seq}");
         assert!(n >= 10, "only {n} frames in 2 s");
         assert!(cap.last_frame_at().is_some());
+        cap.stop();
+    }
+
+    /// WinRT/DeviceWatcher spell the same id in upper case.
+    #[test]
+    #[ignore = "needs a camera"]
+    fn capture_opens_id_in_any_case() {
+        let id = crate::list().expect("list cameras")[0]
+            .id
+            .to_ascii_uppercase();
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::start(&id, &CameraConfig::default(), Arc::clone(&slot))
+            .expect("start with upper-case id");
+        assert!(slot.take_newer(0, Duration::from_secs(1)).is_some());
         cap.stop();
     }
 

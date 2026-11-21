@@ -3,13 +3,19 @@
 pub mod capture;
 pub mod device;
 pub mod error;
+pub mod health;
+pub mod permission;
 pub mod slot;
 pub mod transform;
+pub mod watch;
 
 pub use capture::Capture;
-pub use device::{CameraFormat, CameraInfo, list};
+pub use device::{CameraFormat, CameraInfo, list, normalize_id};
 pub use error::CameraError;
+pub use health::{HealthConfig, HealthMonitor};
+pub use permission::{Access, desktop_camera_access};
 pub use slot::LatestFrame;
+pub use watch::{CameraEvent, WatchGuard, watch};
 
 #[cfg(test)]
 mod tests {

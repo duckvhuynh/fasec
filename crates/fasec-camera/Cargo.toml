@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+crossbeam-channel = "0.5.17"
 fasec-config = { version = "0.0.1", path = "../fasec-config" }
 fasec-core = { version = "0.0.1", path = "../fasec-core" }
 nokhwa = { version = "0.10.11", features = ["input-msmf"] }
@@ -20,4 +21,9 @@ tracing = "0.1.44"
 
 [target.'cfg(windows)'.dependencies]
 # Same major as nokhwa-bindings-windows uses, so no second copy is built.
-windows = { version = "0.62", features = ["Win32_System_Com"] }
+windows = { version = "0.62", features = [
+    "Devices_Enumeration",
+    "Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+] }

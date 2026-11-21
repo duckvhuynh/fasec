@@ -36,15 +36,14 @@ pub fn list() -> Result<Vec<CameraInfo>, CameraError> {
         Ok(devices
             .into_iter()
             .map(|d| {
-                let id = d.misc();
-                let formats = open(&id)
+                let formats = open_symlink(&d.misc())
                     .and_then(|mut cam| formats(&mut cam))
                     .unwrap_or_else(|e| {
                         tracing::warn!(camera = %d.human_name(), error = %e, "cannot read camera formats");
                         Vec::new()
                     });
                 CameraInfo {
-                    id,
+                    id: normalize_id(&d.misc()),
                     name: d.human_name(),
                     formats,
                 }
@@ -55,6 +54,12 @@ pub fn list() -> Result<Vec<CameraInfo>, CameraError> {
     .map_err(|_| CameraError::Backend("camera enumeration thread panicked".into()))?
 }
 
+/// Canonical form of a device id (ASCII lowercase). MF symlinks and WinRT device ids name the
+/// same device path in different letter case; every id we hand out or look up goes through this.
+pub fn normalize_id(id: &str) -> String {
+    id.to_ascii_lowercase()
+}
+
 /// Serialises nokhwa's MF init, device open and device drop across threads: nokhwa keeps a
 /// non-atomic camera refcount and calls `MFShutdown` when it reaches zero. Never hold it while
 /// streaming.
@@ -63,8 +68,21 @@ pub(crate) fn mf_lock() -> MutexGuard<'static, ()> {
     MF.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Opens (without streaming) the device whose symbolic link is `id`.
+/// Opens (without streaming) the device `id` (a `CameraInfo::id`, matched in any letter case).
+/// Caller holds `mf_lock`.
 pub(crate) fn open(id: &str) -> Result<Camera, CameraError> {
+    let want = normalize_id(id);
+    // nokhwa compares symlinks exactly, so look up the exact spelling MF uses right now.
+    let symlink = nokhwa::query(ApiBackend::MediaFoundation)?
+        .into_iter()
+        .map(|d| d.misc())
+        .find(|s| normalize_id(s) == want)
+        .ok_or_else(|| CameraError::NotFound { id: id.to_owned() })?;
+    open_symlink(&symlink)
+}
+
+/// Opens (without streaming) the device whose MF symbolic link is exactly `id`.
+fn open_symlink(id: &str) -> Result<Camera, CameraError> {
     Camera::with_backend(
         CameraIndex::String(id.to_owned()),
         RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
@@ -72,7 +90,7 @@ pub(crate) fn open(id: &str) -> Result<Camera, CameraError> {
     )
     .map_err(|e| match e {
         // nokhwa's MF backend resolves the symlink to the current index and reports a miss so
-        // (verified live: `capture_unknown_id_is_not_found`).
+        // (verified live in Task 10); here only if the device vanished since `query`.
         NokhwaError::OpenDeviceError(_, ref why) if why == "Not Found" => {
             CameraError::NotFound { id: id.to_owned() }
         }
@@ -133,5 +151,19 @@ impl Drop for ComGuard {
             // SAFETY: matches the successful CoInitializeEx on this same thread.
             unsafe { windows::Win32::System::Com::CoUninitialize() };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_id_matches_winrt_and_mf_ids() {
+        // Same ASUS webcam as seen by WinRT (DeviceInformation) and by MF (nokhwa misc()).
+        let winrt = r"\\?\USB#VID_3277&PID_0096&MI_00#6&ead33bb&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\GLOBAL";
+        let mf = r"\\?\usb#vid_3277&pid_0096&mi_00#6&ead33bb&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\global";
+        assert_eq!(normalize_id(winrt), mf);
+        assert_eq!(normalize_id(mf), mf);
     }
 }
