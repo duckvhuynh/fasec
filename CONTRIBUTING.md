@@ -5,7 +5,8 @@ Read [docs/SRS.md](docs/SRS.md) (architecture) and [docs/ROADMAP.md](docs/ROADMA
 
 ## Build and check
 
-Needs Rust stable (MSVC toolchain on Windows).
+Needs Rust stable (MSVC toolchain on Windows). MSRV is 1.92 (`rust-version` in `Cargo.toml`); do
+not use newer language or std features.
 
 ```sh
 cargo build
@@ -14,7 +15,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI runs the same checks, plus `cargo deny check`.
+CI runs the same checks, plus `cargo build --workspace --examples`, `cargo check` on 1.92 and
+`cargo deny check`. Tests that need models, test images or a camera are `#[ignore]`d; see the
+README for how to run them.
 
 ## Rules
 

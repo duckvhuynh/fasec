@@ -50,18 +50,18 @@ start in parallel with M2 if there are two contributors.
 **Goal:** retire the technical risks that could change the architecture, and set up the repo.
 
 ### Tasks
-- [ ] Repo: Cargo workspace with empty crates from [SRS §3.1](SRS.md#31-workspace-layout), MIT/Apache-2.0 licence files, `CONTRIBUTING.md`, issue templates.
-- [ ] CI (GitHub Actions): `fmt`, `clippy -D warnings`, `test` on `windows-latest` + `ubuntu-latest` (neutral crates), `cargo deny`.
-- [ ] `models/manifest.toml` with YuNet, SFace, MiniFASNet ×2, candidate pose models (URLs + SHA-256 + licence).
+- [x] Repo: Cargo workspace with empty crates from [SRS §3.1](SRS.md#31-workspace-layout), MIT/Apache-2.0 licence files, `CONTRIBUTING.md`, issue templates.
+- [x] CI (GitHub Actions): `fmt`, `clippy -D warnings`, `test` on `windows-latest` + `ubuntu-latest` (neutral crates), `cargo deny`. Also builds all examples and checks the MSRV. **MSRV ruling: 1.92** (raised from 1.85 so current `ort` 2.0 RCs and `sha2` 0.11 can be used).
+- [x] `models/manifest.toml` with YuNet, SFace, MiniFASNet ×2, candidate pose models (URLs + SHA-256 + licence). Pose candidates are listed with empty URL/hash (not fetchable) until SP-4.
 - [ ] **SP-1** Overlay blur prototype: top-most, non-activating, capture-excluded window per monitor with DWM backdrop. Test active/inactive, transparency off, Win10 vs Win11, RDP.
 - [ ] **SP-1b** Capture-based blur prototype: WGC monitor capture → D3D11 downscale/blur → present in overlay (overlay excluded from capture, so no feedback loop). Measure GPU/CPU cost.
 - [ ] **SP-2** Z-order test matrix: Start, Alt-Tab, Task View, Action Center, toasts, Task Manager on top, full-screen games/video, UAC prompt.
-- [ ] **SP-3** `ort` + DirectML: run YuNet, SFace, MiniFASNet on reference laptop; measure ms/frame CPU vs DirectML.
-- [ ] **SP-4** Head pose: compare 6DRepNet vs Face Landmarker + PnP vs 5-point coarse pose on a short labelled clip.
+- [x] **SP-3** `ort` + DirectML: run YuNet, SFace, MiniFASNet on reference laptop; measure ms/frame CPU vs DirectML. Done as `cargo bench -p fasec-vision` (dev laptop, not yet the reference laptop): 720p, 1 face, YuNet@320, a frame with recognition + liveness due ≈ **15 ms DirectML / 30 ms CPU**; detect + pose only ≈ 10 / 12 ms. DirectML is the default (`ep = auto`).
+- [ ] **SP-4** Head pose: compare 6DRepNet vs Face Landmarker + PnP vs 5-point coarse pose on a short labelled clip. *Not started:* M1 uses the 5-point coarse pose (uncalibrated, +4..13° pitch bias on test faces) behind the `PoseEstimator` trait.
 - [ ] **SP-5** Camera sharing with Teams/Zoom/Camera app on 2–3 cameras.
 - [ ] **SP-6** `nokhwa`: enumeration (stable IDs), format negotiation, hot-plug behaviour on built-in + 2 USB cameras.
 - [ ] **SP-7** IR frame access on any available Windows Hello laptop (feeds v0.2).
-- [ ] Write `docs/spikes/SP-x.md` for each: result, numbers, decision.
+- [ ] Write `docs/spikes/SP-x.md` for each: result, numbers, decision. Docs and programs exist for SP-1, 1b, 2, 5, 6, 7 with the agent-measured parts filled in ([index](spikes/README.md)). The rows that need a person at the screen or physical cameras (SP-1, SP-2, SP-5 with Teams/Zoom, SP-6 replug, SP-7 with Hello) and the decisions are still open, so SP-1/1b/2/5/6/7 stay unticked.
 
 ### Exit criteria
 - Decisions recorded for: blur backend order, pose model, camera library (nokhwa vs direct MF), DirectML default.
@@ -75,35 +75,37 @@ start in parallel with M2 if there are two contributors.
 **Goal:** frames in → `VisionReport` out, testable offline.
 
 ### `fasec-camera`
-- [ ] `CameraInfo { id, name, formats }`, `list()`, `open(id, format)`.
-- [ ] Capture thread writing into a latest-frame slot (`ArcSwap`/mutex + seq number).
-- [ ] DeviceWatcher → `CameraEvent::{Added, Removed}`.
-- [ ] Health: frame timeout, black-frame detector.
-- [ ] Rotation/mirror applied at capture.
-- [ ] Privacy-permission-denied detection.
+- [x] `CameraInfo { id, name, formats }`, `list()`, `open(id, format)`.
+- [x] Capture thread writing into a latest-frame slot (`ArcSwap`/mutex + seq number).
+- [x] DeviceWatcher → `CameraEvent::{Added, Removed}`.
+- [x] Health: frame timeout, black-frame detector.
+- [x] Rotation/mirror applied at capture.
+- [x] Privacy-permission-denied detection (mapped from the privacy setting and `0x80070005`; not reproduced on hardware).
 
 ### `fasec-vision`
-- [ ] `runtime`: session builder, EP selection (`auto|directml|cpu`), warm-up, input tensor helpers.
-- [ ] Traits: `FaceDetector`, `FaceEmbedder`, `LivenessModel`, `PoseEstimator`.
-- [ ] YuNet detector (+ NMS, score threshold, 5 landmarks).
-- [ ] SORT tracker (Kalman on box, IoU + Hungarian, `track_ttl_ms`).
-- [ ] 5-point similarity alignment to 112×112 (`nalgebra` Umeyama).
-- [ ] SFace embedder + L2 normalisation.
-- [ ] MiniFASNet liveness (two crops, softmax fusion).
-- [ ] Pose estimator (model chosen in SP-4).
-- [ ] Scheduler (per-track recognition/liveness intervals, idle FPS).
-- [ ] `VisionReport` assembly.
-- [ ] Criterion benches per stage.
+- [x] `runtime`: session builder, EP selection (`auto|directml|cpu`), warm-up, input tensor helpers. No explicit warm-up call yet: the first `run` of each session pays it.
+- [x] Traits: `FaceDetector`, `FaceEmbedder`, `LivenessModel`, `PoseEstimator`.
+- [x] YuNet detector (+ NMS, score threshold, 5 landmarks).
+- [x] SORT tracker (Kalman on box, IoU + Hungarian, `track_ttl_ms`).
+- [x] 5-point similarity alignment to 112×112 (`nalgebra` Umeyama).
+- [x] SFace embedder + L2 normalisation.
+- [x] MiniFASNet liveness (two crops, softmax fusion).
+- [x] Pose estimator: 5-point coarse pose for now (SP-4 not done, see M0).
+- [x] Scheduler (per-track recognition/liveness intervals, idle FPS).
+- [x] `VisionReport` assembly.
+- [x] Criterion benches per stage.
 
 ### `fasec-replay`
-- [ ] Read MP4 / image folder (via `ffmpeg` CLI or `image` sequence; keep it simple).
-- [ ] Simulated clock driven by frame timestamps.
-- [ ] JSONL per-frame output, optional annotated PNG/MP4 dump.
+- [x] Read MP4 / image folder (via `ffmpeg` CLI or `image` sequence; keep it simple).
+- [x] Simulated clock driven by frame timestamps.
+- [ ] JSONL per-frame output, optional annotated PNG/MP4 dump. *JSONL done* (`cargo run -p fasec-replay --release -- run --input <dir|video>`); the annotated dump is not.
 
 ### Exit criteria
 - Live debug window (temporary, can be a tiny egui app) shows boxes, track IDs, pose, liveness at ≥ 15 FPS on reference laptop.
 - `fasec-replay` produces stable output for the same input (deterministic).
 - Per-stage latencies documented; total vision latency per frame ≤ 60 ms p95 with DirectML.
+
+**Status (2026-11-22):** replay output is byte-identical across runs (CPU, `deterministic_output` test). Per-stage medians are in the SP-3 line above (benches give medians, not p95); worst case ≈ 15 ms/frame on DirectML. `live_debug` (`cargo run -p fasec-ui --example live_debug --release`) runs at **~10 FPS on the dev laptop, limited by the webcam** (1280×720 delivers ~10 FPS even with no vision; detect 7–13 ms), so ≥ 15 FPS is not yet met; it also still needs a human run with a face in view.
 
 ---
 

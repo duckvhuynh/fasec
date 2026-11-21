@@ -14,6 +14,10 @@ allow = [
   "ISC",
   "Zlib",
   "Unicode-3.0",
+  # mozjpeg (via nokhwa, fasec-camera): Independent JPEG Group licence, permissive.
+  "IJG",
+  # webpki-roots / webpki-root-certs (via ureq): Mozilla CA bundle data.
+  "CDLA-Permissive-2.0",
 ]
 # Our own workspace crates are not published.
 private = { ignore = true }
