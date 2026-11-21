@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 fasec-config = { version = "0.0.1", path = "../fasec-config" }
 fasec-core = { version = "0.0.1", path = "../fasec-core" }
+fasec-models = { version = "0.0.1", path = "../fasec-models" }
 image = { version = "0.25.9", default-features = false }
 nalgebra = { version = "0.35.0", default-features = false, features = ["std"] }
 ndarray = "0.17"
@@ -23,8 +24,12 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 
 [dev-dependencies]
-fasec-models = { path = "../fasec-models" }
+criterion = "0.8.2"
 image = { version = "0.25.9", default-features = false, features = ["jpeg"] }
+
+[[bench]]
+name = "stages"
+harness = false
 
 [target."cfg(windows)".dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["directml"] }
