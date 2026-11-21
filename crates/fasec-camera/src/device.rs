@@ -1,5 +1,7 @@
 //! Camera enumeration (Media Foundation via nokhwa).
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::{Camera, FormatDecoder, NokhwaError};
@@ -28,6 +30,8 @@ pub fn list() -> Result<Vec<CameraInfo>, CameraError> {
     // Own thread so nokhwa's COM init never touches the caller's apartment.
     std::thread::spawn(|| {
         let _com = ComGuard::init();
+        // Held for the whole enumeration: every device opened here is also dropped here.
+        let _mf = mf_lock();
         let devices = nokhwa::query(ApiBackend::MediaFoundation)?;
         Ok(devices
             .into_iter()
@@ -51,6 +55,14 @@ pub fn list() -> Result<Vec<CameraInfo>, CameraError> {
     .map_err(|_| CameraError::Backend("camera enumeration thread panicked".into()))?
 }
 
+/// Serialises nokhwa's MF init, device open and device drop across threads: nokhwa keeps a
+/// non-atomic camera refcount and calls `MFShutdown` when it reaches zero. Never hold it while
+/// streaming.
+pub(crate) fn mf_lock() -> MutexGuard<'static, ()> {
+    static MF: Mutex<()> = Mutex::new(());
+    MF.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Opens (without streaming) the device whose symbolic link is `id`.
 pub(crate) fn open(id: &str) -> Result<Camera, CameraError> {
     Camera::with_backend(
@@ -59,7 +71,8 @@ pub(crate) fn open(id: &str) -> Result<Camera, CameraError> {
         ApiBackend::MediaFoundation,
     )
     .map_err(|e| match e {
-        // nokhwa's MF backend resolves the symlink to the current index and reports a miss so.
+        // nokhwa's MF backend resolves the symlink to the current index and reports a miss so
+        // (verified live: `capture_unknown_id_is_not_found`).
         NokhwaError::OpenDeviceError(_, ref why) if why == "Not Found" => {
             CameraError::NotFound { id: id.to_owned() }
         }

@@ -13,10 +13,12 @@ pub enum CameraError {
 }
 
 // nokhwa flattens Media Foundation errors to strings; the HRESULT survives as `0x........`.
+// Not reproduced live (needs the privacy toggle); falls back to `Backend` if the text differs.
 const ACCESS_DENIED: [&str; 1] = ["0x80070005"]; // E_ACCESSDENIED
 const BUSY: [&str; 2] = [
-    "0xC00D3704", // MF_E_HW_MFT_FAILED_START_STREAMING: another app holds the device
-    "0xC00D3EA3", // MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED
+    // Verified live: a second process opening the ASUS webcam gets this on its first frame read.
+    "0xC00D3704", // MF_E_HW_MFT_FAILED_START_STREAMING
+    "0xC00D3EA3", // MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED (not reproduced)
 ];
 
 impl From<NokhwaError> for CameraError {
@@ -43,8 +45,12 @@ mod tests {
             CameraError::from(open("Access is denied. (0x80070005)")),
             CameraError::PermissionDenied
         );
+        // Exact text from the live repro (second process, first `frame()` call).
         assert_eq!(
-            CameraError::from(NokhwaError::OpenStreamError("failed (0xC00D3704)".into())),
+            CameraError::from(NokhwaError::ReadFrameError(
+                "Hardware MFT failed to start streaming due to lack of hardware resources. (0xC00D3704)"
+                    .into()
+            )),
             CameraError::Busy
         );
         assert!(

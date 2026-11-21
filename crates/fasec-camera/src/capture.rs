@@ -15,46 +15,73 @@ use nokhwa::utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatT
 use crate::device::{self, ComGuard};
 use crate::{CameraError, LatestFrame, transform};
 
-/// A running capture thread. Dropping it (or `stop`) stops the stream and joins the thread.
+/// How long `stop`/`Drop` waits for the capture thread before detaching it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long `start` waits for the first frame. Busy surfaces only on the first read.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A running capture thread. Dropping it (or `stop`) stops the stream and waits at most
+/// `STOP_TIMEOUT` for the thread; a thread stuck in a blocking read is detached, not joined.
 pub struct Capture {
     stop: Arc<AtomicBool>,
     last: Arc<Mutex<Option<Instant>>>,
     thread: Option<JoinHandle<()>>,
 }
 
+/// Where the capture thread gets raw RGB8 frames (`data, width, height`) from.
+trait FrameSource {
+    fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError>;
+}
+
 impl Capture {
     /// Opens camera `info_id` (a `CameraInfo::id`) on its own thread and starts streaming into
-    /// `slot`. Returns once the stream is open, or with the open error.
+    /// `slot`. Returns once the first frame has arrived, or with the open/first-read error
+    /// (e.g. `Busy` when another process holds the camera).
     pub fn start(
         info_id: &str,
+        cfg: &CameraConfig,
+        slot: Arc<LatestFrame>,
+    ) -> Result<Capture, CameraError> {
+        let (id, open_cfg) = (info_id.to_owned(), cfg.clone());
+        Self::spawn(move || open_stream(&id, &open_cfg), cfg, slot)
+    }
+
+    /// `open` runs on the capture thread (nokhwa's `Camera` is not `Send`).
+    fn spawn<S: FrameSource>(
+        open: impl FnOnce() -> Result<S, CameraError> + Send + 'static,
         cfg: &CameraConfig,
         slot: Arc<LatestFrame>,
     ) -> Result<Capture, CameraError> {
         let stop = Arc::new(AtomicBool::new(false));
         let last = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::sync_channel(1);
-        let (id, cfg) = (info_id.to_owned(), cfg.clone());
+        let cfg = cfg.clone();
         let (t_stop, t_last) = (Arc::clone(&stop), Arc::clone(&last));
         let thread = std::thread::Builder::new()
             .name("fasec-camera".into())
             .spawn(move || {
                 let _com = ComGuard::init();
-                let mut cam = match open_stream(&id, &cfg) {
-                    Ok(cam) => cam,
+                let t0 = Instant::now();
+                let first = open().and_then(|mut src| {
+                    let frame = next_frame(&mut src, &cfg, 1, t0)?;
+                    Ok((src, frame))
+                });
+                let mut src = match first {
+                    Ok((src, frame)) => {
+                        let _ = tx.send(Ok(()));
+                        deliver(frame, &slot, &t_last);
+                        src
+                    }
                     Err(e) => {
                         let _ = tx.send(Err(e));
                         return;
                     }
                 };
-                let _ = tx.send(Ok(()));
-                run(&mut cam, &cfg, &slot, &t_stop, &t_last);
-                if let Err(e) = cam.stop_stream() {
-                    tracing::warn!(error = %e, "stop_stream failed");
-                }
+                run(&mut src, &cfg, &slot, &t_stop, &t_last, t0);
             })
             .map_err(|e| CameraError::Backend(format!("spawn capture thread: {e}")))?;
-        let started = rx.recv();
-        // Built before matching so an early thread exit is joined by Drop.
+        let started = rx.recv_timeout(FIRST_FRAME_TIMEOUT);
+        // Built before matching so every failure path stops the thread through Drop.
         let capture = Capture {
             stop,
             last,
@@ -63,7 +90,11 @@ impl Capture {
         match started {
             Ok(Ok(())) => Ok(capture),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(CameraError::Backend(
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(CameraError::Backend(format!(
+                "camera delivered no frame within {} s",
+                FIRST_FRAME_TIMEOUT.as_secs()
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(CameraError::Backend(
                 "capture thread exited during start".into(),
             )),
         }
@@ -80,17 +111,52 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // shortcut: a camera that stalls without erroring blocks this join until Media
-        // Foundation's synchronous read returns; move to an async SourceReader if that shows up.
-        if let Some(t) = self.thread.take()
-            && t.join().is_err()
-        {
+        let Some(t) = self.thread.take() else {
+            return;
+        };
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !t.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !t.is_finished() {
+            // Dropping the handle detaches the thread; it exits on its own if the read returns.
+            tracing::error!(
+                "camera capture thread did not stop within {STOP_TIMEOUT:?}; detaching it"
+            );
+        } else if t.join().is_err() {
             tracing::error!("camera capture thread panicked");
         }
     }
 }
 
-fn open_stream(id: &str, cfg: &CameraConfig) -> Result<Camera, CameraError> {
+/// nokhwa camera, stopped and dropped under the MF lock (see `device::mf_lock`).
+struct NokhwaSource(Option<Camera>);
+
+impl FrameSource for NokhwaSource {
+    fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
+        let Some(cam) = self.0.as_mut() else {
+            return Err(CameraError::Backend("camera already closed".into()));
+        };
+        let buf = cam.frame()?;
+        let (w, h) = (buf.resolution().width(), buf.resolution().height());
+        Ok((buf.decode_image::<RgbFormat>()?.into_raw(), w, h))
+    }
+}
+
+impl Drop for NokhwaSource {
+    fn drop(&mut self) {
+        let _mf = device::mf_lock();
+        if let Some(mut cam) = self.0.take() {
+            if let Err(e) = cam.stop_stream() {
+                tracing::warn!(error = %e, "stop_stream failed");
+            }
+            drop(cam);
+        }
+    }
+}
+
+fn open_stream(id: &str, cfg: &CameraConfig) -> Result<NokhwaSource, CameraError> {
+    let _mf = device::mf_lock();
     let mut cam = device::open(id)?;
     let available = device::native_formats(&mut cam)?;
     let fmt = pick_format(&available, cfg.resolution[0], cfg.resolution[1], cfg.fps)
@@ -100,7 +166,7 @@ fn open_stream(id: &str, cfg: &CameraConfig) -> Result<Camera, CameraError> {
         RequestedFormatType::Exact(fmt),
     ))?;
     cam.open_stream()?;
-    Ok(cam)
+    Ok(NokhwaSource(Some(cam)))
 }
 
 /// Closest resolution (squared w/h distance), then closest fps; on ties prefer uncompressed
@@ -117,23 +183,28 @@ fn pick_format(formats: &[CameraFormat], w: u32, h: u32, fps: u32) -> Option<Cam
     })
 }
 
+fn deliver(frame: Frame, slot: &LatestFrame, last: &Mutex<Option<Instant>>) {
+    slot.put(frame);
+    *last.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+}
+
+/// Frame loop after the first frame (seq 1) was delivered.
 fn run(
-    cam: &mut Camera,
+    src: &mut impl FrameSource,
     cfg: &CameraConfig,
     slot: &LatestFrame,
     stop: &AtomicBool,
     last: &Mutex<Option<Instant>>,
+    t0: Instant,
 ) {
-    let t0 = Instant::now();
-    let mut seq = 0u64;
+    let mut seq = 1u64;
     let mut errors = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        match next_frame(cam, cfg, seq + 1, t0) {
+        match next_frame(src, cfg, seq + 1, t0) {
             Ok(frame) => {
                 seq = frame.seq;
                 errors = 0;
-                slot.put(frame);
-                *last.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+                deliver(frame, slot, last);
             }
             Err(e) => {
                 // Stall/loss health is derived from `last_frame_at`; log only the first error.
@@ -148,14 +219,12 @@ fn run(
 }
 
 fn next_frame(
-    cam: &mut Camera,
+    src: &mut impl FrameSource,
     cfg: &CameraConfig,
     seq: u64,
     t0: Instant,
 ) -> Result<Frame, CameraError> {
-    let buf = cam.frame()?;
-    let (w, h) = (buf.resolution().width(), buf.resolution().height());
-    let rgb = buf.decode_image::<RgbFormat>()?.into_raw();
+    let (rgb, w, h) = src.next_rgb()?;
     if rgb.len() != w as usize * h as usize * 3 {
         return Err(CameraError::Backend(format!(
             "decoded {} bytes for {w}x{h}",
@@ -175,6 +244,35 @@ mod tests {
         CameraFormat::new_from(w, h, fmt, fps)
     }
 
+    /// Delivers a fixed 2x1 frame every 5 ms.
+    struct Fake;
+    impl FrameSource for Fake {
+        fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok((vec![1, 2, 3, 4, 5, 6], 2, 1))
+        }
+    }
+
+    /// Delivers one frame, then blocks forever, like a stalled camera.
+    struct StallsAfterFirst(bool);
+    impl FrameSource for StallsAfterFirst {
+        fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
+            if std::mem::replace(&mut self.0, true) {
+                loop {
+                    std::thread::park();
+                }
+            }
+            Ok((vec![0; 3], 1, 1))
+        }
+    }
+
+    struct Fails;
+    impl FrameSource for Fails {
+        fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
+            Err(CameraError::Busy)
+        }
+    }
+
     #[test]
     fn pick_format_closest_resolution_then_fps_then_uncompressed() {
         let formats = [
@@ -192,6 +290,61 @@ mod tests {
         ];
         assert_eq!(pick_format(&tie, 640, 480, 30), Some(tie[1]));
         assert_eq!(pick_format(&[], 640, 480, 30), None);
+    }
+
+    #[test]
+    fn capture_loop_sequences_and_transforms_frames() {
+        let cfg = CameraConfig {
+            rotation: 90,
+            ..CameraConfig::default()
+        };
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::spawn(|| Ok(Fake), &cfg, Arc::clone(&slot)).expect("start");
+        let a = slot.take_newer(0, Duration::from_secs(1)).expect("frame");
+        let b = slot
+            .take_newer(a.seq, Duration::from_secs(1))
+            .expect("frame");
+        assert!(b.seq > a.seq && b.ts_ms >= a.ts_ms);
+        assert_eq!((b.width, b.height), (1, 2));
+        assert_eq!(&b.data[..], &[1, 2, 3, 4, 5, 6]);
+        assert!(cap.last_frame_at().is_some());
+        let t0 = Instant::now();
+        cap.stop();
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_is_bounded_when_the_camera_stalls() {
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::spawn(
+            || Ok(StallsAfterFirst(false)),
+            &CameraConfig::default(),
+            slot,
+        )
+        .expect("start");
+        std::thread::sleep(Duration::from_millis(50)); // thread is now parked in next_rgb
+        let t0 = Instant::now();
+        cap.stop();
+        let took = t0.elapsed();
+        assert!(
+            took >= STOP_TIMEOUT && took < Duration::from_millis(2500),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn start_reports_first_read_error() {
+        let err = Capture::spawn(
+            || Ok(Fails),
+            &CameraConfig::default(),
+            Arc::new(LatestFrame::new()),
+        )
+        .err();
+        assert_eq!(err, Some(CameraError::Busy));
     }
 
     #[test]
@@ -222,6 +375,49 @@ mod tests {
         assert!(n >= 10, "only {n} frames in 2 s");
         assert!(cap.last_frame_at().is_some());
         cap.stop();
+    }
+
+    /// Child half of `capture_held_by_another_process_is_busy`; a no-op unless spawned by it.
+    #[test]
+    #[ignore = "needs a camera"]
+    fn hold_camera_for_busy_test() {
+        if std::env::var_os("FASEC_HOLD_CAMERA").is_none() {
+            return;
+        }
+        let id = crate::list().expect("list cameras")[0].id.clone();
+        let cap = Capture::start(&id, &CameraConfig::default(), Arc::new(LatestFrame::new()))
+            .expect("holder start");
+        println!("HOLDING");
+        std::thread::sleep(Duration::from_secs(8));
+        cap.stop();
+    }
+
+    // Busy only reproduces across processes: a second open in the same process shares the stream.
+    #[test]
+    #[ignore = "needs a camera"]
+    fn capture_held_by_another_process_is_busy() {
+        use std::io::BufRead;
+        let id = crate::list().expect("list cameras")[0].id.clone();
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args(["capture::tests::hold_camera_for_busy_test", "--exact"])
+            .args(["--ignored", "--nocapture"])
+            .env("FASEC_HOLD_CAMERA", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn holder");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let held = std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|l| l.contains("HOLDING"));
+        let second = held.then(|| {
+            Capture::start(&id, &CameraConfig::default(), Arc::new(LatestFrame::new())).err()
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        println!("second process start: {second:?}");
+        assert!(held, "holder process never got the camera");
+        assert_eq!(second, Some(Some(CameraError::Busy)));
     }
 
     #[test]
