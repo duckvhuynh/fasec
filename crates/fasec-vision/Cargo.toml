@@ -10,3 +10,20 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+fasec-config = { version = "0.0.1", path = "../fasec-config" }
+fasec-core = { version = "0.0.1", path = "../fasec-core" }
+image = { version = "0.25.9", default-features = false }
+ndarray = "0.16"
+# No `copy-dylibs`: its build script assumes the old `target/<profile>/build/<pkg>-<hash>/out`
+# layout and panics under cargo 1.100; DirectML.dll then resolves from System32.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+
+[dev-dependencies]
+fasec-models = { path = "../fasec-models" }
+
+[target."cfg(windows)".dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["directml"] }
