@@ -13,3 +13,6 @@
 *.key
 
 .env
+
+# Test images fetched by `cargo run -p fasec-models --example fetch`
+/.assets/
