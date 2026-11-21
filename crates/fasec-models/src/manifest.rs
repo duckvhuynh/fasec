@@ -79,7 +79,7 @@ mod tests {
         let defaults: Vec<&str> = m.defaults().map(|e| e.id.as_str()).collect();
         assert_eq!(defaults, ["yunet-2023mar", "sface-2021dec"]);
         assert!(m.defaults().all(ModelEntry::is_fetchable));
-        assert!(!m.get("minifasnet-v2").unwrap().is_fetchable());
+        assert!(!m.get("6drepnet").unwrap().is_fetchable());
     }
 
     #[test]
