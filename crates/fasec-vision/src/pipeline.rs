@@ -96,7 +96,7 @@ impl Pipeline {
         }
     }
 
-    /// YuNet (320 px long side) + SFace + MiniFASNet + CoarsePose from `models_dir`. Every
+    /// YuNet (640 px long side) + SFace + MiniFASNet + CoarsePose from `models_dir`. Every
     /// file is SHA-256 verified against `models_dir/manifest.toml` before any session is
     /// created; a missing or mismatched file is an error naming the model id.
     pub fn from_models(

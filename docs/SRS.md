@@ -183,7 +183,7 @@ Scheduling (to keep CPU low):
   weighted by score, so a single bad frame cannot flip the decision.
 - When no faces are present, detection drops to `idle_fps` (default 5 FPS).
 
-Model input sizes (defaults): YuNet dynamic (frame scaled to 320 px on the long side),
+Model input sizes (defaults): YuNet dynamic (frame scaled to 640 px on the long side; the 2023mar model input is fixed 640×640),
 SFace 112×112, MiniFASNet 80×80 at two crop scales, head pose 224×224 (6DRepNet) or
 192×192 (Face Landmarker).
 

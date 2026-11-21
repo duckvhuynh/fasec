@@ -35,7 +35,8 @@ pub struct YuNetConfig {
 impl Default for YuNetConfig {
     fn default() -> Self {
         YuNetConfig {
-            input_long_side: 320,
+            // The 2023mar input is fixed 640×640, so a smaller side only adds padding and loses range.
+            input_long_side: 640,
             score_threshold: 0.6,
             nms_iou: 0.3,
             top_k: 50,
