@@ -10,3 +10,11 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+anyhow = "1.0.104"
+eframe = "0.35.0"
+fasec-camera = { version = "0.0.1", path = "../fasec-camera" }
+fasec-config = { version = "0.0.1", path = "../fasec-config" }
+fasec-core = { version = "0.0.1", path = "../fasec-core" }
+fasec-vision = { version = "0.0.1", path = "../fasec-vision" }
