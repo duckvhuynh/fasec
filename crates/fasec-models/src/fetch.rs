@@ -1,4 +1,5 @@
 use crate::{ModelEntry, ModelError, verify_file};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// `dir/<entry.file>` if set, else `dir/<last url path segment>`.
@@ -46,7 +47,7 @@ pub fn ensure(dir: &Path, entry: &ModelEntry) -> Result<PathBuf, ModelError> {
     part.push(".part");
     let part = PathBuf::from(part);
     tracing::info!(id = %entry.id, url = %entry.url, "downloading model");
-    let result = download(&entry.url, &part)
+    let result = download(&entry.url, &part, entry.size)
         .and_then(|()| verify_file(&part, &entry.sha256).map_err(|e| with_id(e, entry)))
         .and_then(|()| Ok(std::fs::rename(&part, &path)?));
     if result.is_err() {
@@ -55,14 +56,24 @@ pub fn ensure(dir: &Path, entry: &ModelEntry) -> Result<PathBuf, ModelError> {
     result.map(|()| path)
 }
 
-fn download(url: &str, to: &Path) -> Result<(), ModelError> {
+/// Streams `url` to `to`; with `max_size`, fails once more than that many bytes arrive.
+fn download(url: &str, to: &Path, max_size: Option<u64>) -> Result<(), ModelError> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| ModelError::Download(format!("{url}: {e}")))?;
-    let mut reader = resp.into_body().into_reader();
+    // Read at most one byte past the manifest size so an oversized body cannot fill the disk.
+    let mut reader = resp
+        .into_body()
+        .into_reader()
+        .take(max_size.map_or(u64::MAX, |s| s.saturating_add(1)));
     let mut file = std::fs::File::create(to)?;
-    std::io::copy(&mut reader, &mut file)
+    let written = std::io::copy(&mut reader, &mut file)
         .map_err(|e| ModelError::Download(format!("{url}: {e}")))?;
+    if let Some(max) = max_size.filter(|&max| written > max) {
+        return Err(ModelError::Download(format!(
+            "{url}: body exceeds manifest size of {max} bytes"
+        )));
+    }
     file.sync_all()?;
     Ok(())
 }
@@ -171,6 +182,69 @@ mod tests {
         let d = temp_dir("ensure_dl_fail");
         let r = ensure(&d, &entry("http://127.0.0.1:9/x", HELLO_SHA, None));
         assert!(matches!(r, Err(ModelError::Download(_))), "{r:?}");
+        assert!(!d.join("x").exists());
+        assert!(!d.join("x.part").exists());
+    }
+
+    /// Serves one fixed HTTP response on 127.0.0.1 and returns its URL.
+    fn serve_once(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body);
+        });
+        format!("http://127.0.0.1:{port}/x")
+    }
+
+    #[test]
+    fn ensure_downloads_and_verifies() {
+        let d = temp_dir("ensure_dl_ok");
+        let mut e = entry(&serve_once(b"hello fasec\n"), HELLO_SHA, None);
+        e.size = Some(12);
+        assert_eq!(ensure(&d, &e).unwrap(), d.join("x"));
+        assert_eq!(std::fs::read(d.join("x")).unwrap(), b"hello fasec\n");
+        assert!(!d.join("x.part").exists());
+    }
+
+    #[test]
+    fn ensure_rejects_body_larger_than_manifest_size() {
+        let d = temp_dir("ensure_dl_too_big");
+        let mut e = entry(&serve_once(b"hello fasec\n"), HELLO_SHA, None);
+        e.size = Some(5);
+        match ensure(&d, &e) {
+            Err(ModelError::Download(msg)) => assert!(msg.contains("size"), "{msg}"),
+            other => panic!("expected Download size error, got {other:?}"),
+        }
+        assert!(!d.join("x").exists());
+        assert!(!d.join("x.part").exists());
+    }
+
+    #[test]
+    fn ensure_removes_part_on_downloaded_hash_mismatch() {
+        let d = temp_dir("ensure_dl_bad_hash");
+        let e = entry(&serve_once(b"not the model"), HELLO_SHA, None);
+        match ensure(&d, &e) {
+            Err(ModelError::HashMismatch { id_or_path, .. }) => {
+                assert!(id_or_path.contains("test-model"))
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
         assert!(!d.join("x").exists());
         assert!(!d.join("x.part").exists());
     }
