@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Rust edition 2024, `rust-version = "1.85"`, target `x86_64-pc-windows-msvc`. Crate metadata inherits from `[workspace.package]`; every crate keeps `[lints] workspace = true`.
+- Rust edition 2024, `rust-version = "1.92"` (raised from 1.85 by controller ruling R6 so current `ort` 2.0 RCs and sha2 can be used), target `x86_64-pc-windows-msvc`. Crate metadata inherits from `[workspace.package]`; every crate keeps `[lints] workspace = true`.
 - Add dependencies with `cargo add -p <crate> <dep>` (latest compatible version) in the crate's own `Cargo.toml`. Do **not** add `[workspace.dependencies]`.
 - No `windows` crate (and no `nokhwa`) in `fasec-core`, `fasec-config`, `fasec-vision`, `fasec-identity`, `fasec-policy`, `fasec-models`, `fasec-replay` (NFR-MNT-001). They must build and test on Linux.
 - Never commit model weights, face images, videos or databases. Weights go to `models/` (gitignored by extension); test images go to `.assets/` (add `/.assets/` to `.gitignore`).
