@@ -79,16 +79,16 @@ After all lanes merge back into `feat/m0-m1` (resolve `Cargo.lock` by regenerati
 
 **Interfaces:**
 - Produces:
-  - `pub struct ModelEntry { pub id: String, pub task: String, pub url: String, pub sha256: String, pub size: Option<u64>, pub license: String, pub source: String, pub default: bool }`; `pub struct Manifest { pub model: Vec<ModelEntry> }`; `Manifest::parse(&str) -> Result<Manifest, ModelError>`; `Manifest::load(path) -> Result<Manifest, ModelError>`; `fn get(&self, id: &str) -> Option<&ModelEntry>`; `fn defaults(&self) -> impl Iterator<Item=&ModelEntry>`.
+  - `pub struct ModelEntry { pub id: String, pub task: String, pub url: String, pub sha256: String, pub file: Option<String>, pub size: Option<u64>, pub license: String, pub source: String, pub default: bool }` (`file` = local file name; needed when `url` is empty, e.g. manually imported exports); `pub struct Manifest { pub model: Vec<ModelEntry> }`; `Manifest::parse(&str) -> Result<Manifest, ModelError>`; `Manifest::load(path) -> Result<Manifest, ModelError>`; `fn get(&self, id: &str) -> Option<&ModelEntry>`; `fn defaults(&self) -> impl Iterator<Item=&ModelEntry>`.
   - `ModelEntry::is_fetchable(&self) -> bool` (url and sha256 non-empty, sha256 is 64 hex chars).
   - `pub fn verify_file(path: &Path, sha256_hex: &str) -> Result<(), ModelError>`.
-  - `pub fn model_path(dir: &Path, entry: &ModelEntry) -> PathBuf` → `dir/<file name from url>`.
-  - `pub fn ensure(dir: &Path, entry: &ModelEntry) -> Result<PathBuf, ModelError>`: if file exists and verifies → return; else download (`ureq`) to `<file>.part`, verify, rename. Never leaves an unverified file at the final path.
+  - `pub fn model_path(dir: &Path, entry: &ModelEntry) -> Result<PathBuf, ModelError>` → `dir/<entry.file>` if set, else `dir/<last url path segment>`; error if neither gives a name.
+  - `pub fn ensure(dir: &Path, entry: &ModelEntry) -> Result<PathBuf, ModelError>`: empty/invalid `sha256` → `NotFetchable`; if the file exists and verifies → return it (even when `url` is empty: manual import); if it exists but mismatches → `HashMismatch` (do not overwrite silently); if missing and `url` empty → `NotFetchable`; else download (`ureq`) to `<file>.part`, verify, rename. Never leaves an unverified file at the final path.
   - `pub enum ModelError { Io(..), Parse(..), NotFetchable { id }, HashMismatch { id_or_path, expected, actual }, Download(..) }`.
   - Example `fetch`: `cargo run -p fasec-models --example fetch [-- --dir models]` fetches all `default = true` entries from `models/manifest.toml` into `models/`, and all entries of `assets/test-assets.toml` (same schema) into `.assets/`.
   - `assets/test-assets.toml`: at least **three public-domain portrait photos** (e.g. official NASA astronaut portraits on Wikimedia Commons / nasa.gov, which are US-government public domain): two different photos of the **same** person and one of a **different** person, each with pinned `url`, `sha256`, `license = "Public domain"`, `source` page. Ids: `face-a-1`, `face-a-2`, `face-b-1`. Use `task = "test_image"`. Compute hashes by downloading once.
 
-- [ ] **Step 1: Tests**: `parse_repo_manifest` (parses `../../models/manifest.toml` via `include_str!`, finds `yunet-2023mar` and `sface-2021dec` as defaults), `empty_url_not_fetchable`, `bad_sha_len_not_fetchable`, `verify_ok` and `verify_mismatch_reports_expected_and_actual` (temp file with known content; use `std::env::temp_dir()` + unique name, no extra dep), `ensure_refuses_unfetchable`, `ensure_keeps_valid_existing_file_without_network` (pre-write file whose hash matches a synthetic entry with an unreachable url `http://127.0.0.1:9/x` → Ok).
+- [ ] **Step 1: Tests**: `parse_repo_manifest` (parses `../../models/manifest.toml` via `include_str!`, finds `yunet-2023mar` and `sface-2021dec` as defaults), `empty_url_not_fetchable`, `bad_sha_len_not_fetchable`, `verify_ok` and `verify_mismatch_reports_expected_and_actual` (temp file with known content; use `std::env::temp_dir()` + unique name, no extra dep), `ensure_refuses_missing_file_with_empty_url`, `ensure_refuses_empty_sha`, `ensure_accepts_manually_imported_file` (empty url, `file` set, matching hash → Ok), `ensure_reports_mismatch_on_existing_bad_file`, `ensure_keeps_valid_existing_file_without_network` (pre-write file whose hash matches a synthetic entry with an unreachable url `http://127.0.0.1:9/x` → Ok).
 - [ ] **Step 2:** `cargo test -p fasec-models` → FAIL.
 - [ ] **Step 3:** Implement. Deps: `serde`, `toml`, `sha2`, `hex`, `ureq`, `thiserror`, `tracing`; example dep `anyhow`.
 - [ ] **Step 4:** `cargo test -p fasec-models` → PASS; then `cargo run -p fasec-models --example fetch` → downloads YuNet, SFace, 3 test images, all verified.
@@ -180,7 +180,7 @@ After all lanes merge back into `feat/m0-m1` (resolve `Cargo.lock` by regenerati
 
 **Files:**
 - Create: `crates/fasec-vision/src/liveness/{mod.rs,minifasnet.rs}`, `crates/fasec-vision/src/attention/{mod.rs,coarse_pose.rs}`, `tools/export_minifasnet.py` (only if needed, see Step 3)
-- Modify: `models/manifest.toml` (fill `minifasnet-v2` / `minifasnet-v1se` `sha256`; `url` filled only if a permissively licensed hosted ONNX export exists)
+- Modify: `models/manifest.toml` (fill `minifasnet-v2` / `minifasnet-v1se` `sha256` and `file` (`minifasnet_v2.onnx`, `minifasnet_v1se.onnx`); `url` filled only if a permissively licensed hosted ONNX export exists)
 
 **Interfaces:**
 - Produces:
