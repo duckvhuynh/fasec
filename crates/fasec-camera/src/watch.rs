@@ -106,10 +106,8 @@ mod imp {
                 w.Status(),
                 Ok(DeviceWatcherStatus::Started | DeviceWatcherStatus::EnumerationCompleted)
             );
-            if started {
-                if let Err(e) = w.Stop() {
-                    tracing::warn!(error = %e, "stopping camera device watcher failed");
-                }
+            if started && let Err(e) = w.Stop() {
+                tracing::warn!(error = %e, "stopping camera device watcher failed");
             }
         }
     }

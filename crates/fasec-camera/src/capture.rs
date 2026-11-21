@@ -254,7 +254,7 @@ fn ms_since(t0: Instant) -> u64 {
 /// Mean Rec.601 luma (same weights as `Frame::mean_luma`) over every `LUMA_STRIDE`-th pixel.
 fn sampled_luma(rgb: &[u8]) -> f32 {
     let (mut sum, mut n) = (0.0f64, 0u32);
-    for px in rgb.chunks_exact(3).step_by(LUMA_STRIDE) {
+    for px in rgb.as_chunks::<3>().0.iter().step_by(LUMA_STRIDE) {
         sum += 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
         n += 1;
     }

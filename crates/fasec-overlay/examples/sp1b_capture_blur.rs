@@ -204,7 +204,7 @@ fn blur(
         for y in rows {
             let row = &src[y * pitch..y * pitch + w * 4];
             for (a, block) in acc.iter_mut().zip(row.chunks(d * 4)) {
-                for px in block.chunks_exact(4) {
+                for px in block.as_chunks::<4>().0 {
                     a[0] += u32::from(px[0]);
                     a[1] += u32::from(px[1]);
                     a[2] += u32::from(px[2]);
@@ -232,7 +232,7 @@ fn blur(
     for (y, &(y0, y1, wy)) in yt.iter().enumerate() {
         let (r0, r1) = (&small[y0 * sw..][..sw], &small[y1 * sw..][..sw]);
         let dst = &mut out[y * w * 4..][..w * 4];
-        for (px, &(x0, x1, wx)) in dst.chunks_exact_mut(4).zip(&xt) {
+        for (px, &(x0, x1, wx)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&xt) {
             for c in 0..3 {
                 let top = u32::from(r0[x0][c]) * (256 - wx) + u32::from(r0[x1][c]) * wx;
                 let bot = u32::from(r1[x0][c]) * (256 - wx) + u32::from(r1[x1][c]) * wx;
@@ -246,7 +246,7 @@ fn blur(
 fn draw_marker(img: &mut [u8], w: usize) {
     for y in MARKER_Y..MARKER_Y + MARKER_SIZE {
         let row = &mut img[(y * w + MARKER_X) * 4..][..MARKER_SIZE * 4];
-        for px in row.chunks_exact_mut(4) {
+        for px in row.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&MARKER_BGRA);
         }
     }
@@ -258,7 +258,9 @@ fn marker_seen(src: &[u8], pitch: usize) -> bool {
     for y in MARKER_Y..MARKER_Y + MARKER_SIZE {
         let row = &src[y * pitch + MARKER_X * 4..][..MARKER_SIZE * 4];
         hits += row
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] >= 240 && p[1] <= 15 && p[2] >= 240)
             .count();
     }
