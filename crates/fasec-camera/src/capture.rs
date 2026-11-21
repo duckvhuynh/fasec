@@ -7,33 +7,39 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use fasec_config::CameraConfig;
-use fasec_core::Frame;
+use fasec_core::{CameraHealth, Frame};
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType};
 
 use crate::device::{self, ComGuard};
 use crate::permission::{self, Access};
-use crate::{CameraError, LatestFrame, transform};
+use crate::{CameraError, HealthConfig, HealthMonitor, LatestFrame, transform};
 
 /// How long `stop`/`Drop` waits for the capture thread before detaching it.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long `start` waits for the first frame. Busy surfaces only on the first read.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// Covered detection averages every 61st pixel: a full-frame mean on every 720p frame costs
+/// about one frame time in debug builds (measured: 18 -> 9 frames in 2 s). Prime, so it does
+/// not divide common widths and the sampled columns shift from row to row.
+const LUMA_STRIDE: usize = 61;
 
 /// A running capture thread. Dropping it (or `stop`) stops the stream and waits at most
 /// `STOP_TIMEOUT` for the thread; a thread stuck in a blocking read is detached, not joined.
 pub struct Capture {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
+    /// Origin of the capture clock (`Frame::ts_ms` and the health monitor's `now_ms`).
+    t0: Instant,
     thread: Option<JoinHandle<()>>,
 }
 
-/// What the capture thread last saw, read by `last_frame_at` / `last_error`.
-#[derive(Default)]
+/// What the capture thread last saw, read by `last_frame_at` / `last_error` / `health`.
 struct Status {
     frame_at: Option<Instant>,
     error: Option<CameraError>,
+    health: HealthMonitor,
 }
 
 /// Where the capture thread gets raw RGB8 frames (`data, width, height`) from.
@@ -65,7 +71,12 @@ impl Capture {
         slot: Arc<LatestFrame>,
     ) -> Result<Capture, CameraError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let status = Arc::new(Mutex::new(Status::default()));
+        let status = Arc::new(Mutex::new(Status {
+            frame_at: None,
+            error: None,
+            health: HealthMonitor::new(HealthConfig::default()),
+        }));
+        let t0 = Instant::now();
         let (tx, rx) = mpsc::sync_channel(1);
         let cfg = cfg.clone();
         let (t_stop, t_status) = (Arc::clone(&stop), Arc::clone(&status));
@@ -73,7 +84,6 @@ impl Capture {
             .name("fasec-camera".into())
             .spawn(move || {
                 let _com = ComGuard::init();
-                let t0 = Instant::now();
                 let first = open().and_then(|mut src| {
                     let frame = next_frame(&mut src, &cfg, 1, t0)?;
                     Ok((src, frame))
@@ -97,6 +107,7 @@ impl Capture {
         let capture = Capture {
             stop,
             status,
+            t0,
             thread: Some(thread),
         };
         match started {
@@ -123,6 +134,14 @@ impl Capture {
     /// tell a stalled camera (no frames, `None`) from an erroring one (`Some`).
     pub fn last_error(&self) -> Option<CameraError> {
         self.status().error.clone()
+    }
+
+    /// Health right now (FR-CAM-005/009): `Lost` after 1.5 s without a frame, `Covered` after
+    /// > 2 s of black frames, or the mapped `last_error` (see `with_error`).
+    pub fn health(&self) -> CameraHealth {
+        let now_ms = ms_since(self.t0);
+        let s = self.status();
+        with_error(s.health.evaluate(now_ms), s.error.clone())
     }
 
     fn status(&self) -> MutexGuard<'_, Status> {
@@ -215,11 +234,44 @@ fn explain(e: CameraError, access: Access) -> CameraError {
     }
 }
 
+/// Combines the monitor's verdict with the current capture error.
+/// Busy and PermissionDenied say why frames stopped, so they beat the monitor's Lost/Covered;
+/// a generic error only shows while the monitor still says Ok.
+fn with_error(health: CameraHealth, error: Option<CameraError>) -> CameraHealth {
+    match (error, health) {
+        (Some(CameraError::Busy), _) => CameraHealth::Busy,
+        (Some(CameraError::PermissionDenied), _) => CameraHealth::PermissionDenied,
+        (Some(CameraError::NotFound { .. }), _) => CameraHealth::Lost,
+        (Some(CameraError::Backend(s)), CameraHealth::Ok) => CameraHealth::Error(s),
+        (_, health) => health,
+    }
+}
+
+fn ms_since(t0: Instant) -> u64 {
+    u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Mean Rec.601 luma (same weights as `Frame::mean_luma`) over every `LUMA_STRIDE`-th pixel.
+fn sampled_luma(rgb: &[u8]) -> f32 {
+    let (mut sum, mut n) = (0.0f64, 0u32);
+    for px in rgb.chunks_exact(3).step_by(LUMA_STRIDE) {
+        sum += 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
+        n += 1;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        (sum / f64::from(n)) as f32
+    }
+}
+
 fn deliver(frame: Frame, slot: &LatestFrame, status: &Mutex<Status>) {
+    let (ts_ms, luma) = (frame.ts_ms, sampled_luma(&frame.data));
     slot.put(frame);
     let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
     s.frame_at = Some(Instant::now());
     s.error = None;
+    s.health.on_frame(ts_ms, luma);
 }
 
 /// Frame loop after the first frame (seq 1) was delivered.
@@ -267,7 +319,7 @@ fn next_frame(
         )));
     }
     let (data, w, h) = transform::apply(&rgb, w, h, cfg.rotation, cfg.mirror);
-    let ts_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let ts_ms = ms_since(t0);
     Frame::new(seq, ts_ms, w, h, data).map_err(|e| CameraError::Backend(e.to_string()))
 }
 
@@ -301,7 +353,7 @@ mod tests {
         }
     }
 
-    /// Delivers frames every 5 ms, but fails with `Busy` while the flag is set.
+    /// Delivers bright frames every 5 ms, but fails with `Busy` while the flag is set.
     struct FailsWhile(Arc<AtomicBool>);
     impl FrameSource for FailsWhile {
         fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
@@ -309,28 +361,110 @@ mod tests {
             if self.0.load(Ordering::Relaxed) {
                 Err(CameraError::Busy)
             } else {
-                Ok((vec![0; 3], 1, 1))
+                Ok((vec![200; 3], 1, 1))
             }
         }
+    }
+
+    /// Delivers a 1x1 grey frame of the given level every 5 ms.
+    struct Solid(u8);
+    impl FrameSource for Solid {
+        fn next_rgb(&mut self) -> Result<(Vec<u8>, u32, u32), CameraError> {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok((vec![self.0; 3], 1, 1))
+        }
+    }
+
+    fn spawn_with<S: FrameSource + Send + 'static>(src: S) -> Capture {
+        Capture::spawn(
+            move || Ok(src),
+            &CameraConfig::default(),
+            Arc::new(LatestFrame::new()),
+        )
+        .expect("start")
     }
 
     #[test]
     fn last_error_tracks_the_current_error_streak() {
         let fail = Arc::new(AtomicBool::new(false));
-        let src = FailsWhile(Arc::clone(&fail));
-        let cap = Capture::spawn(
-            move || Ok(src),
-            &CameraConfig::default(),
-            Arc::new(LatestFrame::new()),
-        )
-        .expect("start");
+        let cap = spawn_with(FailsWhile(Arc::clone(&fail)));
         assert_eq!(cap.last_error(), None);
+        assert_eq!(cap.health(), CameraHealth::Ok);
         fail.store(true, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(cap.last_error(), Some(CameraError::Busy));
+        assert_eq!(cap.health(), CameraHealth::Busy);
         fail.store(false, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(cap.last_error(), None, "cleared by the next good frame");
+        assert_eq!(cap.health(), CameraHealth::Ok);
+    }
+
+    #[test]
+    fn health_lost_when_the_camera_stalls() {
+        let cap = spawn_with(StallsAfterFirst(false));
+        assert_eq!(cap.health(), CameraHealth::Ok);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(cap.health(), CameraHealth::Ok, "1 s without a frame");
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(cap.health(), CameraHealth::Lost, "1.6 s without a frame");
+    }
+
+    #[test]
+    fn health_covered_when_frames_stay_black() {
+        let black = spawn_with(Solid(0));
+        let bright = spawn_with(Solid(200));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(black.health(), CameraHealth::Ok, "black for 1.5 s");
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(black.health(), CameraHealth::Covered, "black for 2.2 s");
+        assert_eq!(bright.health(), CameraHealth::Ok);
+    }
+
+    #[test]
+    fn sampled_luma_matches_full_mean() {
+        let (w, h) = (1280u32, 720u32);
+        for level in [0u8, 9, 10, 128, 255] {
+            let f = Frame::new(0, 0, w, h, vec![level; (w * h * 3) as usize]).expect("frame");
+            assert!(
+                (sampled_luma(&f.data) - f.mean_luma()).abs() < 1e-3,
+                "{level}"
+            );
+        }
+        // Left-to-right ramp with coloured channels: a stride dividing the width would sample
+        // the same columns on every row and miss the mean.
+        let data: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let x = u8::try_from((i % w) * 255 / (w - 1)).expect("0..=255");
+                [x, x / 2, 255 - x]
+            })
+            .collect();
+        let f = Frame::new(0, 0, w, h, data).expect("frame");
+        assert!((sampled_luma(&f.data) - f.mean_luma()).abs() < 1.0);
+        assert_eq!(sampled_luma(&[]), 0.0);
+    }
+
+    #[test]
+    fn capture_errors_map_to_health() {
+        use CameraHealth as H;
+        let backend = || Some(CameraError::Backend("driver fault".into()));
+        let busy = Some(CameraError::Busy);
+        let denied = Some(CameraError::PermissionDenied);
+        assert_eq!(with_error(H::Ok, None), H::Ok);
+        assert_eq!(with_error(H::Lost, None), H::Lost);
+        assert_eq!(
+            with_error(H::Ok, backend()),
+            H::Error("driver fault".into())
+        );
+        // Lost/Covered beat a generic error, but not Busy or PermissionDenied.
+        assert_eq!(with_error(H::Lost, backend()), H::Lost);
+        assert_eq!(with_error(H::Covered, backend()), H::Covered);
+        assert_eq!(with_error(H::Ok, busy.clone()), H::Busy);
+        assert_eq!(with_error(H::Lost, busy), H::Busy);
+        assert_eq!(with_error(H::Covered, denied), H::PermissionDenied);
+        // The device vanished mid-stream.
+        let gone = Some(CameraError::NotFound { id: "x".into() });
+        assert_eq!(with_error(H::Ok, gone), H::Lost);
     }
 
     #[test]
@@ -463,6 +597,13 @@ mod tests {
         println!("{n} frames in 2 s, last seq {last_seq}");
         assert!(n >= 10, "only {n} frames in 2 s");
         assert!(cap.last_frame_at().is_some());
+        let health = cap.health();
+        println!("health: {health:?}");
+        // Covered is legitimate if the lens is covered or the room is dark.
+        assert!(
+            matches!(health, CameraHealth::Ok | CameraHealth::Covered),
+            "{health:?}"
+        );
         cap.stop();
     }
 

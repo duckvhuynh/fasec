@@ -25,6 +25,7 @@ impl Default for HealthConfig {
 /// Tracks one capture session. `now_ms` is a monotonic millisecond clock whose 0 is when the
 /// capture was started; before the first frame the camera counts as `Lost` once `now_ms`
 /// exceeds `frame_timeout_ms` (any other clock origin only makes that happen sooner).
+/// `Capture` feeds one of these itself on its own clock; use `Capture::health`.
 #[derive(Debug, Clone)]
 pub struct HealthMonitor {
     cfg: HealthConfig,
@@ -45,7 +46,8 @@ impl HealthMonitor {
 
     pub fn on_frame(&mut self, now_ms: u64, mean_luma: f32) {
         self.last_frame_ms = now_ms;
-        if mean_luma < self.cfg.black_luma {
+        // NaN counts as black: an unreadable frame must not reset a Covered streak.
+        if mean_luma.is_nan() || mean_luma < self.cfg.black_luma {
             self.black_since_ms.get_or_insert(now_ms);
         } else {
             self.black_since_ms = None;
@@ -178,6 +180,19 @@ mod tests {
         let mut m = mon();
         feed(&mut m, 0, 5000, 33, 10.0);
         assert_eq!(m.evaluate(5000), CameraHealth::Ok);
+    }
+
+    #[test]
+    fn nan_luma_counts_as_black() {
+        let mut m = mon();
+        feed(&mut m, 0, 1500, 33, BLACK);
+        // A NaN frame must not reset the streak (fail safe).
+        m.on_frame(1520, f32::NAN);
+        feed(&mut m, 1540, 2100, 33, BLACK);
+        assert_eq!(m.evaluate(2100), CameraHealth::Covered);
+        let mut m = mon();
+        feed(&mut m, 0, 2100, 33, f32::NAN);
+        assert_eq!(m.evaluate(2100), CameraHealth::Covered);
     }
 
     #[test]

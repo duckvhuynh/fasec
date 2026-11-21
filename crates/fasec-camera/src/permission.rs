@@ -14,12 +14,16 @@ pub enum Access {
 const CONSENT_WEBCAM: &str =
     r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
 
-/// Reads HKCU `...\ConsentStore\webcam\NonPackaged` `Value`, plus HKLM `...\webcam` and
-/// `...\webcam\NonPackaged` `Value` (HKLM has only `webcam` on Windows 11 here).
+/// Reads the `Value` of `...\ConsentStore\webcam` ("Let apps access your camera") and
+/// `...\webcam\NonPackaged` ("Let desktop apps access your camera") in HKCU, and the same two
+/// keys in HKLM (HKLM has only `webcam` on Windows 11 here).
 pub fn desktop_camera_access() -> Access {
     let np = format!(r"{CONSENT_WEBCAM}\NonPackaged");
     classify(
-        reg::read(reg::Hive::User, &np).as_deref(),
+        [
+            reg::read(reg::Hive::User, CONSENT_WEBCAM).as_deref(),
+            reg::read(reg::Hive::User, &np).as_deref(),
+        ],
         [
             reg::read(reg::Hive::Machine, CONSENT_WEBCAM).as_deref(),
             reg::read(reg::Hive::Machine, &np).as_deref(),
@@ -27,14 +31,15 @@ pub fn desktop_camera_access() -> Access {
     )
 }
 
-/// `user`: HKCU NonPackaged value; `system`: HKLM values. "Deny" anywhere in HKLM wins.
-fn classify(user: Option<&str>, system: [Option<&str>; 2]) -> Access {
+/// `user`/`system`: `[webcam, webcam\NonPackaged]` values from HKCU/HKLM. "Deny" anywhere in
+/// HKLM wins, then "Deny" anywhere in HKCU; only an explicit HKCU NonPackaged "Allow" is Allowed.
+fn classify(user: [Option<&str>; 2], system: [Option<&str>; 2]) -> Access {
     let is = |v: Option<&str>, want: &str| v.is_some_and(|v| v.eq_ignore_ascii_case(want));
     if system.iter().any(|&v| is(v, "Deny")) {
         Access::DeniedBySystem
-    } else if is(user, "Deny") {
+    } else if user.iter().any(|&v| is(v, "Deny")) {
         Access::DeniedByUser
-    } else if is(user, "Allow") {
+    } else if is(user[1], "Allow") {
         Access::Allowed
     } else {
         Access::Unknown
@@ -103,13 +108,19 @@ mod tests {
     fn classify_registry_values() {
         let allow = Some("Allow");
         let deny = Some("Deny");
-        assert_eq!(classify(allow, [allow, None]), Access::Allowed);
-        assert_eq!(classify(allow, [None, None]), Access::Allowed);
-        assert_eq!(classify(deny, [allow, None]), Access::DeniedByUser);
-        assert_eq!(classify(allow, [deny, None]), Access::DeniedBySystem);
-        assert_eq!(classify(deny, [None, deny]), Access::DeniedBySystem);
-        assert_eq!(classify(None, [allow, None]), Access::Unknown);
-        assert_eq!(classify(Some("Prompt"), [allow, None]), Access::Unknown);
+        let (none, prompt) = (None, Some("Prompt"));
+        assert_eq!(classify([allow, allow], [allow, none]), Access::Allowed);
+        assert_eq!(classify([none, allow], [none, none]), Access::Allowed);
+        assert_eq!(classify([allow, deny], [allow, none]), Access::DeniedByUser);
+        // Master "Let apps access your camera" off while the desktop-apps switch still says Allow.
+        assert_eq!(classify([deny, allow], [allow, none]), Access::DeniedByUser);
+        assert_eq!(
+            classify([allow, allow], [deny, none]),
+            Access::DeniedBySystem
+        );
+        assert_eq!(classify([deny, deny], [none, deny]), Access::DeniedBySystem);
+        assert_eq!(classify([allow, none], [allow, none]), Access::Unknown);
+        assert_eq!(classify([allow, prompt], [allow, none]), Access::Unknown);
     }
 
     #[test]
