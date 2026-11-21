@@ -135,6 +135,7 @@ impl Pipeline {
         frame: &Frame,
         health: CameraHealth,
     ) -> Result<VisionReport, VisionError> {
+        crate::image_ops::check_frame(frame)?;
         let mut timings = StageTimings {
             detect_ms: 0.0,
             recognize_ms: 0.0,
@@ -158,6 +159,7 @@ impl Pipeline {
         let mut dets = self.det.detect(frame)?;
         timings.detect_ms = ms(t0);
         // Non-finite coordinates would poison the tracker and the report.
+        let n_det = dets.len();
         dets.retain(|d| {
             let b = d.bbox;
             let lm = d.landmarks5.iter().flat_map(|p| [p.x, p.y]);
@@ -166,6 +168,12 @@ impl Pipeline {
                 .chain(lm)
                 .all(f32::is_finite)
         });
+        if dets.len() < n_det {
+            tracing::warn!(
+                dropped = n_det - dets.len(),
+                "dropped detections with non-finite coordinates"
+            );
+        }
 
         let now = frame.ts_ms;
         let cfg = self.cfg;
@@ -554,6 +562,19 @@ mod tests {
         let mut h = Harness::new();
         h.set(None);
         assert!(h.p.process(&frame(0), CameraHealth::Ok).is_err());
+    }
+
+    #[test]
+    fn malformed_frame_is_an_error_before_any_stage() {
+        let mut h = Harness::new();
+        h.set(Some(vec![face()]));
+        let mut f = frame(0);
+        f.data = vec![0; 64 * 48 * 3 - 3].into();
+        assert!(matches!(
+            h.p.process(&f, CameraHealth::Ok),
+            Err(VisionError::Input(_))
+        ));
+        assert_eq!(h.calls.get(), [0, 0, 0, 0]);
     }
 
     #[test]

@@ -5,6 +5,22 @@ use image::imageops::{self, FilterType};
 use image::{ImageBuffer, Rgb, RgbImage};
 use ndarray::Array4;
 
+use crate::VisionError;
+
+/// Rejects an empty frame or one whose `data` does not match `width*height*3` (`Frame`'s fields
+/// are public, so the constructor's check can be bypassed); such a frame must never read as
+/// "no faces".
+pub fn check_frame(frame: &Frame) -> Result<(), VisionError> {
+    let (w, h) = (frame.width, frame.height);
+    if w == 0 || h == 0 || view(frame).is_none() {
+        return Err(VisionError::Input(format!(
+            "bad frame {w}x{h} with {} bytes",
+            frame.data.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Borrowed view of the frame; `None` only if `data` does not match `width*height*3`.
 fn view(frame: &Frame) -> Option<ImageBuffer<Rgb<u8>, &[u8]>> {
     ImageBuffer::from_raw(frame.width, frame.height, &frame.data[..])

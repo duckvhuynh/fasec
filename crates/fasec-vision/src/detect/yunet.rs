@@ -12,7 +12,7 @@ use ort::session::Session;
 use ort::value::TensorRef;
 
 use super::nms::nms;
-use crate::image_ops::{resize_rgb, to_nchw_f32};
+use crate::image_ops::{check_frame, resize_rgb, to_nchw_f32};
 use crate::runtime::StageSession;
 use crate::{Detection, FaceDetector, Runtime, VisionError};
 
@@ -95,10 +95,8 @@ impl YuNet {
 
 impl FaceDetector for YuNet {
     fn detect(&mut self, frame: &Frame) -> Result<Vec<Detection>, VisionError> {
+        check_frame(frame)?;
         let (fw, fh) = (frame.width, frame.height);
-        if fw == 0 || fh == 0 {
-            return Err(VisionError::Input(format!("empty frame {fw}x{fh}")));
-        }
         let (in_w, in_h) = (self.in_w, self.in_h);
         let scale = (self.cfg.input_long_side.max(1) as f32 / fw.max(fh) as f32)
             .min(in_w as f32 / fw as f32)
@@ -128,7 +126,8 @@ impl FaceDetector for YuNet {
 }
 
 /// Decodes the raw outputs (in [`OUTPUTS`] order) of an `in_w`×`in_h` input whose top-left
-/// `sw`×`sh` pixels hold the frame, into detections normalised to that frame.
+/// `sw`×`sh` pixels hold the frame, into detections normalised to that frame. Any non-finite
+/// output value is a model fault and an error, never "no faces".
 fn decode(
     outs: &[&[f32]; 12],
     in_w: usize,
@@ -147,10 +146,18 @@ fn decode(
                 "YuNet stride {stride}: unexpected output lengths for {n} anchors"
             )));
         }
+        if [cls, obj, bbox, kps]
+            .iter()
+            .any(|o| o.iter().any(|v| !v.is_finite()))
+        {
+            return Err(VisionError::Model(format!(
+                "YuNet stride {stride}: non-finite output"
+            )));
+        }
         let st = stride as f32;
         for idx in 0..n {
             let score = (cls[idx].clamp(0.0, 1.0) * obj[idx].clamp(0.0, 1.0)).sqrt();
-            if score.is_nan() || score < score_threshold {
+            if score < score_threshold {
                 continue;
             }
             let (c, r) = ((idx % cols) as f32, (idx / cols) as f32);
@@ -210,11 +217,9 @@ mod tests {
         v[4][6] = 0.81; // obj_16
         v[7][6 * 4..6 * 4 + 4].copy_from_slice(&[0.5, 0.25, 2f32.ln(), 0.0]);
         v[10][6 * 10..6 * 10 + 2].copy_from_slice(&[0.0, 0.5]); // first landmark
-        // below threshold and NaN anchors are dropped
+        // below-threshold anchors are dropped
         v[0][0] = 0.5;
         v[3][0] = 0.5;
-        v[2][1] = f32::NAN;
-        v[5][1] = 1.0;
         // the frame fills the left 32×64 of the input
         let dets = decode(&as_refs(&v), 64, 64, 32.0, 64.0, 0.6).unwrap();
         assert_eq!(dets.len(), 1);
@@ -230,6 +235,22 @@ mod tests {
         assert!(close(d.landmarks5[0].y, 24.0 / 64.0), "{d:?}");
         assert!(close(d.landmarks5[1].x, 32.0 / 32.0), "{d:?}");
         assert!(close(d.landmarks5[1].y, 16.0 / 64.0), "{d:?}");
+    }
+
+    #[test]
+    fn decode_rejects_non_finite_outputs() {
+        // every output tensor, NaN and ±inf: a numeric fault is an error, not "no faces"
+        for out in 0..12 {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut v = zero_outputs();
+                v[out][0] = bad;
+                let r = decode(&as_refs(&v), 64, 64, 64.0, 64.0, 0.6);
+                assert!(
+                    matches!(r, Err(VisionError::Model(_))),
+                    "output {out}, {bad}: {r:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -331,6 +352,10 @@ mod tests {
         assert!(det.detect(&black).unwrap().is_empty());
         let empty = Frame::new(0, 0, 0, 0, Vec::new()).unwrap();
         assert!(matches!(det.detect(&empty), Err(VisionError::Input(_))));
+        // `Frame` fields are public, so the length invariant can be broken after construction
+        let mut short = black.clone();
+        short.data = vec![0; 640 * 480 * 3 - 1].into();
+        assert!(matches!(det.detect(&short), Err(VisionError::Input(_))));
     }
 
     #[test]
