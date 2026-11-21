@@ -4,12 +4,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fasec_config::ExecutionProvider;
+use ort::environment::Environment;
 use ort::session::Session;
 
 use crate::VisionError;
 
 /// Creates ONNX Runtime sessions on the configured execution provider.
 pub struct Runtime {
+    env: Environment,
     requested: ExecutionProvider,
     /// DirectML is in use; `Auto` clears it (for good) on the first DirectML failure.
     directml: AtomicBool,
@@ -35,6 +37,7 @@ impl Runtime {
             },
         };
         let rt = Runtime {
+            env: ort::init().with_name("fasec").build()?,
             requested: ep,
             directml: AtomicBool::new(directml),
         };
@@ -51,7 +54,7 @@ impl Runtime {
             )));
         }
         if self.directml.load(Ordering::Relaxed) {
-            match directml::session(model_path) {
+            match directml::session(&self.env, model_path) {
                 Ok(s) => return Ok(s),
                 Err(e) if self.requested == ExecutionProvider::Auto => {
                     tracing::warn!(error = %e, model = %model_path.display(),
@@ -61,7 +64,7 @@ impl Runtime {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(Session::builder()?.commit_from_file(model_path)?)
+        Ok(Session::builder(&self.env)?.commit_from_file(model_path)?)
     }
 
     /// `"directml"` or `"cpu"`.
@@ -78,24 +81,23 @@ impl Runtime {
 mod directml {
     use std::path::Path;
 
-    use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
+    use ort::environment::Environment;
+    use ort::ep::{DirectML, ExecutionProvider};
     use ort::session::Session;
 
     pub fn available() -> Result<(), String> {
-        match DirectMLExecutionProvider::default().is_available() {
+        match DirectML::is_available() {
             Ok(true) => Ok(()),
             Ok(false) => Err("onnxruntime build has no DirectML provider".into()),
             Err(e) => Err(e.to_string()),
         }
     }
 
-    pub fn session(model_path: &Path) -> ort::Result<Session> {
-        Session::builder()?
+    pub fn session(env: &Environment, model_path: &Path) -> ort::Result<Session> {
+        Session::builder(env)?
             // DirectML does not support memory patterns (onnxruntime DirectML EP docs).
             .with_memory_pattern(false)?
-            .with_execution_providers([DirectMLExecutionProvider::default()
-                .build()
-                .error_on_failure()])?
+            .with_execution_providers([DirectML::default().build().error_on_failure()])?
             .commit_from_file(model_path)
     }
 }
@@ -104,13 +106,14 @@ mod directml {
 mod directml {
     use std::path::Path;
 
+    use ort::environment::Environment;
     use ort::session::Session;
 
     pub fn available() -> Result<(), String> {
         Err("DirectML is Windows-only".into())
     }
 
-    pub fn session(_model_path: &Path) -> ort::Result<Session> {
+    pub fn session(_env: &Environment, _model_path: &Path) -> ort::Result<Session> {
         Err(ort::Error::new("DirectML is Windows-only"))
     }
 }
@@ -149,8 +152,8 @@ mod tests {
     fn runtime_cpu_loads_yunet() {
         let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
         let s = rt.session(&verified_yunet()).unwrap();
-        assert_eq!(s.inputs.len(), 1);
-        assert!(!s.outputs.is_empty());
+        assert_eq!(s.inputs().len(), 1);
+        assert!(!s.outputs().is_empty());
         assert_eq!(rt.active_ep(), "cpu");
     }
 
@@ -159,7 +162,7 @@ mod tests {
     fn runtime_auto_loads_yunet() {
         let rt = Runtime::new(ExecutionProvider::Auto).unwrap();
         let s = rt.session(&verified_yunet()).unwrap();
-        assert_eq!(s.inputs.len(), 1);
+        assert_eq!(s.inputs().len(), 1);
         println!("active_ep = {}", rt.active_ep());
         assert!(["directml", "cpu"].contains(&rt.active_ep()));
     }

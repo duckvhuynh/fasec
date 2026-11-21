@@ -120,7 +120,7 @@ mod tests {
         let f = frame(8, 6, |_, _| [10, 20, 30]);
         let out = resize_rgb(&f, 5, 3);
         assert_eq!(out.len(), 5 * 3 * 3);
-        assert!(out.chunks_exact(3).all(|p| p == [10, 20, 30]));
+        assert!(out.as_chunks::<3>().0.iter().all(|p| *p == [10, 20, 30]));
     }
 
     #[test]

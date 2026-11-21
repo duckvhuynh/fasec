@@ -14,8 +14,9 @@ pub enum VisionError {
     Io(#[from] std::io::Error),
 }
 
-impl From<ort::Error> for VisionError {
-    fn from(e: ort::Error) -> Self {
+/// Generic over the recoverable payload (`ort::Error<SessionBuilder>` from builder calls).
+impl<R> From<ort::Error<R>> for VisionError {
+    fn from(e: ort::Error<R>) -> Self {
         VisionError::Ort(e.to_string())
     }
 }
