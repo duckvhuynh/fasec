@@ -29,10 +29,10 @@ impl Config {
         struct Header {
             version: Option<i64>,
         }
-        if let Some(v) = toml::from_str::<Header>(s)?.version {
-            if v < 1 || v > i64::from(CURRENT_VERSION) {
-                return Err(ConfigError::UnsupportedVersion(v));
-            }
+        if let Some(v) = toml::from_str::<Header>(s)?.version
+            && (v < 1 || v > i64::from(CURRENT_VERSION))
+        {
+            return Err(ConfigError::UnsupportedVersion(v));
         }
         // Only version 1 exists, so there is nothing to migrate yet.
         let cfg: Config = toml::from_str(s)?;

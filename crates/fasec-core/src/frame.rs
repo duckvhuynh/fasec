@@ -49,7 +49,7 @@ impl Frame {
     /// Mean Rec.601 luma in 0..255; 0 for an empty frame.
     pub fn mean_luma(&self) -> f32 {
         let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
-        for px in self.data.chunks_exact(3) {
+        for px in self.data.as_chunks::<3>().0 {
             r += u64::from(px[0]);
             g += u64::from(px[1]);
             b += u64::from(px[2]);
