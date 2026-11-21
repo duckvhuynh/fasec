@@ -1,0 +1,83 @@
+# SP-1: Overlay blur backends
+
+**Question:** does a top-most, non-activating (`WS_EX_NOACTIVATE`), tool-window, capture-excluded
+(`WDA_EXCLUDEFROMCAPTURE`) popup covering each monitor show a live blur of what is behind it on
+Windows 10 and Windows 11, and what does it fall back to? (SRS FR-OV-001, -002, -004, -005, -008)
+
+**Program:** `crates/fasec-overlay/examples/sp1_overlay.rs`
+
+```
+cargo run -p fasec-overlay --example sp1_overlay -- --mode <acrylic|backdrop|solid> [--seconds 15] [--click-through]
+```
+
+- `acrylic`: undocumented `user32!SetWindowCompositionAttribute(WCA_ACCENT_POLICY,
+  ACCENT_ENABLE_ACRYLICBLURBEHIND)`, tint `0x99101010` (AABBGGRR), loaded dynamically.
+- `backdrop`: `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)` then
+  `DwmExtendFrameIntoClientArea(-1)` (Win11 22H2+, build 22621+). The frame is only extended if
+  the backdrop call succeeds, so a failure stays opaque black instead of going transparent.
+- `solid`: opaque black (class background brush).
+- `--click-through` adds `WS_EX_LAYERED | WS_EX_TRANSPARENT` (+ `SetLayeredWindowAttributes(alpha 255)`).
+- Re-asserts `HWND_TOPMOST` every 250 ms. Esc (low-level keyboard hook, not swallowed) or
+  `--seconds` closes it.
+
+Transparency effects = Settings > Personalization > Colors > Transparency effects
+(`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\EnableTransparency`; the
+program prints it).
+
+"Overlay inactive" = start the overlay with `--click-through`, then click/Alt-Tab into another
+app so it has focus while the overlay stays on top. The overlay is never active in normal use
+(`WS_EX_NOACTIVATE`), so this is the row that matters; DWM may drop to a flat fallback colour for
+inactive windows.
+
+## Automated run on the dev machine (2026-11-21, by the implementer, screen not observed)
+
+Each mode was run with `--seconds 5`. Every run exited by itself after 5 s with exit code 0 and
+printed `keyboard hook removed`.
+
+| Item | Printed |
+|---|---|
+| Windows build | `26300.9974 (Windows 11)` |
+| Transparency effects | `on` |
+| Monitors | 1: `(0,0)-(1920,1200)`, 96 DPI (100%), primary |
+| `WDA_EXCLUDEFROMCAPTURE` | `ok` in every mode |
+| `--mode solid` | `Solid backend: applied`, 20 top-most re-asserts, 0 errors |
+| `--mode acrylic` | `Acrylic backend: applied` (SetWindowCompositionAttribute returned TRUE), 20 re-asserts, 0 errors |
+| `--mode backdrop` | `Backdrop backend: applied` (both DWM calls returned S_OK), 20 re-asserts, 0 errors |
+| `--mode acrylic --click-through` | `Acrylic backend: applied`, 20 re-asserts, 0 errors |
+
+No API returned an error. "Applied" only means the call succeeded. Whether a blur is actually
+visible has to be checked by eye in the table below.
+
+## Results (fill in by hand)
+
+Mark each cell `y` / `n`. **live blur?** = content behind is visibly blurred and updates live.
+**solid fallback?** = flat opaque/tinted colour, nothing behind readable. **transparent (bad)?** =
+content behind is readable (fails open, violates FR-OV-005).
+
+| OS (build) | Mode | Transparency | Overlay inactive (other app focused) | live blur? | solid fallback? | transparent (bad)? | Notes |
+|---|---|---|---|---|---|---|---|
+| Win10 | acrylic | on | no | | | | |
+| Win10 | acrylic | on | yes | | | | |
+| Win10 | acrylic | off | no | | | | |
+| Win10 | acrylic | off | yes | | | | |
+| Win10 | backdrop | on | no | | | | expected: unsupported, prints failure, stays black |
+| Win10 | backdrop | on | yes | | | | |
+| Win10 | backdrop | off | no | | | | |
+| Win10 | backdrop | off | yes | | | | |
+| Win11 (26300) | acrylic | on | no | | | | |
+| Win11 (26300) | acrylic | on | yes | | | | |
+| Win11 (26300) | acrylic | off | no | | | | |
+| Win11 (26300) | acrylic | off | yes | | | | |
+| Win11 (26300) | backdrop | on | no | | | | |
+| Win11 (26300) | backdrop | on | yes | | | | |
+| Win11 (26300) | backdrop | off | no | | | | |
+| Win11 (26300) | backdrop | off | yes | | | | |
+
+Also worth noting per row: does a screenshot (Win+Shift+S, OBS, Teams share) show the overlay
+(it should not: `WDA_EXCLUDEFROMCAPTURE`)? Does the blur survive `--click-through`
+(layered window)? Any lag dragging a window behind the overlay?
+
+## Conclusion
+
+_To be written after the table is filled: which backend to use as default on Win10 / Win11, and
+the conditions under which the app must fall back to solid._
