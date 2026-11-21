@@ -675,4 +675,171 @@ mod tests {
         .err();
         assert!(matches!(err, Some(CameraError::NotFound { .. })), "{err:?}");
     }
+
+    type Step = Result<(Vec<u8>, u32, u32), CameraError>;
+
+    /// Plays back what the test sends, one result per `next_rgb`; errors out once the sender is gone.
+    struct Scripted(mpsc::Receiver<Step>);
+    impl FrameSource for Scripted {
+        fn next_rgb(&mut self) -> Step {
+            self.0
+                .recv()
+                .unwrap_or_else(|_| Err(CameraError::Backend("script over".into())))
+        }
+    }
+
+    fn good() -> Step {
+        Ok((vec![200; 3], 1, 1))
+    }
+
+    /// Polls (instead of fixed sleeps) until `cond` holds.
+    fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn errors_never_reach_the_slot_and_seq_stays_contiguous_after_recovery() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(good()).expect("first frame");
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::spawn(
+            move || Ok(Scripted(rx)),
+            &CameraConfig::default(),
+            Arc::clone(&slot),
+        )
+        .expect("start");
+        assert_eq!(
+            slot.take_newer(0, Duration::from_secs(1)).map(|f| f.seq),
+            Some(1)
+        );
+
+        // A wrong-sized decode is an error, not a (corrupt) frame.
+        tx.send(Ok((vec![0; 5], 2, 1))).expect("send");
+        wait_for(
+            "size mismatch error",
+            || matches!(cap.last_error(), Some(CameraError::Backend(m)) if m.contains("decoded 5 bytes")),
+        );
+        assert!(matches!(cap.health(), CameraHealth::Error(_)));
+        assert!(slot.take_newer(1, Duration::from_millis(50)).is_none());
+
+        // Latest error of the streak wins; each maps to its health (FR-CAM-005/008).
+        tx.send(Err(CameraError::Busy)).expect("send");
+        wait_for("Busy", || cap.last_error() == Some(CameraError::Busy));
+        assert_eq!(cap.health(), CameraHealth::Busy);
+        tx.send(Err(CameraError::PermissionDenied)).expect("send");
+        wait_for("PermissionDenied", || {
+            cap.last_error() == Some(CameraError::PermissionDenied)
+        });
+        assert_eq!(cap.health(), CameraHealth::PermissionDenied);
+        tx.send(Err(CameraError::NotFound { id: "x".into() }))
+            .expect("send");
+        wait_for("NotFound", || {
+            matches!(cap.last_error(), Some(CameraError::NotFound { .. }))
+        });
+        assert_eq!(
+            cap.health(),
+            CameraHealth::Lost,
+            "unplugged is Lost at once"
+        );
+        assert!(slot.take_newer(1, Duration::from_millis(50)).is_none());
+
+        // Recovery: failed reads consumed no sequence numbers, the next frame is 2.
+        tx.send(good()).expect("send");
+        assert_eq!(
+            slot.take_newer(1, Duration::from_secs(2)).map(|f| f.seq),
+            Some(2)
+        );
+        wait_for("error cleared", || cap.last_error().is_none());
+        assert_eq!(cap.health(), CameraHealth::Ok);
+        drop(tx); // unblocks the source so Drop does not wait for it
+        drop(cap);
+    }
+
+    #[test]
+    fn start_rejects_a_first_frame_of_the_wrong_size() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok((vec![0; 5], 2, 1))).expect("send");
+        let err = Capture::spawn(
+            move || Ok(Scripted(rx)),
+            &CameraConfig::default(),
+            Arc::new(LatestFrame::new()),
+        )
+        .err();
+        assert!(matches!(err, Some(CameraError::Backend(m)) if m.contains("decoded 5 bytes")));
+        drop(tx);
+    }
+
+    #[test]
+    fn start_reports_an_open_failure() {
+        let err = Capture::spawn(
+            || Err::<Fake, _>(CameraError::NotFound { id: "gone".into() }),
+            &CameraConfig::default(),
+            Arc::new(LatestFrame::new()),
+        )
+        .err();
+        assert_eq!(err, Some(CameraError::NotFound { id: "gone".into() }));
+    }
+
+    #[test]
+    fn capture_applies_mirror_from_config() {
+        let cfg = CameraConfig {
+            mirror: true,
+            ..CameraConfig::default()
+        };
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::spawn(|| Ok(Fake), &cfg, Arc::clone(&slot)).expect("start");
+        let f = slot.take_newer(0, Duration::from_secs(1)).expect("frame");
+        assert_eq!((f.width, f.height), (2, 1));
+        assert_eq!(&f.data[..], &[4, 5, 6, 1, 2, 3]);
+        drop(cap);
+    }
+
+    #[test]
+    fn slow_consumer_gets_the_latest_frame_and_never_the_same_one_twice() {
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::spawn(|| Ok(Fake), &CameraConfig::default(), Arc::clone(&slot))
+            .expect("start");
+        // Consumer far slower than the camera (5 ms/frame): frames are dropped, not queued.
+        std::thread::sleep(Duration::from_millis(300));
+        let first = slot.take_newer(0, Duration::from_secs(1)).expect("frame");
+        assert!(first.seq > 5, "got a stale frame {}", first.seq);
+        let (mut last, mut skipped) = (first.seq, false);
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(60));
+            let f = slot
+                .take_newer(last, Duration::from_secs(1))
+                .expect("frame");
+            assert!(f.seq > last);
+            skipped |= f.seq > last + 1;
+            last = f.seq;
+        }
+        assert!(skipped, "a slow consumer must see gaps (dropped frames)");
+        drop(cap);
+    }
+
+    #[test]
+    fn stalled_camera_hands_out_nothing_stale() {
+        let slot = Arc::new(LatestFrame::new());
+        let cap = Capture::spawn(
+            || Ok(StallsAfterFirst(false)),
+            &CameraConfig::default(),
+            Arc::clone(&slot),
+        )
+        .expect("start");
+        assert_eq!(
+            slot.take_newer(0, Duration::from_secs(1)).map(|f| f.seq),
+            Some(1)
+        );
+        let at = cap.last_frame_at();
+        assert!(slot.take_newer(1, Duration::from_millis(200)).is_none());
+        assert!(
+            slot.take_newer(0, Duration::ZERO).is_none(),
+            "frame 1 was taken"
+        );
+        assert_eq!(cap.last_frame_at(), at, "no frame arrived");
+    }
 }

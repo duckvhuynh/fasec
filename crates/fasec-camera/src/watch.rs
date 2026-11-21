@@ -160,4 +160,18 @@ mod tests {
             Err(crossbeam_channel::RecvTimeoutError::Disconnected)
         ));
     }
+
+    #[test]
+    fn watch_guard_can_move_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<WatchGuard>();
+        assert_send::<CameraEvent>();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn watch_fails_cleanly_without_windows() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert!(matches!(watch(tx), Err(CameraError::Backend(_))));
+    }
 }

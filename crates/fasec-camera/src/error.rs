@@ -57,4 +57,22 @@ mod tests {
             matches!(CameraError::from(open("boom")), CameraError::Backend(m) if m.contains("boom"))
         );
     }
+
+    #[test]
+    fn maps_second_busy_code_and_keeps_unrelated_errors_as_backend() {
+        let read = |why: &str| NokhwaError::ReadFrameError(why.into());
+        assert_eq!(
+            CameraError::from(read("preempted (0xC00D3EA3)")),
+            CameraError::Busy
+        );
+        assert_eq!(
+            CameraError::from(read("denied (0x80070005)")),
+            CameraError::PermissionDenied
+        );
+        // A different HRESULT must not be mistaken for busy/denied.
+        assert!(matches!(
+            CameraError::from(read("failure (0x80004005)")),
+            CameraError::Backend(m) if m.contains("0x80004005")
+        ));
+    }
 }

@@ -130,4 +130,26 @@ mod tests {
         #[cfg(not(windows))]
         assert_eq!(access, Access::Unknown);
     }
+
+    #[test]
+    fn classify_is_case_insensitive_and_unset_means_unknown() {
+        assert_eq!(
+            classify([Some("allow"), Some("DENY")], [None, None]),
+            Access::DeniedByUser
+        );
+        assert_eq!(
+            classify([Some("ALLOW"), Some("aLLoW")], [None, None]),
+            Access::Allowed
+        );
+        assert_eq!(classify([None, None], [None, None]), Access::Unknown);
+        assert_eq!(
+            classify([Some(""), Some("")], [None, None]),
+            Access::Unknown
+        );
+        // A device-wide Allow never grants on its own; only the user's desktop-apps switch does.
+        assert_eq!(
+            classify([None, None], [Some("Allow"), Some("Allow")]),
+            Access::Unknown
+        );
+    }
 }

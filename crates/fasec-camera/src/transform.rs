@@ -87,4 +87,70 @@ mod tests {
         let (out, w, _) = apply(&img3x2(), 3, 2, 90, true);
         assert_eq!(px(&out, w, 0, 0), [0, 0, 9]);
     }
+
+    type Grid = Vec<Vec<[u8; 3]>>;
+
+    fn to_grid(data: &[u8], w: usize) -> Grid {
+        data.chunks(w * 3)
+            .map(|row| row.chunks(3).map(|p| [p[0], p[1], p[2]]).collect())
+            .collect()
+    }
+
+    /// Independent oracle: clockwise quarter turn, `new[r][c] = old[h - 1 - c][r]`.
+    fn rot90(g: &Grid) -> Grid {
+        let (h, w) = (g.len(), g[0].len());
+        (0..w)
+            .map(|r| (0..h).map(|c| g[h - 1 - c][r]).collect())
+            .collect()
+    }
+
+    /// Distinct pixel per cell.
+    fn img(w: u32, h: u32) -> Vec<u8> {
+        (0..h)
+            .flat_map(|y| (0..w).flat_map(move |x| [x as u8, y as u8, (y * w + x) as u8]))
+            .collect()
+    }
+
+    #[test]
+    fn transform_matches_reference_for_every_rotation_mirror_and_shape() {
+        for (w, h) in [(3u32, 2u32), (1, 4), (4, 1), (5, 3), (1, 1)] {
+            let src = img(w, h);
+            for rotation in [0u16, 90, 180, 270] {
+                for mirror in [false, true] {
+                    let mut want = to_grid(&src, w as usize);
+                    for _ in 0..rotation / 90 {
+                        want = rot90(&want);
+                    }
+                    if mirror {
+                        want.iter_mut().for_each(|row| row.reverse());
+                    }
+                    let (out, ow, oh) = apply(&src, w, h, rotation, mirror);
+                    let case = format!("{w}x{h} rot {rotation} mirror {mirror}");
+                    assert_eq!(
+                        (ow as usize, oh as usize),
+                        (want[0].len(), want.len()),
+                        "{case}"
+                    );
+                    assert_eq!(to_grid(&out, ow as usize), want, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_unsupported_rotation_acts_as_zero_and_four_turns_are_identity() {
+        let src = img(3, 2);
+        for rotation in [45u16, 360, 450, u16::MAX] {
+            assert_eq!(apply(&src, 3, 2, rotation, false), (src.clone(), 3, 2));
+            assert_eq!(
+                apply(&src, 3, 2, rotation, true),
+                apply(&src, 3, 2, 0, true)
+            );
+        }
+        let (mut data, mut w, mut h) = (src.clone(), 3, 2);
+        for _ in 0..4 {
+            (data, w, h) = apply(&data, w, h, 90, false);
+        }
+        assert_eq!((data, w, h), (src, 3, 2));
+    }
 }

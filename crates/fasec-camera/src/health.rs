@@ -201,4 +201,40 @@ mod tests {
         m.on_frame(5000, BRIGHT);
         assert_eq!(m.evaluate(4000), CameraHealth::Ok);
     }
+
+    #[test]
+    fn custom_thresholds_are_honoured() {
+        let mut m = HealthMonitor::new(HealthConfig {
+            frame_timeout_ms: 100,
+            black_luma: 50.0,
+            black_ms: 300,
+        });
+        feed(&mut m, 0, 400, 20, 49.9); // just below the custom threshold
+        assert_eq!(
+            m.evaluate(300),
+            CameraHealth::Ok,
+            "black for exactly 300 ms"
+        );
+        assert_eq!(m.evaluate(301), CameraHealth::Covered);
+        assert_eq!(m.evaluate(400 + 101), CameraHealth::Lost);
+        m.on_frame(900, 50.0); // at the threshold: not black
+        assert_eq!(m.evaluate(950), CameraHealth::Ok);
+    }
+
+    #[test]
+    fn luma_just_below_threshold_is_black() {
+        let mut m = mon();
+        feed(&mut m, 0, 2100, 33, 9.99);
+        assert_eq!(m.evaluate(2100), CameraHealth::Covered);
+    }
+
+    #[test]
+    fn black_streak_counts_from_its_first_frame_not_the_last() {
+        let mut m = mon();
+        m.on_frame(0, BLACK);
+        // Sparse black frames (slow camera) still add up to > 2 s since the streak began.
+        m.on_frame(1000, BLACK);
+        m.on_frame(2001, BLACK);
+        assert_eq!(m.evaluate(2002), CameraHealth::Covered);
+    }
 }

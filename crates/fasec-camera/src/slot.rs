@@ -120,4 +120,85 @@ mod tests {
         );
         consumer.join().expect("consumer thread");
     }
+
+    #[test]
+    fn slot_keeps_a_frame_that_is_not_newer() {
+        let slot = LatestFrame::new();
+        slot.put(frame(3));
+        // Asking for newer than 5 must not consume (or lose) the frame.
+        assert!(slot.take_newer(5, Duration::ZERO).is_none());
+        assert_eq!(slot.take_newer(2, Duration::ZERO).map(|f| f.seq), Some(3));
+    }
+
+    #[test]
+    fn slot_ignores_stale_put_and_keeps_waiting_for_newer() {
+        let slot = Arc::new(LatestFrame::new());
+        let producer = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                slot.put(frame(3)); // wakes the waiter, but is not newer than 5
+                std::thread::sleep(Duration::from_millis(50));
+                slot.put(frame(6));
+            })
+        };
+        assert_eq!(
+            slot.take_newer(5, Duration::from_secs(5)).map(|f| f.seq),
+            Some(6)
+        );
+        producer.join().expect("producer thread");
+    }
+
+    #[test]
+    fn slot_put_does_not_wait_for_a_parked_consumer() {
+        let slot = Arc::new(LatestFrame::new());
+        let consumer = {
+            let slot = Arc::clone(&slot);
+            // Nothing is ever newer than u64::MAX, so this waits out its whole timeout.
+            std::thread::spawn(move || slot.take_newer(u64::MAX, Duration::from_secs(3)))
+        };
+        std::thread::sleep(Duration::from_millis(50)); // consumer is now waiting in the slot
+        let t0 = Instant::now();
+        for seq in 1..=10_000 {
+            slot.put(frame(seq));
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "puts blocked behind a waiting consumer: {:?}",
+            t0.elapsed()
+        );
+        assert!(consumer.join().expect("consumer thread").is_none());
+    }
+
+    #[test]
+    fn slot_concurrent_consumer_sees_increasing_seqs_and_the_last_frame() {
+        const LAST: u64 = 5000;
+        let slot = Arc::new(LatestFrame::new());
+        let producer = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                for seq in 1..=LAST {
+                    slot.put(frame(seq));
+                    if seq % 64 == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        };
+        let mut last = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while last < LAST && Instant::now() < deadline {
+            if let Some(f) = slot.take_newer(last, Duration::from_millis(50)) {
+                assert!(
+                    f.seq > last,
+                    "stale or repeated frame {} after {last}",
+                    f.seq
+                );
+                last = f.seq;
+            }
+        }
+        producer.join().expect("producer thread");
+        // Dropping may skip frames, never the newest one.
+        assert_eq!(last, LAST);
+    }
 }
