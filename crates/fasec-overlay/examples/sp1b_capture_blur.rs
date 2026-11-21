@@ -11,6 +11,7 @@
 //! positive control for that check. Closes after `--seconds` or on Esc.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowDisplayAffinity,
     SetWindowPos, SetWindowsHookExW, ShowWindow, ULW_OPAQUE, UnhookWindowsHookEx,
     UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_SYSKEYDOWN,
@@ -52,6 +53,8 @@ const MARKER_Y: usize = 64;
 const MARKER_SIZE: usize = 48;
 const MARKER_BGRA: [u8; 4] = [255, 0, 255, 255];
 const WM_FRAME: u32 = WM_APP + 1;
+/// Set by the Esc hook; checked on every frame because WM_QUIT/WM_TIMER can starve behind WM_FRAME.
+static ESC: AtomicBool = AtomicBool::new(false);
 
 struct Args {
     monitor: usize,
@@ -200,11 +203,12 @@ fn blur(
         let nrows = rows.len();
         for y in rows {
             let row = &src[y * pitch..y * pitch + w * 4];
-            for (x, px) in row.chunks_exact(4).enumerate() {
-                let a = &mut acc[x / d];
-                a[0] += u32::from(px[0]);
-                a[1] += u32::from(px[1]);
-                a[2] += u32::from(px[2]);
+            for (a, block) in acc.iter_mut().zip(row.chunks(d * 4)) {
+                for px in block.chunks_exact(4) {
+                    a[0] += u32::from(px[0]);
+                    a[1] += u32::from(px[1]);
+                    a[2] += u32::from(px[2]);
+                }
             }
         }
         for (sx, a) in acc.iter().enumerate() {
@@ -282,6 +286,7 @@ unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         let kb = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
         if kb.vkCode == u32::from(VK_ESCAPE.0) {
             println!("Esc pressed, closing");
+            ESC.store(true, Ordering::Relaxed);
             // SAFETY: LL hooks run on the installing thread, so this ends our message loop.
             unsafe { PostQuitMessage(0) };
         }
@@ -462,6 +467,11 @@ fn main() -> Result<()> {
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
         match msg.message {
             WM_FRAME => {
+                // WM_TIMER is lowest priority: a frame flood must not remove the exits.
+                if ESC.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    println!("Esc or {} s deadline reached, closing", args.seconds);
+                    break;
+                }
                 let t = Instant::now();
                 {
                     let mut s = shared.lock().expect("lock poisoned");
@@ -520,8 +530,10 @@ fn main() -> Result<()> {
                 let dt = now - last;
                 if dt >= Duration::from_secs(1) {
                     let cpu = process_cpu_time();
-                    let cpu_pct =
-                        (cpu - last_cpu).as_secs_f64() / dt.as_secs_f64() / cores as f64 * 100.0;
+                    let cpu_pct = cpu.saturating_sub(last_cpu).as_secs_f64()
+                        / dt.as_secs_f64()
+                        / cores as f64
+                        * 100.0;
                     let mut s = shared.lock().expect("lock poisoned");
                     let ms = |d: Duration, n: u32| d.as_secs_f64() * 1000.0 / f64::from(n.max(1));
                     println!(
@@ -559,6 +571,10 @@ fn main() -> Result<()> {
         }
     }
 
+    // Uncover the screen and release the hook before anything that might block.
+    // SAFETY: valid hwnd.
+    let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+    drop(_hook);
     let result = capture.stop();
     let s = shared.lock().expect("lock poisoned");
     println!(

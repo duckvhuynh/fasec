@@ -10,6 +10,10 @@ capture-excluded overlay? Do we need a GPU blur?
 cargo run --release -p fasec-overlay --example sp1b_capture_blur -- [--monitor 0] [--seconds 15] [--downscale 8] [--no-exclude]
 ```
 
+> **Warning:** while it runs, the whole monitor is covered by the blurred overlay and clicks do
+> not reach the windows behind it. Press **Esc** to close it early. Otherwise it closes by
+> itself after `--seconds`.
+
 - Overlay: one `WS_POPUP` covering the monitor, `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
   | WS_EX_NOACTIVATE`, `WDA_EXCLUDEFROMCAPTURE` (the program refuses to run if that fails),
   top-most re-asserted every 250 ms. It stays invisible until the first blurred frame is presented.
@@ -17,7 +21,9 @@ cargo run --release -p fasec-overlay --example sp1b_capture_blur -- [--monitor 0
   off, capture border off where the OS supports turning it off. The default
   `MinUpdateInterval` is used, so there is no frame cap.
 - Blur, CPU, single-threaded, on the capture thread: box-average `d`×`d` blocks
-  (`--downscale d`), then bilinear upscale back to full resolution.
+  (`--downscale d`), then bilinear upscale back to full resolution. This is **naive scalar
+  code** (no SIMD, per-channel bounds-checked indexing, per-pixel bilinear in the inner loop),
+  written to get a number, not to be fast.
 - Present, on the UI thread: copy into a top-down 32-bit DIB section, then
   `UpdateLayeredWindow(ULW_OPAQUE)`.
 - Printed every second: capture FPS, readback ms (`Frame::buffer`: staging texture,
@@ -27,8 +33,11 @@ cargo run --release -p fasec-overlay --example sp1b_capture_blur -- [--monitor 0
   Every captured frame is checked for it. If the overlay were in its own capture (a "hall of
   mirrors"), the square would show up in the captured frame. `--no-exclude` skips
   `WDA_EXCLUDEFROMCAPTURE` and serves as the positive control for this check.
-- Esc (low-level keyboard hook, not swallowed, removed by a Drop guard) or `--seconds` closes
-  the program. It also exits if the capture thread dies.
+- Esc (low-level keyboard hook, not swallowed) or `--seconds` closes the program. Both are
+  checked on every frame as well as on the 250 ms timer, because `WM_TIMER`/`WM_QUIT` can be
+  starved by a flood of frame messages. On exit the overlay is hidden and the hook removed
+  *before* the capture is stopped, so a slow `stop()` cannot leave the screen covered. It also
+  exits if the capture thread dies.
 
 Use `--release`. The numbers below are release builds.
 
@@ -36,10 +45,11 @@ Use `--release`. The numbers below are release builds.
 
 Machine: Intel Core i7-14650HX (24 logical cores), NVIDIA RTX 5060 Laptop + Intel UHD,
 Windows 11 build 26300. Monitor 0: `\\.\DISPLAY1`, 1920×1200 native, 165 Hz, 100 % DPI.
-Each run: `--seconds 10`, exit code 0, `keyboard hook removed`. The desktop behind the overlay
+Each run: `--seconds 10`, exit code 0, `keyboard hook removed`. All numbers are for the
+naive scalar blur described above. The desktop behind the overlay
 was whatever was open at the time (a terminal session). Nobody interacted with it.
 
-Native resolution, 1920×1200. Means of the per-second lines:
+Native resolution, 1920×1200. Means of the per-second lines (original box pass, with a per-pixel `x / d`):
 
 | `--downscale` | capture FPS | readback ms | blur ms | present ms | process CPU % (of 24 logical) | ≈ logical cores | marker in capture |
 |---|---|---|---|---|---|---|---|
@@ -58,17 +68,39 @@ exception was a noisy `--downscale 16` run (32–40 fps, blur 15–19 ms, presen
 cost does not depend on `--downscale`, so that run reflects load elsewhere on the machine, not
 the setting.
 
-**1080p:** not measured. This machine's only monitor is 1920×1200, and changing the display mode
-was out of scope for an unattended run. Every stage is a full-resolution pass, so the cost scales
-with pixel count. 1920×1080 is 0.90× the pixels, which gives an *estimate* of blur ≈ 10.4 ms,
-readback ≈ 2.1 ms and present ≈ 2.0 ms per frame. To measure it, run the same command on a 1080p
-monitor and add a row.
+After review, the box pass was rewritten row-wise (one accumulator per `d`-pixel chunk, which
+removes the per-pixel `x / d` division) and measured again with the same 10 s runs:
+
+| `--downscale` | capture FPS | readback ms | blur ms | present ms | process CPU % | marker in capture |
+|---|---|---|---|---|---|---|
+| 4  | 44.3 | 2.4 | 13.1 | 2.5 | 2.8 | 0 / 443 |
+| 8  | 49.4 | 2.3 | 10.9 | 2.2 | 2.8 | 0 / 494 |
+| 16 | 46.2 | 2.3 | 12.1 | 2.6 | 2.9 | 0 / 462 |
+
+There was no measurable change: the 10.9–13.1 ms spread is within run-to-run noise (single
+seconds ranged from 9.1 to 17.0 ms). The division was not the bottleneck, so the bilinear pass
+probably dominates. This was not profiled.
+
+**1080p: to be measured by a human.** This machine's only monitor is 1920×1200, and changing the
+display mode is a system setting, which was out of scope for an unattended run. *Estimate
+only*: every stage runs at full resolution and 1920×1080 is 0.90× the pixels, which gives blur
+≈ 10.4 ms, readback ≈ 2.1 ms and present ≈ 2.0 ms per frame. To measure it, run the same command
+on a 1080p monitor and fill in:
+
+| `--downscale` | capture FPS | readback ms | blur ms | present ms | process CPU % | marker in capture |
+|---|---|---|---|---|---|---|
+| 4  | _to be measured by a human_ | | | | | |
+| 8  | _to be measured by a human_ | | | | | |
+| 16 | _to be measured by a human_ | | | | | |
 
 ### Observations
 
-- **`--downscale` barely matters** (blur 11.5–12.1 ms for 4/8/16). The cost is set by the two
-  full-resolution passes: reading 9.2 MB in the box pass and writing 9.2 MB in the bilinear
-  pass. The small intermediate image doesn't move the total.
+- **`--downscale` barely matters** (blur 11–13 ms for 4/8/16) because both passes, the box
+  read and the bilinear write, loop over every full-resolution pixel no matter what `d` is.
+  The cost is **compute-bound, not memory-bound**: 9.2 MB in about 12 ms is under 1 GB/s, far
+  below memory bandwidth. It is the cost of this naive scalar code. Removing the per-pixel
+  division gave no measurable gain, which suggests the bilinear inner loop dominates. That is
+  a hypothesis: nothing was profiled.
 - **Per frame, the CPU does about 16 ms of work** (readback + blur on the capture thread,
   present on the UI thread). At about 47 fps that comes to about 0.7 of a logical core,
   continuously, for one 1920×1200 monitor. On a 4-core / 8-thread laptop that would show as
@@ -87,12 +119,17 @@ monitor and add a row.
 
 _To be decided by a human._ Data for the decision:
 
-- CPU fallback as built: about 0.7 logical core per 1920×1200 monitor at about 47 fps, roughly
-  linear in pixel count and monitor count. A 4K monitor would be about 3.6× that.
-- The cheap CPU-side levers don't reduce the full-resolution passes. A bigger downscale doesn't
-  help, as measured. What would help: a frame cap (`MinUpdateInterval`, for example 15–30 fps),
-  multi-threading (lowers latency, not CPU), or downscaling on the GPU before readback, so that
-  only the small image crosses to the CPU and gets blurred. The last option is already GPU work.
-- Implementer's suggestion: yes, do downscale and blur on the GPU (a D3D11 compute or pixel
-  shader on the WGC texture, presented through DirectComposition or a swap chain). Keep the CPU
-  path only as a last-resort fallback with a frame cap. Not decided here.
+- CPU fallback **as built (naive scalar, single-threaded)**: about 0.7 logical core per
+  1920×1200 monitor at about 47 fps, roughly linear in pixel count and monitor count. A 4K
+  monitor would be about 3.6× that. This is **not a ceiling for CPU blur**.
+- Measured: a bigger downscale does not help, and neither does removing the `x / d` division.
+  Untested CPU options that could plausibly cut the cost several times over: SIMD (or
+  auto-vectorisable code without per-channel bounds checks), a separable bilinear upscale with
+  precomputed row blends, or presenting the small image and letting a stretched blit or the
+  compositor do the upscale. Options that cut CPU without speeding up the code: a frame cap
+  (`MinUpdateInterval`, for example 15–30 fps), or downscaling on the GPU before readback, so
+  that only the small image crosses to the CPU. Multi-threading lowers latency, not CPU.
+- Implementer's suggestion: GPU downscale and blur (a D3D11 shader on the WGC texture) is the
+  cleanest route, because the frame is already on the GPU. But the case for it is weaker than
+  "CPU cannot do it": an optimised CPU path with a frame cap has not been tried. Not decided
+  here.
