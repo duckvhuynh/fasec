@@ -713,4 +713,90 @@ mod tests {
         );
         assert!(min_sharp > DEFAULT_MIN_SHARPNESS && DEFAULT_MIN_SHARPNESS > max_blur);
     }
+
+    // ---- audit additions ----
+
+    #[test]
+    #[ignore = "BUG: samples_per_pose = 0 makes finish() return Ok(empty) - an enrolment with no templates succeeds (enrol.rs:118-123,213-219)"]
+    fn zero_samples_per_pose_is_never_a_complete_enrolment() {
+        let mut e = Enrolment::new(EnrolConfig {
+            samples_per_pose: 0,
+            ..EnrolConfig::default()
+        });
+        let _ = e.offer(
+            &frame(10, true),
+            &report(10, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, 10)),
+        );
+        assert!(
+            !matches!(e.finish(), Ok(s) if s.is_empty()),
+            "empty enrolment reported success"
+        );
+    }
+
+    /// Sharpness is measured on `frame`, the embedding on the frame at `report.ts_ms`;
+    /// a sharp unrelated frame must not vouch for a blurry embedding frame.
+    #[test]
+    #[ignore = "BUG: frame.ts_ms is never compared with report.ts_ms / embedding ts, so the blur gate can run on a different frame (enrol.rs:163-169,187-195)"]
+    fn frame_from_another_timestamp_is_rejected() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let v = e.offer(
+            &frame(5, true), // sharp frame from t=5
+            &report(10, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, 10)), // embedding/report from t=10
+        );
+        assert!(matches!(v, SampleVerdict::Rejected(_)), "{v:?}");
+        assert_eq!(e.progress().0, 0);
+    }
+
+    #[test]
+    fn rejected_frames_between_good_ones_never_store_or_advance() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let good = |ts: u64| {
+            (
+                frame(ts, true),
+                report(ts, vec![track(1, 0.0, 0.0)]),
+                emb(1, ts),
+            )
+        };
+        let (f, r, te) = good(1);
+        assert!(matches!(
+            e.offer(&f, &r, Some(&te)),
+            SampleVerdict::Accepted { .. }
+        ));
+        // second face, blur, spoof, stale embedding: progress stays at 1
+        let mut two = report(2, vec![track(1, 0.0, 0.0)]);
+        two.tracks.push(track(2, 0.0, 0.0));
+        let mut spoof = report(3, vec![track(1, 0.0, 0.0)]);
+        spoof.tracks[0].liveness = LivenessState::Spoof {
+            score: 0.1,
+            tier: LivenessTier::Rgb,
+        };
+        for (f, r, te) in [
+            (frame(2, true), two, emb(1, 2)),
+            (
+                frame(3, false),
+                report(3, vec![track(1, 0.0, 0.0)]),
+                emb(1, 3),
+            ),
+            (frame(3, true), spoof, emb(1, 3)),
+            (
+                frame(1, true),
+                report(1, vec![track(1, 0.0, 0.0)]),
+                emb(1, 1),
+            ),
+        ] {
+            assert!(matches!(
+                e.offer(&f, &r, Some(&te)),
+                SampleVerdict::Rejected(_)
+            ));
+            assert_eq!(e.progress(), (1, 10));
+        }
+        let (f, r, te) = good(4);
+        assert!(matches!(
+            e.offer(&f, &r, Some(&te)),
+            SampleVerdict::Accepted { pose: Pose::Front }
+        ));
+        assert_eq!(e.progress(), (2, 10));
+    }
 }

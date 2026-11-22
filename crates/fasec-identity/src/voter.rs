@@ -320,4 +320,74 @@ mod tests {
             IdentityState::Stranger { best: 0.1 }
         );
     }
+
+    // ---- audit additions ----
+
+    #[test]
+    fn stranger_to_known_recovery_needs_unbroken_streak() {
+        let mut v = Voter::default();
+        feed(&mut v, T, &vec![stranger(0.1); 5]);
+        // Interleaved non-matches reset the streak: never Known.
+        for _ in 0..4 {
+            let s = feed(
+                &mut v,
+                T,
+                &[known("a", 0.7), known("a", 0.7), stranger(0.1)],
+            );
+            assert!(!is_known(&s, "a"), "{s:?}");
+        }
+        // A different person in between also breaks it.
+        let s = feed(
+            &mut v,
+            T,
+            &[known("a", 0.7), known("a", 0.7), known("b", 0.7)],
+        );
+        assert!(!is_known(&s, "a") && !is_known(&s, "b"), "{s:?}");
+        // Three in a row for one person recover, with that person and latest score.
+        let s = feed(&mut v, T, &[known("b", 0.6), known("b", 0.65)]);
+        assert_eq!(
+            s,
+            IdentityState::Known {
+                person: "b".into(),
+                score: 0.65
+            }
+        );
+        // And the recovered identity is again sticky against one bad frame.
+        assert!(is_known(&v.observe(T, &stranger(0.1), 0), "b"));
+    }
+
+    #[test]
+    fn ambiguous_after_known_never_becomes_other_person() {
+        let amb = MatchResult::Ambiguous {
+            best: 0.5,
+            second: 0.49,
+        };
+        let mut v = Voter::default();
+        feed(&mut v, T, &[known("a", 0.7)]);
+        let s = feed(&mut v, T, &[amb.clone(), amb.clone(), amb]);
+        assert_eq!(s, IdentityState::Stranger { best: 0.5 });
+    }
+
+    #[test]
+    fn many_tracks_retain_forget_only_touch_the_right_ones() {
+        let mut v = Voter::default();
+        for i in 0..500u64 {
+            v.observe(TrackId(i), &known("a", 0.7), 0);
+        }
+        v.forget(TrackId(9999)); // unknown track: no panic, no effect
+        v.retain(&[TrackId(3), TrackId(400), TrackId(12345)]);
+        // survivors keep their decision: one contrary frame does not flip
+        assert!(is_known(&v.observe(TrackId(3), &stranger(0.1), 0), "a"));
+        assert!(is_known(&v.observe(TrackId(400), &stranger(0.1), 0), "a"));
+        // dropped tracks restart at Pending
+        assert_eq!(
+            v.observe(TrackId(4), &stranger(0.1), 0),
+            IdentityState::Pending
+        );
+        v.retain(&[]);
+        assert_eq!(
+            v.observe(TrackId(3), &stranger(0.1), 0),
+            IdentityState::Pending
+        );
+    }
 }

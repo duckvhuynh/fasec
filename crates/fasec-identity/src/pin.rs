@@ -53,3 +53,31 @@ pub(crate) fn verify(pin: &str, phc: &str) -> Result<bool, IdentityError> {
         Err(_) => Err(invalid()),
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    const SALT_HASH: &str = "c29tZXNhbHRzb21lc2FsdA$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+
+    #[test]
+    fn non_argon2id_or_degenerate_stored_hash_is_error() {
+        for head in [
+            "$argon2i$v=19$m=19456,t=2,p=1", // parsable, wrong variant
+            "$argon2d$v=19$m=19456,t=2,p=1",
+            "$argon2id$v=19$m=19456,t=0,p=1", // zero passes
+            "$argon2id$v=19$m=19456,t=2,p=0", // zero lanes
+            "$argon2id$v=19$m=1,t=2,p=1",     // memory below 8*p
+        ] {
+            let phc = format!("{head}${SALT_HASH}");
+            assert!(PasswordHash::new(&phc).is_ok(), "fixture must parse: {phc}");
+            assert!(
+                matches!(verify("1234", &phc), Err(IdentityError::Pin(_))),
+                "{phc} must be an error, never Ok"
+            );
+        }
+        let scrypt = "$scrypt$ln=4,r=8,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+        assert!(verify("1234", scrypt).is_err());
+        assert!(verify("1234", "").is_err());
+    }
+}

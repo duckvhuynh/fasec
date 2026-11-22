@@ -308,4 +308,152 @@ mod tests {
         );
         assert!(!format!("{m:?}").contains("0.123"));
     }
+
+    // ---- audit additions ----
+
+    /// Score of `at(cos, axis)` against the query exactly as the matcher computes it.
+    fn score_of(cos: f32) -> f32 {
+        let m = Matcher::new(
+            vec![(pid("a"), Role::Owner, at(cos, 1))],
+            MatcherConfig {
+                threshold: -1.0,
+                margin: 0.0,
+            },
+        );
+        match m.best(&query()) {
+            MatchResult::Known { score, .. } => score,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn next_up(x: f32) -> f32 {
+        f32::from_bits(x.to_bits() + 1)
+    }
+
+    #[test]
+    fn threshold_boundary_is_inclusive() {
+        // FR-ID-009: accept if score >= threshold. Use the computed score as the threshold.
+        let s = score_of(0.5);
+        let at_t = |threshold| {
+            Matcher::new(
+                vec![(pid("a"), Role::Owner, at(0.5, 1))],
+                MatcherConfig {
+                    threshold,
+                    margin: 0.05,
+                },
+            )
+            .best(&query())
+        };
+        assert!(matches!(at_t(s), MatchResult::Known { .. }));
+        assert!(matches!(at_t(next_up(s)), MatchResult::Stranger { .. }));
+        // default threshold 0.363 itself
+        let d = MatcherConfig::default();
+        assert_eq!((d.threshold, d.margin), (0.363, 0.05));
+        let just_below = Matcher::new(vec![(pid("a"), Role::Owner, at(0.362, 1))], d);
+        assert!(matches!(
+            just_below.best(&query()),
+            MatchResult::Stranger { .. }
+        ));
+        let above = Matcher::new(vec![(pid("a"), Role::Owner, at(0.364, 1))], d);
+        assert!(matches!(above.best(&query()), MatchResult::Known { .. }));
+    }
+
+    #[test]
+    fn margin_boundary_is_inclusive() {
+        // FR-ID-009: margin over second-best >= match_margin. Use the computed gap as margin.
+        let pair = || {
+            vec![
+                (pid("a"), Role::Owner, at(0.60, 1)),
+                (pid("b"), Role::Authorised, at(0.50, 2)),
+            ]
+        };
+        let (best, second) = match Matcher::new(
+            pair(),
+            MatcherConfig {
+                threshold: 0.363,
+                margin: 1.0,
+            },
+        )
+        .best(&query())
+        {
+            MatchResult::Ambiguous { best, second } => (best, second),
+            other => panic!("{other:?}"),
+        };
+        let gap = best - second;
+        let run = |margin| {
+            Matcher::new(
+                pair(),
+                MatcherConfig {
+                    threshold: 0.363,
+                    margin,
+                },
+            )
+            .best(&query())
+        };
+        assert!(matches!(run(gap), MatchResult::Known { .. }));
+        assert!(matches!(run(next_up(gap)), MatchResult::Ambiguous { .. }));
+    }
+
+    #[test]
+    fn identical_templates_for_two_people_are_ambiguous() {
+        let m = Matcher::new(
+            vec![
+                (pid("a"), Role::Owner, at(0.9, 1)),
+                (pid("b"), Role::Authorised, at(0.9, 1)),
+            ],
+            MatcherConfig::default(),
+        );
+        assert!(matches!(m.best(&query()), MatchResult::Ambiguous { .. }));
+    }
+
+    /// A NaN threshold or margin must never turn a stranger into `Known`.
+    #[test]
+    #[ignore = "BUG: NaN threshold/margin in MatcherConfig makes every comparison false, so best() returns Known (matcher.rs:112,116)"]
+    fn nan_config_does_not_fail_open() {
+        let one = |cfg| Matcher::new(vec![(pid("a"), Role::Owner, at(0.0, 1))], cfg).best(&query());
+        // query is orthogonal to the template: a real stranger
+        let r = one(MatcherConfig {
+            threshold: f32::NAN,
+            margin: 0.05,
+        });
+        assert!(
+            !matches!(r, MatchResult::Known { .. }),
+            "NaN threshold: {r:?}"
+        );
+        let two = Matcher::new(
+            vec![
+                (pid("a"), Role::Owner, at(0.50, 1)),
+                (pid("b"), Role::Authorised, at(0.50, 2)),
+            ],
+            MatcherConfig {
+                threshold: 0.363,
+                margin: f32::NAN,
+            },
+        );
+        let r = two.best(&query());
+        assert!(!matches!(r, MatchResult::Known { .. }), "NaN margin: {r:?}");
+    }
+
+    /// The same person id with conflicting roles must not yield an order-dependent role.
+    #[test]
+    #[ignore = "BUG: Matcher::new keeps the first-seen role for a duplicated PersonId, so the granted role depends on row order (matcher.rs:70-73)"]
+    fn conflicting_roles_for_one_person_are_order_independent() {
+        let role_of = |first: Role, second: Role| {
+            let m = Matcher::new(
+                vec![
+                    (pid("x"), first, at(0.9, 1)),
+                    (pid("x"), second, at(0.9, 2)),
+                ],
+                MatcherConfig::default(),
+            );
+            match m.best(&query()) {
+                MatchResult::Known { role, .. } => Some(role),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            role_of(Role::Owner, Role::Authorised),
+            role_of(Role::Authorised, Role::Owner)
+        );
+    }
 }

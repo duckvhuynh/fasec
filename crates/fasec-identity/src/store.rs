@@ -774,4 +774,58 @@ mod tests {
             assert_corrupt(&g, id);
         }
     }
+
+    // ---- audit additions ----
+
+    #[test]
+    #[ignore = "BUG: non-finite quality binds as SQL NULL, violates NOT NULL and is reported as NotFound for an existing person (store.rs:222-224)"]
+    fn nan_quality_is_not_reported_as_missing_person() {
+        let mut g = gallery();
+        let alice = g.add_person("Alice", Role::Owner).unwrap();
+        let res = g.add_template(&alice, MODEL, Pose::Front, f32::NAN, &embedding(0.1));
+        assert!(
+            !matches!(res, Err(IdentityError::NotFound)),
+            "misleading error: {res:?}"
+        );
+        assert!(res.is_err() || count(&g, "template") == 1);
+    }
+
+    #[test]
+    fn delete_all_leaves_no_pin_or_ciphertext_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gallery.db");
+        let mut g = Gallery::open(&path, Arc::new(XorProtector::default())).unwrap();
+        let alice = g.add_person("Alice Distinctname", Role::Owner).unwrap();
+        let tid = g
+            .add_template(&alice, MODEL, Pose::Front, 0.9, &embedding(0.1))
+            .unwrap();
+        g.set_pin("1234").unwrap();
+        let blob = blob(&g, tid);
+        let phc = stored_pin(&g);
+        let in_file = |needle: &[u8]| {
+            std::fs::read(&path)
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle)
+        };
+        assert!(in_file(phc.as_bytes()) && in_file(&blob), "fixture sanity");
+
+        g.delete_all_biometrics().unwrap();
+        assert!(!g.has_pin().unwrap());
+        assert!(!g.verify_pin("1234").unwrap());
+        assert!(g.persons().unwrap().is_empty());
+        assert!(!in_file(phc.as_bytes()), "PIN hash survived in file");
+        assert!(
+            !in_file(&blob[..16]),
+            "template ciphertext survived in file"
+        );
+        assert!(
+            !in_file(b"Alice Distinctname"),
+            "person name survived in file"
+        );
+        for ext in ["db-wal", "db-journal"] {
+            let side = dir.path().join(format!("gallery.{ext}"));
+            assert!(!side.exists() || std::fs::metadata(side).unwrap().len() == 0);
+        }
+    }
 }
