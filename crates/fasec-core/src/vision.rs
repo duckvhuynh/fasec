@@ -31,6 +31,19 @@ pub enum LivenessState {
     Spoof { score: f32, tier: LivenessTier },
 }
 
+/// Whether a face box (normalised) is small enough in a `frame_w`×`frame_h` frame for the RGB
+/// liveness crop (MiniFASNetV2: the box scaled 2.7× about its centre) to keep at least 90 % of
+/// its scale. Upstream caps the scale so the crop fits the frame; below 90 % the model sees a
+/// tighter crop than it was trained on, so liveness is `Unknown` and enrolment asks the user to
+/// move back. In 720p the cut-off is a face box about 296 px tall. NaN boxes never fit.
+pub fn liveness_fits(frame_w: u32, frame_h: u32, bbox: RectF) -> bool {
+    const SCALE: f32 = 2.7;
+    const MIN_FRACTION: f32 = 0.9;
+    let (bw, bh) = (bbox.w * frame_w as f32, bbox.h * frame_h as f32);
+    let cap = ((frame_h as f32 - 1.0) / bh).min((frame_w as f32 - 1.0) / bw);
+    cap >= SCALE * MIN_FRACTION
+}
+
 /// Head pose in degrees.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HeadPose {
@@ -211,5 +224,20 @@ mod tests {
         let set: std::collections::HashSet<TrackId> = [TrackId(2), TrackId(1), TrackId(2)].into();
         assert_eq!(set.len(), 2);
         assert!(TrackId(1) < TrackId(2));
+    }
+
+    #[test]
+    fn liveness_fits_cut_off_in_720p() {
+        let b = |h_px: f32| RectF {
+            x: 0.4,
+            y: 0.3,
+            w: h_px / 1280.0,
+            h: h_px / 720.0,
+        };
+        // 719 / (0.9 · 2.7) ≈ 295.9 px
+        assert!(liveness_fits(1280, 720, b(295.0)));
+        assert!(!liveness_fits(1280, 720, b(297.0)));
+        assert!(!liveness_fits(1280, 720, b(400.0)));
+        assert!(!liveness_fits(1280, 720, b(f32::NAN)));
     }
 }

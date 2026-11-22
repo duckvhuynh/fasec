@@ -1,10 +1,12 @@
 //! Guided 5-pose enrolment (FR-ID-002): only good samples are accepted, 2 per pose.
 //!
 //! Pose sign convention follows M1 `CoarsePose`: +yaw = nose towards image right,
-//! +pitch = looking down. No frame or crop is kept: only accepted embeddings (FR-ID-005).
+//! +pitch = looking down. Front is judged on the absolute pose; every other pose on the pose
+//! relative to the mean of the accepted Front samples (the user's frontal baseline). No frame or crop is kept: only accepted embeddings (FR-ID-005).
 
 use fasec_core::{
     CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, VisionReport,
+    liveness_fits,
 };
 use zeroize::Zeroizing;
 
@@ -28,7 +30,8 @@ pub struct EnrolConfig {
     pub samples_per_pose: usize,
     pub min_face_px: f32,
     pub min_sharpness: f32,
-    /// Targets in the order they are asked for.
+    /// Targets in the order they are asked for. Front is absolute; the others are relative
+    /// to the frontal baseline (absolute while no Front sample is accepted yet).
     pub pose_windows: [(Pose, PoseWindow); 5],
 }
 
@@ -45,16 +48,18 @@ impl Default for EnrolConfig {
         // The brief bounds one axis per turned pose; the other is held to ±20° so a diagonal
         // head turn is not accepted as a clean left/right/up/down sample.
         let free = (-20.0, 20.0);
+        // Up/Down ±6°: on real hardware (one user, 2026-11-22) CoarsePose read pitch +11° looking
+        // straight and only +1° on a >30° chin-up tilt (biased, low gain), so ±12° never passed.
         EnrolConfig {
             samples_per_pose: 2,
             min_face_px: 112.0,
             min_sharpness: DEFAULT_MIN_SHARPNESS,
             pose_windows: [
                 (Pose::Front, w((-10.0, 10.0), (-10.0, 10.0))),
-                (Pose::Left, w((-35.0, -15.0), free)),
-                (Pose::Right, w((15.0, 35.0), free)),
-                (Pose::Up, w(free, (-30.0, -12.0))),
-                (Pose::Down, w(free, (12.0, 30.0))),
+                (Pose::Left, w((-45.0, -15.0), free)),
+                (Pose::Right, w((15.0, 45.0), free)),
+                (Pose::Up, w(free, (-40.0, -6.0))),
+                (Pose::Down, w(free, (6.0, 40.0))),
             ],
         }
     }
@@ -65,6 +70,8 @@ pub enum RejectReason {
     NoFace,
     MultipleFaces,
     TooSmall,
+    /// The face is too large for an in-distribution liveness crop (`liveness_fits`).
+    TooClose,
     Blurry,
     NotLive,
     SpoofDetected,
@@ -111,6 +118,8 @@ pub struct Enrolment {
     /// Identity is judged by embedding, not by track id: the tracker hands out a new id when it
     /// loses the face for a moment (common while turning), and every sample has exactly one face.
     units: Vec<Zeroizing<Vec<f32>>>,
+    /// (yaw, pitch) of each accepted Front sample.
+    front: Vec<(f32, f32)>,
 }
 
 impl Enrolment {
@@ -122,7 +131,18 @@ impl Enrolment {
             samples: Vec::new(),
             last_ts: None,
             units: Vec::new(),
+            front: Vec::new(),
         }
+    }
+
+    /// Mean (yaw, pitch) in degrees of the accepted Front samples; `None` before the first.
+    pub fn frontal_baseline(&self) -> Option<(f32, f32)> {
+        let n = self.front.len() as f32;
+        let (y, p) = self
+            .front
+            .iter()
+            .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        (n > 0.0).then(|| (y / n, p / n))
     }
 
     /// The pose being collected now; `None` once every pose has its samples.
@@ -150,6 +170,10 @@ impl Enrolment {
         };
         match self.judge(frame, report, embedding, want) {
             Ok((quality, te, unit)) => {
+                // `judge` accepted exactly one track, with a pose
+                if let (Pose::Front, Some(hp)) = (want, report.tracks[0].head_pose) {
+                    self.front.push((hp.yaw, hp.pitch));
+                }
                 self.last_ts = Some(te.ts_ms);
                 self.units.push(unit);
                 self.samples.push(EnrolledSample {
@@ -186,6 +210,10 @@ impl Enrolment {
         if !(self.cfg.min_face_px..).contains(&t.face_width_px) {
             return Err(TooSmall);
         }
+        // before the liveness gate: a too-close face is `Unknown`, and "move back" is the fix
+        if !liveness_fits(frame.width, frame.height, t.bbox) {
+            return Err(TooClose);
+        }
         if !(self.cfg.min_sharpness..).contains(&sharpness(frame, t.bbox)) {
             return Err(Blurry);
         }
@@ -195,8 +223,12 @@ impl Enrolment {
             LivenessState::Unknown => return Err(NotLive),
         }
         let window = self.cfg.pose_windows.iter().find(|(p, _)| *p == want);
+        let (by, bp) = match want {
+            Pose::Front => (0.0, 0.0),
+            _ => self.frontal_baseline().unwrap_or((0.0, 0.0)),
+        };
         let in_pose = match (t.head_pose, window) {
-            (Some(hp), Some((_, w))) => w.contains(hp.yaw, hp.pitch),
+            (Some(hp), Some((_, w))) => w.contains(hp.yaw - by, hp.pitch - bp),
             _ => false,
         };
         if !in_pose {
@@ -284,11 +316,12 @@ mod tests {
 
     use super::*;
 
+    /// 22 px in the 64×64 test frame: small enough for the liveness crop.
     const FACE: RectF = RectF {
-        x: 0.25,
-        y: 0.25,
-        w: 0.5,
-        h: 0.5,
+        x: 0.3,
+        y: 0.3,
+        w: 0.35,
+        h: 0.35,
     };
 
     /// 64×64 frame: 1-px black/white checkerboard (sharp) or flat grey (blurry).
@@ -395,8 +428,9 @@ mod tests {
             order,
             [Pose::Front, Pose::Left, Pose::Right, Pose::Up, Pose::Down]
         );
-        assert_eq!(c.pose_windows[1].1.yaw, (-35.0, -15.0));
-        assert_eq!(c.pose_windows[4].1.pitch, (12.0, 30.0));
+        assert_eq!(c.pose_windows[1].1.yaw, (-45.0, -15.0));
+        assert_eq!(c.pose_windows[3].1.pitch, (-40.0, -6.0));
+        assert_eq!(c.pose_windows[4].1.pitch, (6.0, 40.0));
         assert!(c.min_sharpness > 0.0);
     }
 
@@ -418,6 +452,26 @@ mod tests {
         assert_rejected(
             |_, r, _| r.tracks[0].face_width_px = f32::NAN,
             RejectReason::TooSmall,
+        );
+    }
+
+    #[test]
+    fn rejects_face_too_close_for_liveness() {
+        // 0.5 of 64 px: the 2.7× liveness crop is capped at 63/32 ≈ 1.97
+        let close = RectF {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
+        assert_rejected(|_, r, _| r.tracks[0].bbox = close, RejectReason::TooClose);
+        // checked before liveness: the pipeline reports such a face as Unknown
+        assert_rejected(
+            |_, r, _| {
+                r.tracks[0].bbox = close;
+                r.tracks[0].liveness = LivenessState::Unknown;
+            },
+            RejectReason::TooClose,
         );
     }
 
@@ -954,5 +1008,142 @@ mod tests {
             offer(&mut e, &at(3, DEFAULT_THRESHOLD + 0.01)),
             SampleVerdict::Accepted { pose: Pose::Front }
         );
+    }
+
+    fn offer_at(e: &mut Enrolment, ts: u64, yaw: f32, pitch: f32) -> SampleVerdict {
+        e.offer(
+            &frame(ts, true),
+            &report(ts, vec![track(1, yaw, pitch)]),
+            Some(&emb(1, ts)),
+        )
+    }
+
+    /// Two Front samples at `(yaw, pitch)`, then `poses` (absolute angles), all accepted.
+    fn with_baseline(yaw: f32, pitch: f32, poses: &[(f32, f32)]) -> (Enrolment, u64) {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let mut ts = 0;
+        for &(y, p) in [(yaw, pitch), (yaw, pitch)].iter().chain(poses) {
+            ts += 1;
+            let v = offer_at(&mut e, ts, y, p);
+            assert!(
+                matches!(v, SampleVerdict::Accepted { .. }),
+                "{y} {p}: {v:?}"
+            );
+        }
+        (e, ts)
+    }
+
+    /// Up is next after Front, Left and Right at relative yaw ∓25.
+    fn at_up(pitch: f32) -> (Enrolment, u64) {
+        let side = [(-25.0, pitch), (-25.0, pitch), (25.0, pitch), (25.0, pitch)];
+        let (e, ts) = with_baseline(0.0, pitch, &side);
+        assert_eq!(e.current_target(), Some(Pose::Up));
+        (e, ts)
+    }
+
+    fn accepted(pose: Pose) -> SampleVerdict {
+        SampleVerdict::Accepted { pose }
+    }
+
+    fn wrong(want: Pose) -> SampleVerdict {
+        SampleVerdict::Rejected(RejectReason::WrongPose { want })
+    }
+
+    #[test]
+    fn frontal_baseline_is_the_mean_of_front_samples() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        assert_eq!(e.frontal_baseline(), None);
+        assert_eq!(offer_at(&mut e, 1, 2.0, 8.0), accepted(Pose::Front));
+        assert_eq!(offer_at(&mut e, 2, 4.0, 10.0), accepted(Pose::Front));
+        assert_eq!(e.frontal_baseline(), Some((3.0, 9.0)));
+        // later poses do not move it
+        assert_eq!(offer_at(&mut e, 3, -20.0, 9.0), accepted(Pose::Left));
+        assert_eq!(e.frontal_baseline(), Some((3.0, 9.0)));
+    }
+
+    #[test]
+    fn front_stays_absolute() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        assert_eq!(offer_at(&mut e, 1, 0.0, 10.5), wrong(Pose::Front));
+        assert_eq!(offer_at(&mut e, 2, 0.0, 10.0), accepted(Pose::Front));
+        // a baseline from the first sample does not shift the second Front sample's window
+        assert_eq!(offer_at(&mut e, 3, 0.0, -10.5), wrong(Pose::Front));
+    }
+
+    #[test]
+    fn up_and_down_are_relative_to_the_frontal_baseline() {
+        // baseline pitch +10
+        let (mut e, ts) = at_up(10.0);
+        // +5 is relative −5: not up enough
+        assert_eq!(offer_at(&mut e, ts + 1, 0.0, 5.0), wrong(Pose::Up));
+        // −3 is relative −13, −8 relative −18: both up
+        assert_eq!(offer_at(&mut e, ts + 2, 0.0, -3.0), accepted(Pose::Up));
+        assert_eq!(offer_at(&mut e, ts + 3, 0.0, -8.0), accepted(Pose::Up));
+        // Down: +15 is relative +5, +16 relative +6 (the window edge)
+        assert_eq!(offer_at(&mut e, ts + 4, 0.0, 15.0), wrong(Pose::Down));
+        assert_eq!(offer_at(&mut e, ts + 5, 0.0, 16.0), accepted(Pose::Down));
+    }
+
+    #[test]
+    fn up_passes_on_the_measured_hardware_readings() {
+        // looking straight read pitch +11, a full chin-up tilt about +1 (2026-11-22). The
+        // absolute Front window stops at +10, so +11 itself never becomes the baseline: the
+        // Front samples land at +10 (+9 and +11 averaged the same) and +11 is refused.
+        let mut e = Enrolment::new(EnrolConfig::default());
+        assert_eq!(offer_at(&mut e, 1, 0.0, 11.0), wrong(Pose::Front));
+        assert_eq!(offer_at(&mut e, 2, -3.0, 9.0), accepted(Pose::Front));
+        assert_eq!(offer_at(&mut e, 3, 3.0, 11.0), wrong(Pose::Front));
+        assert_eq!(offer_at(&mut e, 4, 3.0, 10.0), accepted(Pose::Front));
+        assert_eq!(e.frontal_baseline(), Some((0.0, 9.5)));
+        for (ts, yaw) in [(5, -25.0), (6, -25.0), (7, 25.0), (8, 25.0)] {
+            assert!(matches!(
+                offer_at(&mut e, ts, yaw, 9.5),
+                SampleVerdict::Accepted { .. }
+            ));
+        }
+        // +3 is relative −6.5 and the full-tilt +1 relative −8.5: accepted for Up;
+        // +4 (relative −5.5) is not
+        assert_eq!(offer_at(&mut e, 9, 0.0, 4.0), wrong(Pose::Up));
+        assert_eq!(offer_at(&mut e, 10, 0.0, 3.0), accepted(Pose::Up));
+        assert_eq!(offer_at(&mut e, 11, -3.0, 1.0), accepted(Pose::Up));
+
+        // the exact readings, with a Front window that admits +11: +4 is relative −7
+        let mut cfg = EnrolConfig::default();
+        cfg.pose_windows[0].1.pitch = (-10.0, 15.0);
+        let mut e = Enrolment::new(cfg);
+        for (ts, yaw) in [
+            (1, 0.0),
+            (2, 0.0),
+            (3, -25.0),
+            (4, -25.0),
+            (5, 25.0),
+            (6, 25.0),
+        ] {
+            assert!(matches!(
+                offer_at(&mut e, ts, yaw, 11.0),
+                SampleVerdict::Accepted { .. }
+            ));
+        }
+        assert_eq!(e.frontal_baseline(), Some((0.0, 11.0)));
+        assert_eq!(offer_at(&mut e, 7, 0.0, 4.0), accepted(Pose::Up));
+    }
+
+    #[test]
+    fn left_and_right_are_relative_to_the_frontal_baseline() {
+        // baseline yaw +8, pitch +10
+        let (mut e, ts) = with_baseline(8.0, 10.0, &[]);
+        // −5 is relative −13: not turned enough; −10 is relative −18
+        assert_eq!(offer_at(&mut e, ts + 1, -5.0, 10.0), wrong(Pose::Left));
+        assert_eq!(offer_at(&mut e, ts + 2, -10.0, 10.0), accepted(Pose::Left));
+        // the off-axis pitch is relative too: −12 is relative −22, +28 relative +18
+        assert_eq!(offer_at(&mut e, ts + 3, -10.0, -12.0), wrong(Pose::Left));
+        assert_eq!(offer_at(&mut e, ts + 4, -10.0, 28.0), accepted(Pose::Left));
+        // +20 is in the absolute window but relative +12; +25 is relative +17
+        assert_eq!(offer_at(&mut e, ts + 5, 20.0, 10.0), wrong(Pose::Right));
+        assert_eq!(offer_at(&mut e, ts + 6, 25.0, 10.0), accepted(Pose::Right));
+        // the widened outer bound: relative +46 rejected, +45 accepted
+        assert_eq!(offer_at(&mut e, ts + 7, 54.0, 10.0), wrong(Pose::Right));
+        assert_eq!(offer_at(&mut e, ts + 8, 53.0, 10.0), accepted(Pose::Right));
+        assert_eq!(e.current_target(), Some(Pose::Up));
     }
 }

@@ -14,7 +14,7 @@ pub use geom::{PointF, RectF};
 pub use threat::ThreatLevel;
 pub use vision::{
     CameraHealth, HeadPose, IdentityState, LivenessState, LivenessTier, StageTimings, TrackId,
-    TrackObs, VisionReport,
+    TrackObs, VisionReport, liveness_fits,
 };
 
 /// Errors produced by `fasec-core` constructors.

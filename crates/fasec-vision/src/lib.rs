@@ -13,6 +13,8 @@ pub mod traits;
 
 pub use detect::{YuNet, YuNetConfig};
 pub use error::VisionError;
+/// The liveness crop cut-off, shared with enrolment (which does not link the models).
+pub use fasec_core::liveness_fits;
 pub use pipeline::{Pipeline, PipelineConfig, ProcessOutput};
 pub use recognize::RECOGNISER_MODEL_ID;
 pub use runtime::Runtime;

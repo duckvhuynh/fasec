@@ -364,6 +364,74 @@ mod tests {
         assert!(matches!(m.score(&empty, &det), Err(VisionError::Input(_))));
     }
 
+    /// `name`'s face, scaled so its box is `face_h` px tall, centred in a 1280×720 grey frame.
+    fn face_in_720p(name: &str, face_h: f32) -> Frame {
+        let src = load(name);
+        let b = detect(&src).bbox;
+        let (sw, sh) = (src.width as f32, src.height as f32);
+        let k = face_h / (b.h * sh);
+        let img = RgbImage::from_raw(src.width, src.height, src.data.to_vec()).unwrap();
+        let img = image::imageops::resize(
+            &img,
+            (sw * k).round() as u32,
+            (sh * k).round() as u32,
+            image::imageops::FilterType::Triangle,
+        );
+        let (cx, cy) = ((b.x + b.w / 2.0) * sw * k, (b.y + b.h / 2.0) * sh * k);
+        let (ox, oy) = (640.0 - cx, 360.0 - cy);
+        frame(1280, 720, |x, y| {
+            let (u, v) = (x as f32 - ox, y as f32 - oy);
+            if u >= 0.0 && v >= 0.0 && (u as u32) < img.width() && (v as u32) < img.height() {
+                img.get_pixel(u as u32, v as u32).0
+            } else {
+                [128; 3]
+            }
+        })
+    }
+
+    /// Measures the face-size effect behind `liveness_fits` (report: liveness-size-report.md).
+    /// The `.assets` portraits score live at every size, even with the crop capped, so this
+    /// only pins what was measured: faces that fit score live, and the cut-off falls between
+    /// the 270 and 305 px faces in 720p.
+    #[test]
+    #[ignore = "needs models: run `cargo run -p fasec-models --example fetch`"]
+    fn liveness_vs_face_size_720p() {
+        use fasec_core::{CameraHealth, LivenessState};
+        let mut m = minifasnet(ExecutionProvider::Cpu);
+        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
+        let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        println!("name     | box h | eff 2.7 | eff 4.0 | v2 live | v1se live | fused | pipeline");
+        for name in ["face-a-1", "face-a-2", "face-b-1"] {
+            for h in [120.0, 160.0, 200.0, 240.0, 280.0, 320.0, 400.0] {
+                let f = face_in_720p(name, h);
+                let det = detect(&f);
+                let (bw, bh) = (det.bbox.w * 1280.0, det.bbox.h * 720.0);
+                let px = [det.bbox.x * 1280.0, det.bbox.y * 720.0, bw, bh];
+                let eff = |s: f32| s.min(719.0 / bh).min(1279.0 / bw);
+                let (a, c) = (m.v2.probs(&f, px).unwrap(), m.v1se.probs(&f, px).unwrap());
+                let s = m.score(&f, &det).unwrap();
+                let mut p = crate::Pipeline::from_models(&rt, &models, Default::default()).unwrap();
+                let out = p.process(&f, CameraHealth::Ok).unwrap();
+                let state = &out.report.tracks[0].liveness;
+                println!(
+                    "{name} | {bh:5.0} | {:7.2} | {:7.2} | {:7.3} | {:9.3} | {s:.3} | {state:?}",
+                    eff(2.7),
+                    eff(4.0),
+                    a[LIVE],
+                    c[LIVE],
+                );
+                let fits = crate::liveness_fits(1280, 720, det.bbox);
+                assert_eq!(fits, bh < 296.0, "{name} {bh}");
+                if fits {
+                    assert!(s >= 0.75, "{name} {bh}: {s}");
+                    assert!(matches!(state, LivenessState::Live { .. }), "{state:?}");
+                } else {
+                    assert_eq!(*state, LivenessState::Unknown);
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "needs models: run `cargo run -p fasec-models --example fetch`"]
     fn liveness_and_pose_ms() {

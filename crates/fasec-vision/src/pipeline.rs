@@ -241,8 +241,12 @@ impl Pipeline {
                 st.liveness = LivenessState::Unknown;
                 st.scored_at = None;
                 // A YuNet box can extend past the frame; with its centre outside, the crop
-                // would score unrelated edge pixels.
-                if (0.0..=1.0).contains(&c.x) && (0.0..=1.0).contains(&c.y) {
+                // would score unrelated edge pixels. A face too large for an in-distribution
+                // crop scores as a spoof, so it is not scored at all (`Unknown`, retried).
+                if (0.0..=1.0).contains(&c.x)
+                    && (0.0..=1.0).contains(&c.y)
+                    && crate::liveness_fits(frame.width, frame.height, d.bbox)
+                {
                     let t0 = Instant::now();
                     let res = self.live.score(frame, d).and_then(|s| {
                         if s.is_finite() {
@@ -682,6 +686,29 @@ mod tests {
         assert_eq!(t.landmarks5[0], PointF { x: 0.0, y: 1.0 });
         // face width comes from the unclamped box
         assert!((t.face_width_px - 0.3 * 64.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn face_too_close_for_the_liveness_crop_is_unknown_and_not_scored() {
+        let mut h = Harness::new();
+        // 64×48 frame: a 24 px tall box caps the 2.7× crop at 47/24 ≈ 1.96 (< 0.9 · 2.7)
+        let close = det(0.3, 0.1, 0.5, 0.9);
+        assert!(!crate::liveness_fits(64, 48, close.bbox));
+        h.set(Some(vec![close]));
+        for ts in [0, 33, 2500] {
+            let out = h.run_out(ts);
+            assert_eq!(out.report.tracks[0].liveness, LivenessState::Unknown);
+        }
+        assert_eq!(
+            h.calls.get()[2],
+            0,
+            "liveness model ran on a too-close face"
+        );
+        // the same face stepping back is scored on the next frame
+        h.set(Some(vec![face()]));
+        let r = h.run(2533);
+        assert!(matches!(r.tracks[0].liveness, LivenessState::Live { .. }));
+        assert_eq!(h.calls.get()[2], 1);
     }
 
     /// Liveness and embedding outputs the audit tests steer per frame.
