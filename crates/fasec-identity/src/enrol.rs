@@ -4,7 +4,7 @@
 //! +pitch = looking down. No frame or crop is kept: only accepted embeddings (FR-ID-005).
 
 use fasec_core::{
-    CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, TrackId, VisionReport,
+    CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, VisionReport,
 };
 use zeroize::Zeroizing;
 
@@ -107,10 +107,10 @@ pub struct Enrolment {
     samples: Vec<EnrolledSample>,
     /// `ts_ms` of the last accepted embedding, so one frame is never stored twice.
     last_ts: Option<u64>,
-    /// Track of the first accepted sample; later samples must come from it.
-    track: Option<TrackId>,
-    /// Sum of the accepted embeddings, each L2-normalised; its direction is their mean.
-    sum: Zeroizing<Vec<f32>>,
+    /// The accepted embeddings, L2-normalised. A new sample must look like at least one of them.
+    /// Identity is judged by embedding, not by track id: the tracker hands out a new id when it
+    /// loses the face for a moment (common while turning), and every sample has exactly one face.
+    units: Vec<Zeroizing<Vec<f32>>>,
 }
 
 impl Enrolment {
@@ -121,8 +121,7 @@ impl Enrolment {
             cfg,
             samples: Vec::new(),
             last_ts: None,
-            track: None,
-            sum: Zeroizing::new(Vec::new()),
+            units: Vec::new(),
         }
     }
 
@@ -152,15 +151,7 @@ impl Enrolment {
         match self.judge(frame, report, embedding, want) {
             Ok((quality, te, unit)) => {
                 self.last_ts = Some(te.ts_ms);
-                self.track = Some(te.track);
-                if self.sum.is_empty() {
-                    self.sum = unit;
-                } else {
-                    self.sum
-                        .iter_mut()
-                        .zip(unit.iter())
-                        .for_each(|(s, u)| *s += u);
-                }
+                self.units.push(unit);
                 self.samples.push(EnrolledSample {
                     pose: want,
                     quality,
@@ -191,9 +182,6 @@ impl Enrolment {
             [t] => t,
             _ => return Err(MultipleFaces),
         };
-        if self.track.is_some_and(|id| id != t.id) {
-            return Err(DifferentPerson);
-        }
         // `RangeFrom::contains` is false for NaN, so a NaN measurement fails the gate
         if !(self.cfg.min_face_px..).contains(&t.face_width_px) {
             return Err(TooSmall);
@@ -226,21 +214,21 @@ impl Enrolment {
         };
         // empty, zero or non-finite: nothing usable to store
         let unit = normalised(te.embedding.as_slice()).ok_or(NoEmbeddingYet)?;
-        if !self.sum.is_empty() && !self.like_accepted(&unit) {
+        if !self.units.is_empty() && !self.like_accepted(&unit) {
             return Err(DifferentPerson);
         }
         Ok((t.det_score, te, unit))
     }
 
-    /// Cosine of `unit` against the mean of the accepted samples is at least the matcher's
-    /// acceptance threshold.
+    /// Cosine of `unit` against its most similar accepted sample is at least the matcher's
+    /// acceptance threshold. The closest sample (not the mean) tolerates the pose change from
+    /// one side to the other; another person stays far below the threshold for every sample.
     fn like_accepted(&self, unit: &[f32]) -> bool {
-        let Some(mean) = normalised(&self.sum) else {
-            return false;
-        };
-        let cos: f32 = mean.iter().zip(unit).map(|(a, b)| a * b).sum();
-        // `>=` is false for NaN
-        mean.len() == unit.len() && cos >= DEFAULT_THRESHOLD
+        self.units.iter().any(|u| {
+            let cos: f32 = u.iter().zip(unit).map(|(a, b)| a * b).sum();
+            // `>=` is false for NaN
+            u.len() == unit.len() && cos >= DEFAULT_THRESHOLD
+        })
     }
 
     /// All samples, in target order; an error unless every pose has its samples.
@@ -868,23 +856,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_second_track_after_the_first_sample() {
+    fn a_new_track_of_the_same_person_continues() {
+        // regression: the tracker re-assigns the id after losing the face for a moment (e.g.
+        // while turning); pinning the first id rejected every later frame and stuck enrolment
         let mut e = started();
-        // a different track, even with an identical embedding, is someone else
         let v = e.offer(
             &frame(2, true),
             &report(2, vec![track(2, 0.0, 0.0)]),
             Some(&emb(2, 2)),
         );
+        assert_eq!(v, SampleVerdict::Accepted { pose: Pose::Front });
+        assert_eq!(e.progress(), (2, 10));
+    }
+
+    #[test]
+    fn a_new_track_of_another_person_is_rejected() {
+        let mut e = started();
+        let mut v = vec![0.0f32; 128];
+        v[0] = 1.0;
+        let te = TrackEmbedding {
+            track: TrackId(2),
+            ts_ms: 2,
+            embedding: Embedding::from(v),
+        };
+        let v = e.offer(
+            &frame(2, true),
+            &report(2, vec![track(2, 0.0, 0.0)]),
+            Some(&te),
+        );
         assert_eq!(v, SampleVerdict::Rejected(RejectReason::DifferentPerson));
         assert_eq!(e.progress(), (1, 10));
-        // the first track still continues
-        let v = e.offer(
-            &frame(3, true),
-            &report(3, vec![track(1, 0.0, 0.0)]),
-            Some(&emb(1, 3)),
-        );
-        assert_eq!(v, SampleVerdict::Accepted { pose: Pose::Front });
     }
 
     #[test]
