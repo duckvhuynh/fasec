@@ -38,7 +38,7 @@ struct RunArgs {
     /// Simulated frame rate: frame `i` gets `ts_ms = i * 1000 / fps`.
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..))]
     fps: u32,
-    /// Directory holding the model files and `manifest.toml`.
+    /// Directory holding the model files (verified against the manifest built into the binary).
     #[arg(long, default_value = "models")]
     models: PathBuf,
     #[arg(long, value_enum, default_value_t = Ep::Auto)]

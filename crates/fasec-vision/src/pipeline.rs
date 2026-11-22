@@ -9,7 +9,7 @@ use fasec_core::{
     CameraHealth, Frame, IdentityState, LivenessState, PointF, RectF, StageTimings, TrackId,
     TrackObs, VisionReport,
 };
-use fasec_models::Manifest;
+use fasec_models::{Manifest, VerifiedModel};
 
 use crate::attention::{CoarsePose, face_width_px};
 use crate::liveness::MiniFasNet;
@@ -97,21 +97,19 @@ impl Pipeline {
     }
 
     /// YuNet (640 px long side) + SFace + MiniFASNet + CoarsePose from `models_dir`. Every
-    /// file is SHA-256 verified against `models_dir/manifest.toml` before any session is
-    /// created; a missing or mismatched file is an error naming the model id.
+    /// file is read once and SHA-256 verified against the manifest embedded in the binary
+    /// (`models_dir/manifest.toml` is ignored) before any session is created, and sessions are
+    /// built from those verified bytes; a missing or mismatched file is an error naming the id.
     pub fn from_models(
         rt: &Runtime,
         models_dir: &Path,
         cfg: PipelineConfig,
     ) -> Result<Pipeline, VisionError> {
-        let manifest = Manifest::load(models_dir.join("manifest.toml"))
-            .map_err(|e| VisionError::Model(format!("models manifest: {e}")))?;
+        let manifest = Manifest::embedded();
         let verified = |id: &str| {
             let bad = |e: &dyn std::fmt::Display| VisionError::Model(format!("{id}: {e}"));
             let entry = manifest.get(id).ok_or_else(|| bad(&"not in manifest"))?;
-            let path = fasec_models::model_path(models_dir, entry).map_err(|e| bad(&e))?;
-            fasec_models::verify_file(&path, &entry.sha256).map_err(|e| bad(&e))?;
-            Ok::<_, VisionError>(path)
+            VerifiedModel::load(models_dir, entry).map_err(|e| bad(&e))
         };
         // All four verified before the first session is created.
         let yunet = verified("yunet-2023mar")?;
@@ -852,11 +850,6 @@ mod tests {
             std::env::temp_dir().join(format!("fasec-pipeline-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(
-            models_dir().join("manifest.toml"),
-            dir.join("manifest.toml"),
-        )
-        .unwrap();
         dir
     }
 
@@ -884,6 +877,51 @@ mod tests {
         .unwrap();
         let e = from_models_err(&dir);
         assert!(e.contains("yunet-2023mar") && e.contains("mismatch"), "{e}");
+    }
+
+    #[test]
+    #[ignore = "needs models: run `cargo run -p fasec-models --example fetch`"]
+    fn pipeline_ignores_on_disk_manifest() {
+        let dir = temp_models("tampered_manifest");
+        let ids = [
+            "yunet-2023mar",
+            "sface-2021dec",
+            "minifasnet-v2",
+            "minifasnet-v1se",
+        ];
+        for id in ids {
+            let entry = Manifest::embedded().get(id).unwrap();
+            let name = fasec_models::model_path(Path::new(""), entry).unwrap();
+            std::fs::copy(models_dir().join(&name), dir.join(&name)).unwrap();
+        }
+        // An on-disk manifest that would reject every real file (and could bless swapped ones).
+        let tampered = std::fs::read_to_string(models_dir().join("manifest.toml"))
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.starts_with("sha256 = \"") && l.len() > 12 {
+                    format!("sha256 = \"{}\"", "0".repeat(64))
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("manifest.toml"), tampered).unwrap();
+        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
+        Pipeline::from_models(&rt, &dir, PipelineConfig::default()).unwrap();
+
+        // A tampered model file is still rejected, naming its id.
+        let v1se = Manifest::embedded().get("minifasnet-v1se").unwrap();
+        let path = fasec_models::model_path(&dir, v1se).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let e = from_models_err(&dir);
+        assert!(
+            e.contains("minifasnet-v1se") && e.contains("mismatch"),
+            "{e}"
+        );
     }
 
     #[test]
