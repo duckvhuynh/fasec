@@ -217,6 +217,12 @@ impl Pipeline {
     /// verdict fused with its IR evidence (`fuse`). IR evidence older than the previous call
     /// is stale, so a stalled IR camera falls back to the RGB tier. IR timestamps are on the IR
     /// camera's clock and are never compared with `frame.ts_ms`.
+    ///
+    /// Caller contract: pass `Some` for every newly taken lit pair. IR evidence is fresh for this
+    /// call and the next only, and an IR spoof streak counts lit frames on consecutive calls, so
+    /// a caller that calls more often than lit frames arrive loses IR evidence. A restarted IR
+    /// capture must be signalled by `ir_health != Ok` for at least one call; otherwise its seq
+    /// may go backwards and IR is ignored until it passes the old maximum.
     pub fn process_with_ir(
         &mut self,
         frame: &Frame,
@@ -458,6 +464,10 @@ impl Pipeline {
             let Some(st) = self.tracks.get_mut(&id) else {
                 continue;
             };
+            // a gap without a lit frame, or the track absent, ends the streak
+            if st.ir.is_none_or(|s| s.call + 1 < self.calls) {
+                st.ir_spoof_streak = 0;
+            }
             st.ir_spoof_streak = match verdict {
                 IrVerdict::Spoof { .. } => st.ir_spoof_streak.saturating_add(1),
                 _ => 0,
@@ -1423,6 +1433,32 @@ mod tests {
                 *r.ir.lock().unwrap() = vec![ir_face()];
                 assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
             }
+        }
+    }
+
+    #[test]
+    fn ir_spoof_streak_breaks_on_a_call_without_a_lit_frame_or_without_the_track() {
+        for break_streak in ["gap", "track absent"] {
+            let mut r = IrRig::new();
+            assert_eq!(live0(&r.warm()), IR_LIVE);
+            *r.ir.lock().unwrap() = Vec::new();
+            for _ in 0..2 {
+                assert_eq!(live0(&r.lit(Scene::Empty)), RGB_LIVE);
+            }
+            match break_streak {
+                "gap" => {
+                    r.dark();
+                }
+                _ => {
+                    *r.rgb.lock().unwrap() = Vec::new();
+                    assert!(r.lit(Scene::Empty).report.tracks.is_empty());
+                    *r.rgb.lock().unwrap() = vec![rgb_face(0.3)];
+                }
+            }
+            // scattered spoof frames never add up: this is the first of a new streak
+            assert_eq!(live0(&r.lit(Scene::Empty)), RGB_LIVE, "{break_streak}");
+            assert_eq!(live0(&r.lit(Scene::Empty)), RGB_LIVE, "{break_streak}");
+            assert_eq!(live0(&r.lit(Scene::Empty)), IR_SPOOF, "{break_streak}");
         }
     }
 
