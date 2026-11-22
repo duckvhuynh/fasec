@@ -6,13 +6,16 @@ use std::path::Path;
 use std::time::Instant;
 
 use fasec_core::{
-    CameraHealth, Frame, IdentityState, LivenessState, PointF, RectF, StageTimings, TrackEmbedding,
-    TrackId, TrackObs, VisionReport,
+    CameraHealth, Frame, IdentityState, IrFrame, LivenessState, LivenessTier, PointF, RectF,
+    StageTimings, TrackEmbedding, TrackId, TrackObs, VisionReport,
 };
 use fasec_models::{Manifest, VerifiedModel};
 use zeroize::Zeroize;
 
 use crate::attention::{CoarsePose, face_width_px};
+use crate::ir::{
+    IrAssociator, IrLivenessConfig, IrSpoofReason, IrVerdict, ir_cues, ir_faces, judge,
+};
 use crate::liveness::MiniFasNet;
 use crate::recognize::SFace;
 use crate::track::{Tracker, TrackerConfig};
@@ -37,6 +40,7 @@ pub struct PipelineConfig {
     /// Liveness score at or above which a track is `Live` (0.75, Balanced, SRS §5.5).
     pub liveness_threshold: f32,
     pub tracker: TrackerConfig,
+    pub ir: IrLivenessConfig,
 }
 
 impl Default for PipelineConfig {
@@ -49,6 +53,7 @@ impl Default for PipelineConfig {
             rerecog_iou: 0.5,
             liveness_threshold: 0.75,
             tracker: TrackerConfig::default(),
+            ir: IrLivenessConfig::default(),
         }
     }
 }
@@ -60,6 +65,36 @@ pub struct ProcessOutput {
     pub report: VisionReport,
     /// Only the embeddings computed on this frame (none carried over), so each is seen once.
     pub embeddings: Vec<TrackEmbedding>,
+    /// One entry per reported track, in report order: the IR evidence its liveness was fused
+    /// with. Empty when the RGB camera is not healthy.
+    pub ir: Vec<TrackIr>,
+}
+
+/// IR evidence for one RGB track on one frame, after the spoof streak and staleness rules.
+/// `Live` already implies IR healthy, the mapping trusted and the track matched to an IR face.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IrEvidence {
+    /// IR unhealthy, absent or stale, an `Unknown` verdict, or a spoof streak still short of
+    /// `IrLivenessConfig::spoof_frames`.
+    Absent,
+    Live {
+        score: f32,
+    },
+    Spoof {
+        score: f32,
+        reason: IrSpoofReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackIr {
+    pub track: TrackId,
+    pub evidence: IrEvidence,
+    /// The tier the track's fused liveness rests on.
+    pub tier: LivenessTier,
+    /// The cues behind the last IR verdict measured lit − ambient (a usable unlit frame).
+    /// `false` where the driver blanks unlit frames: IR `Live` then rests on the lit frame alone.
+    pub ambient: bool,
 }
 
 /// Detector, tracker and per-track stages, plus each track's carried results.
@@ -73,6 +108,28 @@ pub struct Pipeline {
     tracks: HashMap<TrackId, TrackState>,
     /// The last report had at least one track.
     active: bool,
+    /// Learned IR↔RGB mapping; replaced by a fresh one whenever IR stops being healthy or the
+    /// IR frame size changes, so trust is never carried across an IR restart.
+    ir_assoc: IrAssociator,
+    /// Number of `process_with_ir` calls so far: IR freshness is counted in calls.
+    calls: u64,
+    /// The last lit frame used (since the last IR reset).
+    last_lit: Option<LitSeen>,
+}
+
+#[derive(Clone, Copy)]
+struct LitSeen {
+    seq: u64,
+    call: u64,
+    size: (u32, u32),
+}
+
+/// A track's last IR verdict and the call whose lit frame gave it.
+#[derive(Clone, Copy)]
+struct IrSeen {
+    call: u64,
+    verdict: IrVerdict,
+    ambient: bool,
 }
 
 /// What a track carries between scheduled runs.
@@ -83,6 +140,9 @@ struct TrackState {
     liveness: LivenessState,
     /// `ts_ms` and box of the last successful liveness score.
     scored_at: Option<(u64, RectF)>,
+    ir: Option<IrSeen>,
+    /// Consecutive lit frames with an IR `Spoof` verdict.
+    ir_spoof_streak: u8,
 }
 
 impl Pipeline {
@@ -102,6 +162,9 @@ impl Pipeline {
             cfg,
             tracks: HashMap::new(),
             active: false,
+            ir_assoc: IrAssociator::new(),
+            calls: 0,
+            last_lit: None,
         }
     }
 
@@ -134,15 +197,39 @@ impl Pipeline {
         ))
     }
 
-    /// Runs the stages due on `frame`. A detector error fails the frame; an error of a
-    /// per-track stage only leaves that track's field `None`/`Unknown` (retried next frame).
-    /// With `health != Ok` no model runs and the report has no tracks.
+    /// RGB only: [`Pipeline::process_with_ir`] with no IR frame and IR `Lost`, so a pipeline
+    /// that had IR drops its IR trust.
     pub fn process(
         &mut self,
         frame: &Frame,
         health: CameraHealth,
     ) -> Result<ProcessOutput, VisionError> {
+        self.process_with_ir(frame, None, health, CameraHealth::Lost)
+    }
+
+    /// Runs the stages due on `frame`. A detector error fails the frame; an error of a
+    /// per-track stage only leaves that track's field `None`/`Unknown` (retried next frame).
+    /// With `health != Ok` no model runs and the report has no tracks.
+    ///
+    /// `ir` is the lit IR frame newly taken for this call and its ambient (unlit) partner, if
+    /// any. It is used only when `ir_health` is `Ok`, the frame is lit and its seq is newer than
+    /// the last one used. IR cues then run for every track, and each track's liveness is its RGB
+    /// verdict fused with its IR evidence (`fuse`). IR evidence older than the previous call
+    /// is stale, so a stalled IR camera falls back to the RGB tier. IR timestamps are on the IR
+    /// camera's clock and are never compared with `frame.ts_ms`.
+    pub fn process_with_ir(
+        &mut self,
+        frame: &Frame,
+        ir: Option<(&IrFrame, Option<&IrFrame>)>,
+        health: CameraHealth,
+        ir_health: CameraHealth,
+    ) -> Result<ProcessOutput, VisionError> {
         crate::image_ops::check_frame(frame)?;
+        self.calls += 1;
+        let ir_ok = ir_health == CameraHealth::Ok;
+        if !ir_ok {
+            self.reset_ir();
+        }
         let mut timings = StageTimings {
             detect_ms: 0.0,
             recognize_ms: 0.0,
@@ -159,6 +246,7 @@ impl Pipeline {
                 timings,
             },
             embeddings: Vec::new(),
+            ir: Vec::new(),
         };
         if out.report.camera_health != CameraHealth::Ok {
             self.active = false;
@@ -197,6 +285,8 @@ impl Pipeline {
                 embedded_at: None,
                 liveness: LivenessState::Unknown,
                 scored_at: None,
+                ir: None,
+                ir_spoof_streak: 0,
             });
             st.last_seen_ms = now;
             // A new track has no state yet, so `None` covers `is_new`.
@@ -288,6 +378,7 @@ impl Pipeline {
                 }),
                 det_score: d.score,
                 identity: IdentityState::Pending,
+                // the RGB verdict, fused with IR below
                 liveness: st.liveness.clone(),
                 head_pose,
                 face_width_px: face_width_px(d, frame),
@@ -295,9 +386,98 @@ impl Pipeline {
             });
         }
 
+        let lit = ir.filter(|(l, _)| ir_ok && self.last_lit.is_none_or(|s| l.seq > s.seq));
+        if let Some((lit, ambient)) = lit {
+            let t0 = Instant::now();
+            self.judge_ir(lit, ambient, &out.report.tracks);
+            timings.liveness_ms += ms(t0);
+        }
+
+        let fresh = |call: u64| call + 1 >= self.calls;
+        for obs in &mut out.report.tracks {
+            let st = &self.tracks[&obs.id];
+            let seen = st.ir.filter(|s| fresh(s.call));
+            let evidence = match seen.map(|s| s.verdict) {
+                Some(IrVerdict::Live { score }) => IrEvidence::Live { score },
+                Some(IrVerdict::Spoof { score, reason })
+                    if st.ir_spoof_streak >= cfg.ir.spoof_frames =>
+                {
+                    IrEvidence::Spoof { score, reason }
+                }
+                _ => IrEvidence::Absent,
+            };
+            let (liveness, tier) = fuse(&st.liveness, evidence);
+            obs.liveness = liveness;
+            out.ir.push(TrackIr {
+                track: obs.id,
+                evidence,
+                tier,
+                ambient: seen.is_some_and(|s| s.ambient),
+            });
+        }
+        if self.ir_assoc.is_trusted() && self.last_lit.is_some_and(|l| fresh(l.call)) {
+            out.report.liveness_tier = LivenessTier::Ir;
+        }
+
         out.report.timings = timings;
         self.active = !out.report.tracks.is_empty();
         Ok(out)
+    }
+
+    /// Detects faces in `lit`, matches them to `tracks` and records each track's IR verdict.
+    fn judge_ir(&mut self, lit: &IrFrame, ambient: Option<&IrFrame>, tracks: &[TrackObs]) {
+        let size = (lit.width, lit.height);
+        if self.last_lit.is_some_and(|s| s.size != size) {
+            self.reset_ir();
+        }
+        // an unlit frame is an error here, so it never counts as a fresh lit frame
+        let faces = match ir_faces(&mut *self.det, lit) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "IR face detection failed");
+                return;
+            }
+        };
+        self.last_lit = Some(LitSeen {
+            seq: lit.seq,
+            call: self.calls,
+            size,
+        });
+        let cfg = self.cfg.ir;
+        let matches = self.ir_assoc.associate(tracks, &faces);
+        for (obs, (id, matched)) in tracks.iter().zip(matches) {
+            let cues = ir_cues(
+                lit,
+                ambient,
+                &self.ir_assoc,
+                obs.bbox,
+                &faces,
+                matched.as_ref(),
+            );
+            let verdict = cues.map_or(IrVerdict::Unknown, |c| judge(&c, &cfg));
+            let Some(st) = self.tracks.get_mut(&id) else {
+                continue;
+            };
+            st.ir_spoof_streak = match verdict {
+                IrVerdict::Spoof { .. } => st.ir_spoof_streak.saturating_add(1),
+                _ => 0,
+            };
+            st.ir = Some(IrSeen {
+                call: self.calls,
+                verdict,
+                ambient: cues.is_some_and(|c| c.lit_minus_ambient.is_finite()),
+            });
+        }
+    }
+
+    /// Forgets the IR mapping and every track's IR state.
+    fn reset_ir(&mut self) {
+        self.ir_assoc = IrAssociator::new();
+        self.last_lit = None;
+        for st in self.tracks.values_mut() {
+            st.ir = None;
+            st.ir_spoof_streak = 0;
+        }
     }
 
     /// Frame interval to ask the camera for: the idle rate while the last report had no tracks.
@@ -308,6 +488,35 @@ impl Pipeline {
             self.cfg.idle_fps
         };
         1000 / u64::from(fps.max(1))
+    }
+}
+
+/// The fusion table. IR only adds evidence: a spoof on either side beats a live on the other,
+/// and since fusion runs per RGB track, IR alone never makes anything `Live`.
+///
+/// | IR evidence | RGB            | result           |
+/// |-------------|----------------|------------------|
+/// | Spoof       | any            | Spoof, tier `Ir` |
+/// | Live        | Spoof          | the RGB Spoof    |
+/// | Live        | Live / Unknown | Live, tier `Ir`  |
+/// | Absent      | any            | the RGB verdict  |
+///
+/// IR `Live` with RGB `Unknown` is accepted, the bar Windows Hello holds since CVE-2025-26644
+/// (an NIR face plus an RGB camera that sees the same face): MiniFASNet gives no verdict for a
+/// face as close as the owner at a laptop. Residual risk: a dual-spectrum (visible + NIR) screen
+/// held close enough that RGB is `Unknown`, on hardware without a usable ambient frame.
+fn fuse(rgb: &LivenessState, ir: IrEvidence) -> (LivenessState, LivenessTier) {
+    let rgb_tier = match rgb {
+        LivenessState::Live { tier, .. } | LivenessState::Spoof { tier, .. } => *tier,
+        LivenessState::Unknown => LivenessTier::Rgb,
+    };
+    let tier = LivenessTier::Ir;
+    match (ir, rgb) {
+        (IrEvidence::Spoof { score, .. }, _) => (LivenessState::Spoof { score, tier }, tier),
+        (IrEvidence::Live { .. }, LivenessState::Spoof { .. }) | (IrEvidence::Absent, _) => {
+            (rgb.clone(), rgb_tier)
+        }
+        (IrEvidence::Live { score }, _) => (LivenessState::Live { score, tier }, tier),
     }
 }
 
@@ -922,6 +1131,447 @@ mod tests {
         // IoU of empty boxes is 0 (< rerecog_iou): the re-recognition trigger is not
         // suppressed, so the track is re-embedded every frame (fail-safe direction).
         assert_eq!(h.calls.get()[1], 3);
+    }
+
+    // ---- IR fusion ----
+
+    use crate::ir::IrSpoofReason;
+    use fasec_core::IrFrame;
+
+    /// IR frame width; the RGB test frame is 64 wide, so the mock detector tells them apart.
+    const IR_W: u32 = 100;
+    /// The face box on both cameras: the identity mapping sits inside the associator's prior.
+    const FACE_BOX: RectF = RectF {
+        x: 0.3,
+        y: 0.3,
+        w: 0.4,
+        h: 0.4,
+    };
+    const RGB_LIVE: LivenessState = LivenessState::Live {
+        score: 0.9,
+        tier: LivenessTier::Rgb,
+    };
+    /// IR live without glints scores 0.8.
+    const IR_LIVE: LivenessState = LivenessState::Live {
+        score: 0.8,
+        tier: LivenessTier::Ir,
+    };
+    const IR_SPOOF: LivenessState = LivenessState::Spoof {
+        score: 0.0,
+        tier: LivenessTier::Ir,
+    };
+
+    type Dets = Arc<Mutex<Vec<Detection>>>;
+
+    /// RGB faces for RGB frames, IR faces for IR frames (which arrive as grey replicated to RGB).
+    struct DualDet {
+        rgb: Dets,
+        ir: Dets,
+    }
+    impl FaceDetector for DualDet {
+        fn detect(&mut self, f: &Frame) -> Result<Vec<Detection>, VisionError> {
+            let s = if f.width == IR_W { &self.ir } else { &self.rgb };
+            Ok(s.lock().unwrap().clone())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Scene {
+        /// A face near the emitter: bright on a dark background, the nose brighter still.
+        Face,
+        /// An evenly bright face-sized patch (printed photo).
+        Flat,
+        /// Dark background only (what IR sees of a phone replay).
+        Empty,
+        /// A dim, real ambient (unlit) frame.
+        Dim,
+    }
+
+    /// Pixels are placed in normalised coordinates, so any frame size shows the same scene.
+    fn ir_frame(seq: u64, lit: bool, scene: Scene, (w, h): (u32, u32)) -> IrFrame {
+        let px = |x: u32, y: u32| {
+            let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let face = (0.3..0.7).contains(&u) && (0.3..0.7).contains(&v);
+            let nose = (0.46..0.54).contains(&u) && (0.51..0.59).contains(&v);
+            match scene {
+                Scene::Face if nose => 210,
+                Scene::Face | Scene::Flat if face => 150,
+                Scene::Dim => 10,
+                _ => 20,
+            }
+        };
+        let data = (0..w * h).map(|i| px(i % w, i / w)).collect();
+        IrFrame::new(seq, seq * 33, w, h, lit, data).unwrap()
+    }
+
+    fn rgb_face(x: f32) -> Detection {
+        Detection {
+            bbox: RectF { x, ..FACE_BOX },
+            landmarks5: [RectF { x, ..FACE_BOX }.center(); 5],
+            score: 0.9,
+        }
+    }
+
+    /// The IR face at `FACE_BOX`, landmarks where `Scene::Face` puts the eyes, nose and mouth.
+    fn ir_face() -> Detection {
+        let p = |x, y| PointF { x, y };
+        Detection {
+            bbox: FACE_BOX,
+            landmarks5: [
+                p(0.42, 0.45),
+                p(0.58, 0.45),
+                p(0.5, 0.55),
+                p(0.44, 0.65),
+                p(0.56, 0.65),
+            ],
+            score: 0.9,
+        }
+    }
+
+    /// A pipeline whose RGB liveness runs every frame and is steered by `live` (`Err` = the
+    /// model gave no verdict, as for a face too close for MiniFASNet).
+    struct IrRig {
+        p: Pipeline,
+        rgb: Dets,
+        ir: Dets,
+        live: Arc<Mutex<Result<f32, ()>>>,
+        ts: u64,
+        seq: u64,
+        size: (u32, u32),
+        /// Send a dim ambient frame with each lit frame (else none, as on blanking hardware).
+        ambient: bool,
+    }
+
+    impl IrRig {
+        fn new() -> IrRig {
+            let rgb: Dets = Arc::new(Mutex::new(vec![rgb_face(0.3)]));
+            let ir: Dets = Arc::new(Mutex::new(vec![ir_face()]));
+            let ctl = Ctl {
+                live: Arc::new(Mutex::new(Ok(0.9))),
+                emb: Arc::new(Mutex::new(Ok(vec![1.0; 4]))),
+            };
+            let p = Pipeline::new(
+                Box::new(DualDet {
+                    rgb: rgb.clone(),
+                    ir: ir.clone(),
+                }),
+                Box::new(CtlEmb(ctl.clone())),
+                Box::new(CtlLive(ctl.clone())),
+                Box::new(MockPose(Calls::default())),
+                PipelineConfig {
+                    liveness_interval_ms: 0,
+                    ..PipelineConfig::default()
+                },
+            );
+            IrRig {
+                p,
+                rgb,
+                ir,
+                live: ctl.live,
+                ts: 0,
+                seq: 0,
+                size: (IR_W, IR_W),
+                ambient: false,
+            }
+        }
+
+        /// One RGB frame 33 ms after the last, with lit frame `lit` (seq, scene) if any.
+        fn call(&mut self, lit: Option<(u64, Scene)>, ir_health: CameraHealth) -> ProcessOutput {
+            self.ts += 33;
+            let frames = lit.map(|(seq, s)| {
+                let amb = self
+                    .ambient
+                    .then(|| ir_frame(seq, false, Scene::Dim, self.size));
+                (ir_frame(seq, true, s, self.size), amb)
+            });
+            let ir = frames.as_ref().map(|(l, a)| (l, a.as_ref()));
+            self.p
+                .process_with_ir(&frame(self.ts), ir, CameraHealth::Ok, ir_health)
+                .unwrap()
+        }
+
+        /// A new lit frame of `scene`, IR healthy.
+        fn lit(&mut self, scene: Scene) -> ProcessOutput {
+            self.seq += 1;
+            self.call(Some((self.seq, scene)), CameraHealth::Ok)
+        }
+
+        /// No new lit frame this call, IR healthy.
+        fn dark(&mut self) -> ProcessOutput {
+            self.call(None, CameraHealth::Ok)
+        }
+
+        /// Five lit frames of the face: the associator trusts the mapping on the fifth.
+        fn warm(&mut self) -> ProcessOutput {
+            let mut out = self.lit(Scene::Face);
+            for _ in 0..4 {
+                out = self.lit(Scene::Face);
+            }
+            out
+        }
+    }
+
+    fn live0(out: &ProcessOutput) -> LivenessState {
+        out.report.tracks[0].liveness.clone()
+    }
+
+    #[test]
+    fn fusion_table_row_by_row() {
+        let rgb_spoof = LivenessState::Spoof {
+            score: 0.2,
+            tier: LivenessTier::Rgb,
+        };
+        let all = [RGB_LIVE, rgb_spoof.clone(), LivenessState::Unknown];
+        let ir_spoof = IrEvidence::Spoof {
+            score: 0.0,
+            reason: IrSpoofReason::NoIrFace,
+        };
+        let ir_live = IrEvidence::Live { score: 0.8 };
+        // IR spoof (streak met) wins over any RGB verdict
+        for rgb in &all {
+            assert_eq!(fuse(rgb, ir_spoof), (IR_SPOOF, LivenessTier::Ir), "{rgb:?}");
+        }
+        // IR live never overrides an RGB spoof
+        assert_eq!(
+            fuse(&rgb_spoof, ir_live),
+            (rgb_spoof.clone(), LivenessTier::Rgb)
+        );
+        // IR live with RGB live or no RGB verdict (too close) is live on the IR tier
+        for rgb in [&RGB_LIVE, &LivenessState::Unknown] {
+            assert_eq!(fuse(rgb, ir_live), (IR_LIVE, LivenessTier::Ir), "{rgb:?}");
+        }
+        // no IR evidence: the RGB verdict as today
+        for rgb in &all {
+            assert_eq!(
+                fuse(rgb, IrEvidence::Absent),
+                (rgb.clone(), LivenessTier::Rgb),
+                "{rgb:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_too_close_for_rgb_is_live_on_ir_once_trusted() {
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        // the mapping is not trusted for the first four lit frames: RGB alone, Unknown
+        for k in 0..4 {
+            let out = r.lit(Scene::Face);
+            assert_eq!(live0(&out), LivenessState::Unknown, "frame {k}");
+            assert_eq!(out.report.liveness_tier, LivenessTier::Rgb, "frame {k}");
+            assert_eq!(out.ir[0].evidence, IrEvidence::Absent);
+        }
+        let out = r.lit(Scene::Face);
+        assert_eq!(live0(&out), IR_LIVE);
+        assert_eq!(out.report.liveness_tier, LivenessTier::Ir);
+        let id = out.report.tracks[0].id;
+        assert_eq!(
+            out.ir,
+            [TrackIr {
+                track: id,
+                evidence: IrEvidence::Live { score: 0.8 },
+                tier: LivenessTier::Ir,
+                ambient: false,
+            }]
+        );
+        // with a usable ambient frame the evidence says so
+        r.ambient = true;
+        let out = r.lit(Scene::Face);
+        assert_eq!(live0(&out), IR_LIVE);
+        assert!(out.ir[0].ambient);
+    }
+
+    #[test]
+    fn rgb_live_and_ir_live_is_ir_tier_but_rgb_spoof_wins() {
+        let mut r = IrRig::new();
+        assert_eq!(live0(&r.warm()), IR_LIVE);
+        *r.live.lock().unwrap() = Ok(0.2);
+        let out = r.lit(Scene::Face);
+        assert_eq!(
+            live0(&out),
+            LivenessState::Spoof {
+                score: 0.2,
+                tier: LivenessTier::Rgb
+            }
+        );
+        assert_eq!(out.ir[0].tier, LivenessTier::Rgb);
+    }
+
+    #[test]
+    fn ir_spoof_needs_three_consecutive_lit_frames_and_beats_rgb_live() {
+        for (scene, faces) in [(Scene::Empty, vec![]), (Scene::Flat, vec![ir_face()])] {
+            let mut r = IrRig::new();
+            assert_eq!(live0(&r.warm()), IR_LIVE);
+            *r.ir.lock().unwrap() = faces.clone();
+            // two spoof frames: below the streak, the RGB verdict stands
+            for _ in 0..2 {
+                let out = r.lit(scene);
+                assert_eq!(live0(&out), RGB_LIVE);
+                assert_eq!(out.ir[0].evidence, IrEvidence::Absent);
+            }
+            let out = r.lit(scene);
+            assert_eq!(live0(&out), IR_SPOOF);
+            assert!(matches!(out.ir[0].evidence, IrEvidence::Spoof { .. }));
+            // a non-spoof frame resets the streak
+            *r.ir.lock().unwrap() = vec![ir_face()];
+            assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
+            for _ in 0..3 {
+                *r.ir.lock().unwrap() = faces.clone();
+                for _ in 0..2 {
+                    assert_eq!(live0(&r.lit(scene)), RGB_LIVE);
+                }
+                *r.ir.lock().unwrap() = vec![ir_face()];
+                assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_ir_falls_back_to_rgb() {
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        assert_eq!(live0(&r.warm()), IR_LIVE);
+        // one call without a lit frame: the previous lit frame still counts
+        let out = r.dark();
+        assert_eq!(live0(&out), IR_LIVE);
+        assert_eq!(out.report.liveness_tier, LivenessTier::Ir);
+        // two: stale
+        let out = r.dark();
+        assert_eq!(live0(&out), LivenessState::Unknown);
+        assert_eq!(out.report.liveness_tier, LivenessTier::Rgb);
+        assert_eq!(out.ir[0].evidence, IrEvidence::Absent);
+        // a new lit frame brings it back
+        assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
+        // a lit frame seen before (same or older seq) is not new evidence
+        for back in [0, 1] {
+            let mut r = IrRig::new();
+            *r.live.lock().unwrap() = Err(());
+            r.warm();
+            let old = Some((r.seq - back, Scene::Face));
+            assert_eq!(live0(&r.call(old, CameraHealth::Ok)), IR_LIVE);
+            let out = r.call(old, CameraHealth::Ok);
+            assert_eq!(live0(&out), LivenessState::Unknown, "seq - {back}");
+        }
+        // an unlit frame passed as the lit one is not a lit frame
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        r.warm();
+        for k in 1..=2 {
+            let unlit = ir_frame(r.seq + k, false, Scene::Face, r.size);
+            r.ts += 33;
+            let out =
+                r.p.process_with_ir(
+                    &frame(r.ts),
+                    Some((&unlit, None)),
+                    CameraHealth::Ok,
+                    CameraHealth::Ok,
+                )
+                .unwrap();
+            let want = if k == 1 {
+                (IR_LIVE, LivenessTier::Ir)
+            } else {
+                (LivenessState::Unknown, LivenessTier::Rgb)
+            };
+            assert_eq!((live0(&out), out.report.liveness_tier), want, "call {k}");
+        }
+    }
+
+    #[test]
+    fn ir_loss_falls_back_to_rgb_and_trust_is_re_earned() {
+        for lost in [
+            CameraHealth::Lost,
+            CameraHealth::Busy,
+            CameraHealth::Error("x".into()),
+        ] {
+            let mut r = IrRig::new();
+            *r.live.lock().unwrap() = Err(());
+            assert_eq!(live0(&r.warm()), IR_LIVE);
+            // a lit frame passed with unhealthy IR is ignored
+            r.seq += 1;
+            let out = r.call(Some((r.seq, Scene::Face)), lost.clone());
+            assert_eq!(live0(&out), LivenessState::Unknown, "{lost:?}");
+            assert_eq!(out.report.liveness_tier, LivenessTier::Rgb);
+            // IR back: four lit frames before the mapping is trusted again
+            for k in 0..4 {
+                let out = r.lit(Scene::Face);
+                assert_eq!(live0(&out), LivenessState::Unknown, "{lost:?} frame {k}");
+                assert_eq!(out.report.liveness_tier, LivenessTier::Rgb);
+            }
+            assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
+        }
+    }
+
+    #[test]
+    fn process_is_rgb_only_and_drops_ir_trust() {
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        r.warm();
+        let out = r.p.process(&frame(r.ts + 33), CameraHealth::Ok).unwrap();
+        r.ts += 33;
+        assert_eq!(live0(&out), LivenessState::Unknown);
+        assert_eq!(out.report.liveness_tier, LivenessTier::Rgb);
+        assert_eq!(out.ir[0].evidence, IrEvidence::Absent);
+        assert_eq!(live0(&r.lit(Scene::Face)), LivenessState::Unknown);
+    }
+
+    #[test]
+    fn ir_frame_size_change_resets_trust() {
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        assert_eq!(live0(&r.warm()), IR_LIVE);
+        r.size = (IR_W, 80);
+        for k in 0..4 {
+            assert_eq!(
+                live0(&r.lit(Scene::Face)),
+                LivenessState::Unknown,
+                "frame {k}"
+            );
+        }
+        assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
+    }
+
+    #[test]
+    fn ir_face_without_rgb_face_is_never_live() {
+        let mut r = IrRig::new();
+        *r.rgb.lock().unwrap() = Vec::new();
+        for _ in 0..10 {
+            let out = r.lit(Scene::Face);
+            assert!(out.report.tracks.is_empty() && out.ir.is_empty());
+            assert_eq!(out.report.liveness_tier, LivenessTier::Rgb);
+        }
+        // trusted, then the RGB face goes: nothing to be live
+        *r.rgb.lock().unwrap() = vec![rgb_face(0.3)];
+        r.warm();
+        *r.rgb.lock().unwrap() = Vec::new();
+        let out = r.lit(Scene::Face);
+        assert!(out.report.tracks.is_empty() && out.ir.is_empty());
+    }
+
+    #[test]
+    fn one_ir_face_two_tracks_only_the_matched_track_gets_ir_evidence() {
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        assert_eq!(live0(&r.warm()), IR_LIVE);
+        // a second RGB face overlapping the first; IR sees one face
+        for dets in [
+            vec![rgb_face(0.3), rgb_face(0.36)],
+            vec![rgb_face(0.36), rgb_face(0.3)],
+        ] {
+            *r.rgb.lock().unwrap() = dets;
+            for _ in 0..5 {
+                let out = r.lit(Scene::Face);
+                assert_eq!(out.report.tracks.len(), 2);
+                for (t, ir) in out.report.tracks.iter().zip(&out.ir) {
+                    assert_eq!(t.id, ir.track);
+                    if t.bbox.x == 0.3 {
+                        assert_eq!(t.liveness, IR_LIVE);
+                    } else {
+                        assert_eq!(t.liveness, LivenessState::Unknown);
+                        assert_eq!(ir.evidence, IrEvidence::Absent);
+                    }
+                }
+            }
+        }
     }
 
     fn models_dir() -> PathBuf {

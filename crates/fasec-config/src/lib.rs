@@ -195,6 +195,21 @@ idle_fps = 5
     }
 
     #[test]
+    fn liveness_ir_defaults_to_prefer_and_parses_both_values() {
+        assert_eq!(Config::default().liveness.ir, IrMode::Prefer);
+        assert_eq!(Config::from_toml("").unwrap().liveness.ir, IrMode::Prefer);
+        for (s, want) in [("prefer", IrMode::Prefer), ("off", IrMode::Off)] {
+            let cfg = Config::from_toml(&format!("[liveness]\nir = \"{s}\"\n")).unwrap();
+            assert_eq!(cfg.liveness.ir, want);
+            assert!(cfg.to_toml().contains(&format!("ir = \"{s}\"")));
+        }
+        for bad in ["[liveness]\nir = \"auto\"\n", "[liveness]\nirr = \"off\"\n"] {
+            let err = Config::from_toml(bad).unwrap_err();
+            assert!(matches!(err, ConfigError::Parse(_)), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn rejects_future_version() {
         let err = Config::from_toml("version = 2\n").unwrap_err();
         assert!(matches!(err, ConfigError::UnsupportedVersion(2)), "{err}");

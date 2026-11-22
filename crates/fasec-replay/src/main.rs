@@ -291,6 +291,7 @@ mod tests {
                     ts_ms: f.ts_ms,
                     embedding: vec![0.25, -0.5].into(),
                 }],
+                ir: Vec::new(),
             })
         }
         fn desired_interval_ms(&self) -> u64 {

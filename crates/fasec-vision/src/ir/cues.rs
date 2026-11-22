@@ -75,9 +75,9 @@ pub enum IrVerdict {
 /// Thresholds of [`judge`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IrLivenessConfig {
-    /// Consecutive lit frames of `NoIrFace` before a track is called a spoof. `judge` is per
-    /// frame; the pipeline counts this per track.
-    pub no_face_frames: u8,
+    /// Consecutive lit frames with an IR `Spoof` verdict (any reason) before a track is called
+    /// a spoof. `judge` is per frame; the pipeline counts this per track.
+    pub spoof_frames: u8,
     /// Live needs `face_vs_background` at least this; below it the emitter contrast is too weak
     /// to judge (`Unknown`).
     pub min_face_vs_background: f32,
@@ -100,7 +100,7 @@ pub struct IrLivenessConfig {
 impl Default for IrLivenessConfig {
     fn default() -> Self {
         IrLivenessConfig {
-            no_face_frames: 3,
+            spoof_frames: 3,
             // placeholder until Task 7
             min_face_vs_background: 1.5,
             // placeholder until Task 7
