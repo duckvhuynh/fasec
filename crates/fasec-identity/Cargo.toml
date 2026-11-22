@@ -10,3 +10,17 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Exposes the INSECURE `protect::testing::XorProtector` to other crates' tests.
+testing = []
+
+[dependencies]
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+uuid = { version = "1.29.3", features = ["v4"] }
+zeroize = "1.9.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
