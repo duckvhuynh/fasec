@@ -14,6 +14,10 @@ MSRV 1.92) and the Visual Studio C++ build tools ("Desktop development with C++"
 for replay also needs `ffmpeg`/`ffprobe` on `PATH`.
 
 ```sh
+# 0. Export the MiniFASNet liveness models from the upstream Apache-2.0 weights (into models/),
+#    in a venv with the pinned tools/requirements-export.txt (Python 3.12).
+python tools/export_minifasnet.py
+
 # 1. Download and SHA-256-verify the default models (into models/) and the public-domain
 #    test portraits (into .assets/). Neither is ever committed.
 cargo run -p fasec-models --example fetch
@@ -82,8 +86,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the rules.
 
 - Everything runs on your device. No cloud, no telemetry.
 - Face templates are encrypted with Windows DPAPI. No face images are stored by default.
-- Model weights are downloaded from pinned URLs with SHA-256 checks and are never
-  committed to this repo.
+- Model weights are downloaded from pinned URLs (or exported locally from upstream weights)
+  with SHA-256 checks and are never committed to this repo.
 - Honest about limits: a normal webcam cannot prove a face is 3D. fasec shows which
   liveness tier your hardware supports (RGB, IR, depth).
 

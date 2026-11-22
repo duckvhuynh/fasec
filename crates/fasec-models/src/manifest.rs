@@ -86,7 +86,17 @@ mod tests {
                 "minifasnet-v1se"
             ]
         );
-        assert!(m.defaults().all(ModelEntry::is_fetchable));
+        for e in m.defaults() {
+            assert!(e.has_valid_sha256(), "{}", e.id);
+            // MiniFASNet is a local export of the upstream weights: manual import, never downloaded.
+            let manual = e.id.starts_with("minifasnet-");
+            assert_eq!(e.is_fetchable(), !manual, "{}", e.id);
+            assert!(
+                !manual || (e.url.is_empty() && e.file.is_some()),
+                "{}",
+                e.id
+            );
+        }
         assert!(!m.get("6drepnet").unwrap().is_fetchable());
     }
 

@@ -3,7 +3,7 @@
 //! `cargo run -p fasec-models --example fetch [-- --dir models]`
 
 use anyhow::{Context, bail};
-use fasec_models::{Manifest, ensure};
+use fasec_models::{Manifest, ModelError, ensure, model_path};
 use std::path::{Path, PathBuf};
 
 fn main() -> anyhow::Result<()> {
@@ -32,6 +32,19 @@ fn main() -> anyhow::Result<()> {
     for (entry, dir) in jobs {
         match ensure(dir, entry) {
             Ok(path) => println!("ok    {:<16} {}", entry.id, path.display()),
+            // Manual-import entry (no URL) whose file is missing.
+            // shortcut: the hint names the only such defaults today (MiniFASNet);
+            // generalise when another manual-import default appears.
+            Err(ModelError::NotFetchable { .. }) if entry.url.is_empty() => {
+                failed += 1;
+                let path = model_path(dir, entry).map(|p| p.display().to_string());
+                eprintln!(
+                    "MISS  {:<16} {} not found: run `python tools/export_minifasnet.py` \
+                     (see tools/requirements-export.txt), then re-run fetch",
+                    entry.id,
+                    path.unwrap_or_default()
+                );
+            }
             Err(e) => {
                 failed += 1;
                 eprintln!("FAIL  {:<16} {e}", entry.id);
