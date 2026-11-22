@@ -11,6 +11,15 @@
 //! written until all samples are in; then person, templates and (new owner) PIN go in one
 //! transaction (`Gallery::enrol`). The preview is mirrored for display (selfie view) and the
 //! prompts are worded for it. `--seconds N` closes the window after N s (smoke runs).
+//!
+//! IR as in `live_debug`: the paired IR camera runs beside the RGB one unless the config says
+//! `ir = "off"`. On the IR tier a face too close for the RGB liveness crop is not refused, but
+//! every accepted sample still needs a `Live` verdict.
+
+// enroll draws no per-box labels, so `track_ir_label` is unused here
+#[allow(dead_code)]
+#[path = "support/ir_link.rs"]
+mod ir_link;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -24,14 +33,15 @@ use eframe::egui::{
     TextureOptions, Vec2, ViewportCommand, text_edit::TextEditState,
 };
 use fasec_camera::{Capture, LatestFrame};
-use fasec_config::{CameraConfig, ExecutionProvider};
-use fasec_core::{CameraHealth, Frame, HeadPose, TrackObs};
+use fasec_config::{CameraConfig, ExecutionProvider, IrMode};
+use fasec_core::{CameraHealth, Frame, HeadPose, LivenessTier, TrackObs};
 use fasec_identity::{
     EnrolConfig, EnrolledSample, Enrolment, Gallery, IdentityError, NewTemplate, PersonId, Pose,
     RejectReason, Role, SampleVerdict,
 };
 use fasec_platform::Dpapi;
 use fasec_vision::{Pipeline, PipelineConfig, RECOGNISER_MODEL_ID, Runtime};
+use ir_link::{IrLink, IrView, tier_line};
 use zeroize::{Zeroize, Zeroizing};
 
 const USAGE: &str = "usage: enroll --gallery <path> --name <name> [--role owner|authorised] \
@@ -178,6 +188,7 @@ fn main() -> Result<()> {
     let gallery = Gallery::open(&args.gallery, Arc::new(Dpapi::new()))
         .with_context(|| format!("opening gallery {}", args.gallery.display()))?;
     let step = pin_step(&gallery, args.role)?;
+    let ir_mode = ir_link::ir_mode_from_config().map_err(anyhow::Error::msg)?;
     let camera = match args.camera.clone() {
         Some(id) => id,
         None => {
@@ -201,6 +212,7 @@ fn main() -> Result<()> {
                 gallery,
                 step,
                 camera,
+                ir_mode,
                 app_outcome,
             );
             Ok(Box::new(app))
@@ -241,6 +253,8 @@ struct Shared {
     ready: bool,
     /// Set once every sample is collected and the camera is stopped.
     complete: bool,
+    ir: IrView,
+    tier: Option<LivenessTier>,
 }
 
 enum Stage {
@@ -290,6 +304,7 @@ impl App {
         gallery: Gallery,
         step: PinStep,
         camera: String,
+        ir_mode: IrMode,
         outcome: Arc<Mutex<Option<Result<String, String>>>>,
     ) -> App {
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -298,7 +313,7 @@ impl App {
         // Models load while the PIN is typed; the camera waits for `Cmd::Start`.
         let worker = std::thread::Builder::new()
             .name("enroll-worker".into())
-            .spawn(move || worker(rx, w_shared, ctx));
+            .spawn(move || worker(rx, w_shared, ctx, ir_mode));
         let mut app = App {
             name: args.name,
             role: args.role,
@@ -457,6 +472,10 @@ impl App {
         {
             ui.small(format!("head: yaw {yaw:.0}°  pitch {pitch:.0}°"));
         }
+        ui.small(match s.tier {
+            Some(tier) => tier_line(tier, &s.ir),
+            None => s.ir.status.clone(),
+        });
         ui.small(&s.status);
     }
 
@@ -611,6 +630,7 @@ fn worker(
     rx: Receiver<Cmd>,
     shared: Arc<Mutex<Shared>>,
     ctx: egui::Context,
+    ir_mode: IrMode,
 ) -> Option<Vec<EnrolledSample>> {
     publish(&shared, &ctx, |s| s.status = "loading models…".into());
     // `_rt` is kept alive for as long as the pipeline's sessions.
@@ -639,16 +659,24 @@ fn worker(
             return None;
         }
     };
-    publish(&shared, &ctx, |s| s.status = "camera running".into());
+    publish(&shared, &ctx, |s| s.status = "starting IR…".into());
+    let mut ir = IrLink::new(ir_mode);
+    ir.start(&id);
+    publish(&shared, &ctx, |s| {
+        (s.status, s.ir) = ("camera running".into(), ir.view());
+    });
     let mut seq = 0;
     loop {
         match rx.try_recv() {
             Ok(Cmd::Quit) | Err(TryRecvError::Disconnected) => {
                 cap.stop();
+                ir.stop();
                 return None;
             }
             Ok(Cmd::Start(_)) | Err(TryRecvError::Empty) => {}
         }
+        // IR first, so the RGB frame taken next is the one closest to the lit frame.
+        let (ir_pair, ir_health) = ir.next();
         let Some(frame) = slot.take_newer(seq, Duration::from_millis(100)) else {
             let h = cap.health();
             if h != CameraHealth::Ok {
@@ -660,7 +688,8 @@ fn worker(
             continue;
         };
         seq = frame.seq;
-        let out = match pipeline.process(&frame, cap.health()) {
+        let ir_frames = ir_pair.as_ref().map(|(lit, amb)| (lit, amb.as_ref()));
+        let out = match pipeline.process_with_ir(&frame, ir_frames, cap.health(), ir_health) {
             Ok(o) => o,
             Err(e) => {
                 publish(&shared, &ctx, |s| s.status = format!("vision error: {e}"));
@@ -676,7 +705,9 @@ fn worker(
         let verdict = enrol.offer(&frame, &out.report, emb);
         let done = enrol.current_target().is_none();
         let (target, progress) = (enrol.current_target(), enrol.progress());
+        let (ir_view, tier) = (ir.view(), out.report.liveness_tier);
         let update = move |s: &mut Shared| {
+            (s.ir, s.tier) = (ir_view, Some(tier));
             match verdict {
                 SampleVerdict::Rejected(r) => s.last_reject = Some(r),
                 SampleVerdict::Accepted { .. } | SampleVerdict::Complete => s.last_reject = None,
@@ -694,6 +725,7 @@ fn worker(
         };
         if done {
             cap.stop();
+            ir.stop();
             publish(&shared, &ctx, update);
             // Embeddings computed for this frame (`out.embeddings`) were zeroised on drop.
             return enrol.finish().ok();

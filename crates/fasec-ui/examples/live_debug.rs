@@ -3,7 +3,7 @@
 //! `cargo run -p fasec-ui --example live_debug --release [-- --seconds N] [--gallery <path>]`
 //!
 //! The UI thread only draws. One worker thread owns the `Capture` and the `Pipeline`: it
-//! starts/stops cameras on request (stopping the old one first), runs `Pipeline::process` on
+//! starts/stops cameras on request (stopping the old one first), runs the pipeline on
 //! every new frame and publishes the latest `(Frame, VisionReport)` plus stats. Once a second it
 //! also prints processed FPS and per-stage ms to stdout. `--seconds N` closes the window after
 //! N s (for unattended runs).
@@ -12,6 +12,14 @@
 //! DPAPI, builds an `IdentityTracker` and applies it to every frame, and each box shows
 //! `name (role) score`, `stranger best` or `…` (pending). A missing file is refused up front; any
 //! other gallery error is shown in the side panel and identity stays pending (fail safe).
+//!
+//! IR: unless `%APPDATA%\fasec\config.toml` says `[liveness] ir = "off"`, the worker also opens
+//! the IR camera paired with the RGB one and passes each lit pair to `process_with_ir`. The side
+//! panel shows the IR source, sharing mode, health, fps and the liveness tier with its reason;
+//! each box shows its IR verdict. Any IR failure leaves RGB running on the RGB tier.
+
+#[path = "support/ir_link.rs"]
+mod ir_link;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,11 +34,12 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2, ViewportCommand,
 };
 use fasec_camera::{CameraInfo, Capture, LatestFrame};
-use fasec_config::{CameraConfig, ExecutionProvider};
+use fasec_config::{CameraConfig, ExecutionProvider, IrMode};
 use fasec_core::{CameraHealth, Frame, IdentityState, LivenessState, TrackObs, VisionReport};
 use fasec_identity::{Gallery, IdentityTracker, MatcherConfig, Role, VoterConfig};
 use fasec_platform::Dpapi;
-use fasec_vision::{Pipeline, PipelineConfig, RECOGNISER_MODEL_ID, Runtime};
+use fasec_vision::{Pipeline, PipelineConfig, RECOGNISER_MODEL_ID, Runtime, TrackIr};
+use ir_link::{IrLink, IrView, tier_line, track_ir_label};
 
 const USAGE: &str = "usage: live_debug [--seconds N] [--gallery <path>]";
 const MODELS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models");
@@ -73,13 +82,20 @@ fn main() -> Result<()> {
             g.display()
         );
     }
+    let ir_mode = ir_link::ir_mode_from_config().map_err(anyhow::Error::msg)?;
     let close_after = args.seconds.map(Duration::from_secs);
     let cams = fasec_camera::list().map_err(|e| e.to_string());
     eframe::run_native(
         "fasec live debug",
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
-            let app = App::new(cc.egui_ctx.clone(), cams, close_after, args.gallery);
+            let app = App::new(
+                cc.egui_ctx.clone(),
+                cams,
+                close_after,
+                args.gallery,
+                ir_mode,
+            );
             Ok(Box::new(app))
         }),
     )
@@ -107,6 +123,9 @@ struct Shared {
     gallery: Option<Result<String, String>>,
     /// Person id -> `name (role)`, loaded once with the tracker.
     names: HashMap<String, String>,
+    ir: IrView,
+    /// The report's IR evidence per track.
+    track_ir: Vec<TrackIr>,
 }
 
 /// One second of processed frames; stage ms in `STAGES` order.
@@ -136,13 +155,14 @@ impl App {
         cams: Result<Vec<CameraInfo>, String>,
         close_after: Option<Duration>,
         gallery: Option<PathBuf>,
+        ir_mode: IrMode,
     ) -> App {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (tx, rx) = mpsc::channel();
         let w_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("live-debug-worker".into())
-            .spawn(move || worker(rx, w_shared, ctx, gallery));
+            .spawn(move || worker(rx, w_shared, ctx, gallery, ir_mode));
         let worker = match worker {
             Ok(w) => Some(w),
             Err(e) => {
@@ -209,11 +229,8 @@ impl App {
         ui.label(format!("EP for new sessions: {}", or_dash(s.ep)));
         ui.small("(per-stage EP is not exposed by Pipeline; a stage may fall back to CPU on its first run)");
         if let Some(r) = &s.report {
-            ui.label(format!(
-                "tracks: {}   liveness tier: {:?}",
-                r.tracks.len(),
-                r.liveness_tier
-            ));
+            ui.label(format!("tracks: {}", r.tracks.len()));
+            ui.label(RichText::new(tier_line(r.liveness_tier, &s.ir)).strong());
             let t = &r.timings;
             ui.label(format!(
                 "last frame ms: det {:.1}  rec {:.1}  live {:.1}  pose {:.1}",
@@ -236,6 +253,23 @@ impl App {
                 }
             });
         }
+        ui.separator();
+        ui.heading("IR");
+        let color = if s.ir.on {
+            Color32::GREEN
+        } else {
+            Color32::YELLOW
+        };
+        ui.colored_label(color, &s.ir.status);
+        ui.label(format!("source: {}", s.ir.source.as_deref().unwrap_or("-")));
+        ui.label(format!("sharing: {}", or_dash(s.ir.sharing)));
+        ui.label(format!(
+            "health: {}",
+            s.ir.health
+                .as_ref()
+                .map_or("-".into(), |h| format!("{h:?}"))
+        ));
+        ui.label(format!("lit fps: {:.1}", s.ir.fps));
         if let Some(g) = &s.gallery {
             ui.separator();
             ui.heading("Identity");
@@ -287,6 +321,9 @@ impl App {
                 painter.circle_filled(at(p.x, p.y), 2.5, color);
             }
             let mut text = label(t);
+            if let Some(ir) = s.track_ir.iter().find(|ir| ir.track == t.id) {
+                text = format!("{text}\n{}", track_ir_label(ir));
+            }
             if s.gallery.is_some() {
                 text = format!("{}\n{text}", identity_label(&t.identity, &s.names));
             }
@@ -407,6 +444,7 @@ fn worker(
     shared: Arc<Mutex<Shared>>,
     ctx: egui::Context,
     gallery: Option<PathBuf>,
+    ir_mode: IrMode,
 ) {
     publish(&shared, &ctx, |s| s.status = "loading models…".into());
     let load = || -> Result<(Runtime, Pipeline)> {
@@ -449,6 +487,7 @@ fn worker(
     publish(&shared, &ctx, |s| s.status = "waiting for a camera".into());
     // Each capture gets its own slot so a frame from a previous camera is never handed out.
     let mut cap: Option<(Capture, Arc<LatestFrame>)> = None;
+    let mut ir = IrLink::new(ir_mode);
     let mut seq = 0;
     let mut window = StatsWindow::new();
     loop {
@@ -458,11 +497,12 @@ fn worker(
             match rx.try_recv() {
                 Ok(Cmd::Switch(id)) => switch = Some(id),
                 Ok(Cmd::Quit) | Err(TryRecvError::Disconnected) => {
+                    let t = Instant::now();
                     if let Some((c, _)) = cap.take() {
-                        let t = Instant::now();
                         c.stop();
-                        println!("camera stopped in {} ms", t.elapsed().as_millis());
                     }
+                    ir.stop();
+                    println!("cameras stopped in {} ms", t.elapsed().as_millis());
                     return;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -472,15 +512,22 @@ fn worker(
             if let Some((c, _)) = cap.take() {
                 c.stop();
             }
+            ir.stop();
             publish(&shared, &ctx, |s| {
                 s.status = "starting…".into();
                 (s.frame, s.report, s.health, s.stats) = (None, None, None, None);
+                s.ir = ir.view();
             });
             let slot = Arc::new(LatestFrame::new());
             match Capture::start(&id, &CameraConfig::default(), Arc::clone(&slot)) {
                 Ok(c) => {
                     cap = Some((c, slot));
-                    publish(&shared, &ctx, |s| s.status = "running".into());
+                    publish(&shared, &ctx, |s| s.status = "starting IR…".into());
+                    ir.start(&id);
+                    println!("{}", ir.view().status);
+                    publish(&shared, &ctx, |s| {
+                        (s.status, s.ir) = ("running".into(), ir.view());
+                    });
                 }
                 Err(e) => publish(&shared, &ctx, |s| s.status = format!("camera error: {e}")),
             }
@@ -491,6 +538,8 @@ fn worker(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
+        // IR first, so the RGB frame taken next is the one closest to the lit frame.
+        let (ir_pair, ir_health) = ir.next();
         let Some(frame) = slot.take_newer(seq, Duration::from_millis(100)) else {
             // No frame: still surface a stall (`Lost`) and stop drawing stale boxes.
             let h = c.health();
@@ -501,14 +550,18 @@ fn worker(
         };
         seq = frame.seq;
         let health = c.health();
+        let ir_frames = ir_pair.as_ref().map(|(lit, amb)| (lit, amb.as_ref()));
         // Embeddings go only to the tracker, then are dropped (and zeroised) here.
-        let result = pipeline.process(&frame, health.clone()).map(|mut o| {
-            if let Some(t) = &mut tracker {
-                t.apply(&mut o.report, &o.embeddings);
-            }
-            o.report
-        });
-        if let Ok(r) = &result {
+        let result = pipeline
+            .process_with_ir(&frame, ir_frames, health.clone(), ir_health)
+            .map(|mut o| {
+                if let Some(t) = &mut tracker {
+                    t.apply(&mut o.report, &o.embeddings);
+                }
+                (o.report, o.ir)
+            });
+        let ir_view = ir.view();
+        if let Ok((r, _)) = &result {
             let t = &r.timings;
             window.add([t.detect_ms, t.recognize_ms, t.liveness_ms, t.pose_ms]);
         }
@@ -525,16 +578,34 @@ fn worker(
                 st.max[2],
                 st.avg[3],
                 st.max[3],
-                result.as_ref().map_or(0, |r| r.tracks.len()),
+                result.as_ref().map_or(0, |(r, _)| r.tracks.len()),
                 health
             );
+            if let Ok((r, track_ir)) = &result {
+                println!(
+                    "  {} | {} | lit fps {:.1}",
+                    ir_view.status,
+                    tier_line(r.liveness_tier, &ir_view),
+                    ir_view.fps
+                );
+                for (t, ir) in r.tracks.iter().zip(track_ir) {
+                    println!(
+                        "  #{} w {:.0}px | {:?} | {} | {:?}",
+                        t.id.0,
+                        t.face_width_px,
+                        t.liveness,
+                        track_ir_label(ir),
+                        t.identity
+                    );
+                }
+            }
         }
         publish(&shared, &ctx, |s| {
-            (s.status, s.report) = match result {
-                Ok(r) => ("running".into(), Some(r)),
-                Err(e) => (format!("vision error: {e}"), None),
+            (s.status, s.report, s.track_ir) = match result {
+                Ok((r, ir)) => ("running".into(), Some(r), ir),
+                Err(e) => (format!("vision error: {e}"), None, Vec::new()),
             };
-            (s.frame, s.health) = (Some(frame), Some(health));
+            (s.frame, s.health, s.ir) = (Some(frame), Some(health), ir_view);
             if stats.is_some() {
                 s.stats = stats;
             }
