@@ -1423,6 +1423,11 @@ dependencies = [
 [[package]]
 name = "fasec-platform"
 version = "0.0.1"
+dependencies = [
+ "thiserror 2.0.21",
+ "windows",
+ "zeroize",
+]
 
 [[package]]
 name = "fasec-policy"
