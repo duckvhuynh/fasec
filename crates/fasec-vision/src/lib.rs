@@ -4,6 +4,7 @@ pub mod attention;
 pub mod detect;
 pub mod error;
 pub mod image_ops;
+pub mod ir;
 pub mod liveness;
 pub mod pipeline;
 pub mod recognize;
