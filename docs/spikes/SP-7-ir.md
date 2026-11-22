@@ -110,7 +110,7 @@ Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
   - *Residual risk:* IR catches a phone only once the mapping has been trusted on a real face
     since the IR camera started. On a cold start, or after an IR restart, the RGB verdict
     decides alone until then.
-  - Owner acknowledgement: <pending>
+  - Owner acknowledgement: accepted 2026-11-22 (keep D1; bind IR and RGB identity is the next liveness item).
 - **D2, relief from real faces only.** Live needs relief in `[0.70, 0.97]`.
   - Relief above 0.97 is `Spoof(FlatReflectance)`. This rule is meant for a flat print, which
     should read about 1.0. **It is not verified against a printed photo, since none was

@@ -319,7 +319,7 @@ fused with the RGB verdict per track:
   attacker's own face; IR sees through it to a real face. Mitigation on the roadmap (M7): bind
   the modalities, by IR↔RGB landmark agreement or by an IR-crop embedding check when IR `Live`
   overrides an RGB `Spoof`.
-- Owner acknowledgement: <pending>
+- Owner acknowledgement: accepted 2026-11-22 (keep D1; bind IR and RGB identity is the next liveness item).
 
 ### 4.4 Attention (`fasec-vision::attention`)
 

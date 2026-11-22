@@ -235,10 +235,10 @@ start in parallel with M2 if there are two contributors.
 - [ ] Active challenge (random head-turn sequence) for enrolment and optional unlock.
 - [ ] Depth liveness (stays P2, M11).
 - [ ] Spoof attack replay set expanded (print, phone, tablet, monitor, cut-out with eye holes). *Phone photo and phone video are recorded; print and monitor are not.*
+- [ ] IR follow-up (next, owner-accepted risk 2026-11-22): bind the modalities. Identity is matched in RGB only, so an RGB face can borrow IR liveness from an overlapping live face. Check that IR and RGB landmarks agree, or check an embedding of the IR crop when IR `Live` overrides an RGB `Spoof`.
 - [ ] IR follow-up: keep the IR spoof streak across RGB track-id churn on a spoof face. A moving phone gets a new track id, so its first two lit frames read `Unknown`, not `Spoof`.
 - [ ] IR follow-up: record a printed photo and a monitor replay, and check the `FlatReflectance` and `NoIrFace` rules on them.
 - [ ] IR follow-up: check `max_frame_median` (100) in strong sunlight. None was recorded.
-- [ ] IR follow-up: bind the modalities. Identity is matched in RGB only, so an RGB face can borrow IR liveness from an overlapping live face. Check that IR and RGB landmarks agree, or check an embedding of the IR crop when IR `Live` overrides an RGB `Spoof`.
 - [ ] IR follow-up: handle IR tamper in policy. IR lost or covered after trust, while RGB stays fine, gets no policy response yet.
 - [ ] IR follow-up: restart the IR reader automatically after it dies.
 - [ ] IR follow-up: record an overlay attack: an IR-transparent print of the owner held over a real face (see modality binding above).
