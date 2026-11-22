@@ -82,7 +82,8 @@ impl IrProbe {
         Ok(IrProbe::new(Box::new(det), cfg))
     }
 
-    /// Forgets the mapping. Call it whenever the pipeline got an IR health other than `Ok`.
+    /// Forgets the mapping. Call it whenever the pipeline got an IR health other than `Ok`. An IR
+    /// detector error keeps the mapping, in the pipeline as here.
     pub fn reset(&mut self) {
         (self.assoc, self.last) = (IrAssociator::new(), None);
     }
@@ -290,5 +291,12 @@ mod tests {
         assert!(!f.trusted);
         // an unlit frame passed as lit is the detector's input error, not "no face"
         assert!(p.measure(&unlit(9, 10), None, &t).is_err());
+        // and, as in the pipeline, it keeps the mapping
+        for seq in 10..15 {
+            p.measure(&lit_face(seq, 130), None, &t).unwrap();
+        }
+        assert!(p.measure(&unlit(15, 10), None, &t).is_err());
+        let f = p.measure(&lit_face(16, 130), None, &t).unwrap().unwrap();
+        assert!(f.trusted);
     }
 }

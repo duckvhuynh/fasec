@@ -16,6 +16,10 @@ use crate::ir::assoc::IOU_MATCH;
 const RING_MARGIN: f32 = 0.25;
 /// Below this visible fraction of the face box (the rest outside the IR frame), no cues.
 const MIN_VISIBLE: f32 = 0.5;
+/// An RGB face narrower than this fraction of the RGB frame width (150 px at 1280) may be beyond
+/// the emitter's range, so no IR face there gives no cues. The narrowest recorded real face
+/// (real-80cm, 1280-wide RGB) was 188 px, and IR found it on every trusted frame.
+const MIN_NO_IR_FACE_WIDTH: f32 = 150.0 / 1280.0;
 /// Landmarks may lie this fraction of the box size outside the IR face box (a turned head puts
 /// an eye at the edge); further out the detection is inconsistent and gives no cues.
 const LANDMARK_SLACK: f32 = 0.1;
@@ -111,7 +115,8 @@ impl Default for IrLivenessConfig {
         // a real face at 30, 50 and 80 cm and turning; docs/spikes/SP-7-ir.md). No printed photo
         // or monitor was recorded, and the unlit frame was blank on every frame.
         IrLivenessConfig {
-            // 3 consecutive lit frames ≈ 1.4 s at the recorded ~2.2 lit frames/s
+            // 3 consecutive lit frames: about 1 s at the ~3 lit frames/s measured in the debug
+            // examples, 0.4 s at the camera's ~8 lit frames/s
             spoof_frames: 3,
             // real min 1.72 (80 cm; median 2.35 at 30 cm): margin 0.22
             min_face_vs_background: 1.5,
@@ -187,8 +192,9 @@ pub fn judge(cues: &IrCues, cfg: &IrLivenessConfig) -> IrVerdict {
 /// `None` (no evidence, `Unknown`) when the frames are inconsistent, the face box or its ring is
 /// degenerate or mostly outside the frame, a landmark of `matched` is non-finite or outside its
 /// box (beyond `LANDMARK_SLACK`), or the track has no IR face and that cannot be told
-/// apart from a missed match: the mapping is untrusted, or an IR face overlaps the mapped box
-/// enough to match but went elsewhere (ambiguous or contested).
+/// apart from a missed match: the mapping is untrusted, the RGB face is narrower than
+/// `MIN_NO_IR_FACE_WIDTH` (maybe out of IR range), or an IR face overlaps the mapped box enough
+/// to match but went elsewhere (ambiguous or contested).
 pub fn ir_cues(
     lit: &IrFrame,
     ambient: Option<&IrFrame>,
@@ -222,7 +228,10 @@ pub fn ir_cues(
         }
         None => {
             let mapped = assoc.map(rgb_box);
-            if !assoc.is_trusted() || ir_faces.iter().any(|d| mapped.iou(&d.bbox) >= IOU_MATCH) {
+            if !assoc.is_trusted()
+                || rgb_box.w < MIN_NO_IR_FACE_WIDTH
+                || ir_faces.iter().any(|d| mapped.iou(&d.bbox) >= IOU_MATCH)
+            {
                 return None;
             }
             (mapped, None)
@@ -621,6 +630,24 @@ mod tests {
         // an IR face that overlaps enough to match but went to another track (or was a near-tie)
         let near = det(rect(0.32, 0.3, 0.4, 0.4));
         assert_eq!(ir_cues(&lit, None, &a, FACE, &[near], None), None);
+    }
+
+    #[test]
+    fn no_ir_face_counts_only_within_the_measured_ir_range() {
+        let lit = frame(true, |_, _| 20);
+        let a = trusted_identity();
+        // 150 px of a 1280-wide RGB frame, the same fraction at any width
+        let cues = |w: f32| ir_cues(&lit, None, &a, rect(0.3, 0.3, w, 0.4), &[], None);
+        let c = cues(150.0 / 1280.0).unwrap();
+        assert!(!c.face_present, "{c:?}");
+        let v = judge(&c, &IrLivenessConfig::default());
+        assert_eq!(reason(v), Some(IrSpoofReason::NoIrFace));
+        // narrower: the face may be too far for the emitter, so no IR face says nothing
+        assert_eq!(cues(149.0 / 1280.0), None);
+        // a matched IR face is measured however small the RGB face is
+        let small = rect(0.3, 0.3, 0.1, 0.4);
+        let d = det(FACE);
+        assert!(ir_cues(&lit, None, &a, small, &[d], Some(&d)).is_some());
     }
 
     #[test]

@@ -225,6 +225,7 @@ pub fn tier_line(tier: LivenessTier, ir: &IrView) -> String {
 pub fn track_ir_label(ir: &TrackIr) -> String {
     let verdict = match ir.evidence {
         IrEvidence::Absent => return "IR -".into(),
+        IrEvidence::Unknown => "IR unknown".into(),
         IrEvidence::Live { score } => format!("IR live {score:.2}"),
         IrEvidence::Spoof { score, reason } => format!("IR SPOOF {reason:?} {score:.2}"),
         IrEvidence::Suspect { reason: None, .. } => return "IR suspect, not judged yet".into(),
@@ -313,6 +314,7 @@ mod tests {
             "IR live 0.80 (no ambient)"
         );
         assert_eq!(track_ir_label(&ir(IrEvidence::Absent, false)), "IR -");
+        assert_eq!(track_ir_label(&ir(IrEvidence::Unknown, true)), "IR unknown");
         let spoof = IrEvidence::Spoof {
             score: 0.0,
             reason: IrSpoofReason::NoIrFace,
