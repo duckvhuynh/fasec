@@ -7,6 +7,7 @@
 //! frame had an ambient partner (Gray8), and line `n` of `frames.jsonl` ([`Step`]). No
 //! embeddings, no names.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,15 @@ pub const PRESETS: [&str; 8] = [
 
 /// `%LOCALAPPDATA%\fasec\recordings`, the only place recordings are written.
 pub fn recordings_root() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("fasec").join("recordings"))
+    root_under(std::env::var_os("LOCALAPPDATA"))
+}
+
+/// `None` for an unset, empty or relative `LOCALAPPDATA`, which would resolve against the
+/// current directory.
+fn root_under(local_app_data: Option<OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(local_app_data?);
+    dir.is_absolute()
+        .then(|| dir.join("fasec").join("recordings"))
 }
 
 /// `label` lower-cased with every run of characters outside `[a-z0-9]` turned into one `-`,
@@ -201,20 +210,33 @@ pub struct Recorded {
 }
 
 /// The steps of the session in `dir`, in `frames.jsonl` order. The jsonl is parsed up front;
-/// each step's PNGs are decoded when the iterator reaches it.
+/// each step's PNGs are decoded when the iterator reaches it. An unparseable last line (the
+/// recorder killed mid-write) is skipped with a warning; any earlier one is an error.
 pub fn read(dir: &Path) -> Result<impl Iterator<Item = Result<(Vec<u8>, Recorded)>> + use<>> {
     let path = dir.join(FRAMES_FILE);
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let steps = text
+    let lines: Vec<(usize, &str)> = text
         .lines()
         .enumerate()
         .filter(|(_, l)| !l.trim().is_empty())
-        .map(|(i, l)| {
-            serde_json::from_str::<Step>(l)
-                .with_context(|| format!("{} line {}", path.display(), i + 1))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
+    let mut steps = Vec::with_capacity(lines.len());
+    for (k, &(i, l)) in lines.iter().enumerate() {
+        match serde_json::from_str::<Step>(l) {
+            Ok(s) => steps.push(s),
+            Err(e) if k + 1 == lines.len() => {
+                eprintln!(
+                    "warning: skipped {} line {} (cut short?): {e}",
+                    path.display(),
+                    i + 1
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("{} line {}", path.display(), i + 1));
+            }
+        }
+    }
     ensure!(!steps.is_empty(), "no steps in {}", path.display());
     let dir = dir.to_owned();
     Ok(steps.into_iter().map(move |s| load(&dir, s)))
@@ -386,6 +408,40 @@ mod tests {
         assert!(!rec.write(&f, &l, None).unwrap());
         assert_eq!(read(rec.dir()).unwrap().count(), 2);
         assert!(!rec.dir().join("rgb-2.png").exists());
+    }
+
+    #[test]
+    fn the_root_is_under_an_absolute_local_app_data_only() {
+        let root = |v: &str| root_under(Some(v.into()));
+        assert_eq!(
+            root(r"C:\Users\a\AppData\Local"),
+            Some(PathBuf::from(r"C:\Users\a\AppData\Local\fasec\recordings"))
+        );
+        // empty or relative would put the recordings under the current directory
+        for bad in ["", ".", "AppData", r"..\x"] {
+            assert_eq!(root(bad), None, "{bad:?}");
+        }
+        assert_eq!(root_under(None), None);
+    }
+
+    #[test]
+    fn a_truncated_last_line_is_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rec = Recorder::create(root.path(), "cut", UNIX_EPOCH).unwrap();
+        for _ in 0..2 {
+            rec.write(&rgb(0, 2, 2), &ir(1, 2, 2, true), None).unwrap();
+        }
+        let dir = rec.dir().to_owned();
+        drop(rec);
+        let path = dir.join(FRAMES_FILE);
+        let good = std::fs::read_to_string(&path).unwrap();
+        // killed mid-write: the last line is cut short, its PNGs may be missing
+        std::fs::write(&path, format!("{good}{{\"n\":2,\"rgb_se")).unwrap();
+        assert_eq!(read(&dir).unwrap().count(), 2);
+        // a bad line before the last is damage, not a cut write
+        let (first, second) = good.split_once('\n').unwrap();
+        std::fs::write(&path, format!("{first}\n{{\"n\":1,\"rgb_se\n{second}")).unwrap();
+        assert!(read(&dir).is_err());
     }
 
     #[test]

@@ -237,11 +237,12 @@ impl Pipeline {
         health: CameraHealth,
         ir_health: CameraHealth,
     ) -> Result<ProcessOutput, VisionError> {
-        crate::image_ops::check_frame(frame)?;
+        // before the frame check: a restart signalled with a bad frame must not be lost
         let ir_ok = ir_health == CameraHealth::Ok;
         if !ir_ok {
             self.reset_ir();
         }
+        crate::image_ops::check_frame(frame)?;
         let mut timings = StageTimings {
             detect_ms: 0.0,
             recognize_ms: 0.0,
@@ -1580,6 +1581,24 @@ mod tests {
             }
             assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
         }
+    }
+
+    #[test]
+    fn ir_loss_drops_trust_even_on_a_malformed_frame() {
+        let mut r = IrRig::new();
+        *r.live.lock().unwrap() = Err(());
+        assert_eq!(live0(&r.warm()), IR_LIVE);
+        let mut bad = frame(r.ts + 33);
+        bad.data = vec![0; 3].into();
+        let res =
+            r.p.process_with_ir(&bad, None, CameraHealth::Ok, CameraHealth::Lost);
+        assert!(matches!(res, Err(VisionError::Input(_))));
+        // the restart signal was not lost with the frame: trust is earned again
+        for k in 0..4 {
+            let out = r.lit(Scene::Face);
+            assert_eq!(live0(&out), LivenessState::Unknown, "frame {k}");
+        }
+        assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
     }
 
     #[test]

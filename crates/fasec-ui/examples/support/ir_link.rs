@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use fasec_camera::{CameraError, IrCapture, LatestIrPair};
 use fasec_config::{Config, IrMode};
 use fasec_core::{CameraHealth, IrFrame, LivenessTier};
-use fasec_vision::{IrEvidence, TrackIr};
+use fasec_vision::{IrEvidence, PipelineConfig, TrackIr};
 
 /// Longer than the ASUS IR camera's lit-frame period (~128 ms, 24 lit frames in 3 s in Task 1),
 /// so with healthy IR most calls carry a new lit pair with the RGB frame taken just after it.
@@ -23,9 +23,22 @@ pub type IrOffer = (Option<IrPair>, CameraHealth);
 
 const LOST: IrOffer = (None, CameraHealth::Lost);
 
-/// The pending offer, or a newly polled one that then stays pending until `delivered`.
-fn offer(pending: &mut Option<IrOffer>, poll: impl FnOnce() -> IrOffer) -> IrOffer {
-    pending.get_or_insert_with(poll).clone()
+/// An offer and when it was polled.
+type Pending = Option<(IrOffer, Instant)>;
+
+/// The pending offer, or a newly polled one that then stays pending until `delivered`. A held
+/// lit pair older than the pipeline's `ir_max_age_ms` is polled afresh, since the pipeline would
+/// count it as fresh from the call that takes it; an offer without a pair (the `Lost` of a
+/// restart) is held however long.
+fn offer(pending: &mut Pending, now: Instant, poll: impl FnOnce() -> IrOffer) -> IrOffer {
+    let max_age = Duration::from_millis(PipelineConfig::default().ir_max_age_ms);
+    if pending
+        .as_ref()
+        .is_some_and(|((pair, _), at)| pair.is_some() && now.duration_since(*at) > max_age)
+    {
+        *pending = None;
+    }
+    pending.get_or_insert_with(|| (poll(), now)).0.clone()
 }
 
 /// `[liveness] ir` from `%APPDATA%\fasec\config.toml` (SRS §6.2); no file means `prefer`.
@@ -73,7 +86,7 @@ pub struct IrLink {
     state: IrState,
     /// The offer handed out until a pipeline call takes it. A (re)start sets it to `Lost`, so
     /// the pipeline drops IR trust from the previous run before it sees the new capture.
-    pending: Option<IrOffer>,
+    pending: Pending,
     last_seq: u64,
     window: (Instant, u32),
     fps: f32,
@@ -87,7 +100,7 @@ impl IrLink {
             cap: None,
             source: None,
             state: IrState::NotStarted,
-            pending: Some(LOST),
+            pending: Some((LOST, Instant::now())),
             last_seq: 0,
             window: (Instant::now(), 0),
             fps: 0.0,
@@ -125,7 +138,8 @@ impl IrLink {
     /// Stops the IR capture (bounded at ~2 s).
     pub fn stop(&mut self) {
         self.cap = None;
-        (self.source, self.state, self.pending) = (None, IrState::NotStarted, Some(LOST));
+        let lost = Some((LOST, Instant::now()));
+        (self.source, self.state, self.pending) = (None, IrState::NotStarted, lost);
         (self.window, self.fps) = ((Instant::now(), 0), 0.0);
     }
 
@@ -134,7 +148,7 @@ impl IrLink {
     /// restart is lost on an iteration without an RGB frame. With healthy IR a new poll waits up
     /// to `LIT_WAIT` for a new lit pair.
     pub fn next(&mut self) -> IrOffer {
-        offer(&mut self.pending, || {
+        offer(&mut self.pending, Instant::now(), || {
             let Some(cap) = &self.cap else {
                 return LOST;
             };
@@ -301,30 +315,59 @@ mod tests {
         assert_eq!(track_ir_label(&ir(spoof, true)), "IR SPOOF NoIrFace 0.00");
     }
 
+    fn lit(seq: u64) -> IrFrame {
+        IrFrame::new(seq, 0, 2, 2, true, vec![9; 4]).unwrap()
+    }
+
+    fn seq(o: &IrOffer) -> Option<u64> {
+        o.0.as_ref().map(|(l, _)| l.seq)
+    }
+
     #[test]
     fn restart_lost_and_a_taken_pair_wait_for_a_pipeline_call() {
-        let lit = |seq| IrFrame::new(seq, 0, 2, 2, true, vec![9; 4]).unwrap();
-        let seq = |o: &IrOffer| o.0.as_ref().map(|(l, _)| l.seq);
+        let now = Instant::now();
         let mut link = IrLink::new(IrMode::Prefer);
         link.stop(); // a restart
         // the RGB frame is missing on two iterations: Lost is still what the next call gets
         for _ in 0..2 {
-            let o = offer(&mut link.pending, || {
+            let o = offer(&mut link.pending, now, || {
                 (Some((lit(1), None)), CameraHealth::Ok)
             });
             assert_eq!((seq(&o), o.1), (None, CameraHealth::Lost));
         }
         link.delivered();
         // a taken pair is offered again until a call takes it
-        let o = offer(&mut link.pending, || {
+        let o = offer(&mut link.pending, now, || {
             (Some((lit(2), None)), CameraHealth::Ok)
         });
         assert_eq!((seq(&o), o.1), (Some(2), CameraHealth::Ok));
-        let o = offer(&mut link.pending, || (None, CameraHealth::Ok));
+        let o = offer(&mut link.pending, now, || (None, CameraHealth::Ok));
         assert_eq!(seq(&o), Some(2));
         link.delivered();
-        let o = offer(&mut link.pending, || (None, CameraHealth::Ok));
+        let o = offer(&mut link.pending, now, || (None, CameraHealth::Ok));
         assert_eq!((seq(&o), o.1), (None, CameraHealth::Ok));
+    }
+
+    #[test]
+    fn a_held_pair_older_than_the_ir_max_age_is_dropped_but_lost_is_kept() {
+        let t0 = Instant::now();
+        let max_age = Duration::from_millis(PipelineConfig::default().ir_max_age_ms);
+        let mut link = IrLink::new(IrMode::Prefer);
+        link.delivered();
+        let new = |s| move || (Some((lit(s), None)), CameraHealth::Ok);
+        assert_eq!(seq(&offer(&mut link.pending, t0, new(1))), Some(1));
+        // still within the IR max age: the same pair
+        assert_eq!(
+            seq(&offer(&mut link.pending, t0 + max_age, new(2))),
+            Some(1)
+        );
+        // older: the pipeline would take it as fresh, so a new poll replaces it
+        let late = t0 + max_age + Duration::from_millis(1);
+        assert_eq!(seq(&offer(&mut link.pending, late, new(3))), Some(3));
+        // a restart's Lost is kept however long no RGB frame comes
+        link.stop();
+        let o = offer(&mut link.pending, late + 10 * max_age, new(4));
+        assert_eq!((seq(&o), o.1), (None, CameraHealth::Lost));
     }
 
     #[test]
