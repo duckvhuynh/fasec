@@ -100,7 +100,9 @@ Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
   - Relief below 0.70 is `Unknown`.
   - The other thresholds keep their values, with margin:
     - `face_vs_background ≥ 1.5`: real minimum 1.72, at 80 cm.
-    - `max_background 100`: real maximum 76.
+    - `max_background 100`: real maximum 76. Replaced in fix round 1 (ruling R9) by
+      `max_frame_median 100` on the median of the whole lit frame, real maximum 36; see the
+      flood check below.
     - `min_lit_face 20`: real minimum 109.
   - `min_emitter_fraction` and `self_emit_contrast` stay unmeasured placeholders.
 
@@ -135,6 +137,17 @@ the 3rd trusted frame with a face, so that the spoof streak can be met.
 | phone-photo (session b) | 92 (23 distinct frames × 4) | 92 (100 %) | 22 (23.9 %) |
 | phone-video | 80 (20 × 4) | 80 (100 %) | 27 (33.8 %) |
 
+After fix round 1 (frame-wide flood check, below). The last column counts each track from its
+own 3rd trusted frame, since a new RGB track id starts a new spoof streak:
+
+| label | tracks | Spoof (fused) | IR evidence Spoof | IR Spoof past each track's streak |
+|---|---|---|---|---|
+| phone-photo (session b) | 92 | 92 (100 %) | 64 (69.6 %) | 64 of 64 (100 %) |
+| phone-video | 80 | 80 (100 %) | 44 (55.0 %) | 44 of 44 (100 %) |
+
+Real faces are unchanged: Live on tier Ir on 17, 17, 13 and 11 of 17, 17, 13 and 11 trusted
+tracks.
+
 - When the predecessor is real-turning session b, the phone sessions add nothing: no trust was
   earned.
 - Phone-photo session a (8 steps) is left out of the criterion, because the owner's real face is
@@ -151,7 +164,30 @@ the 3rd trusted frame with a face, so that the spoof streak can be met.
   - Those Unknown frames, and new RGB track ids as the phone moves, keep breaking the 3-frame
     streak.
   - Under D1 the RGB verdict decides while IR is Unknown. So a phone that fooled MiniFASNet and
-    also flooded the ring would pass as RGB Live. This is the open item below.
+    also flooded the ring would pass as RGB Live.
+
+**Flood check, fix round 1 (ruling R9).** The flood check now reads `lit_frame_median`, the
+median grey level of the whole lit frame (a 256-bin histogram, lower median), instead of the
+ring. Sunlight raises the whole scene; a phone held close lights only its own surroundings. The
+ring stays as the denominator of `face_vs_background`.
+
+| label | `lit_frame_median` min-med-max | ring `lit_background` min-max |
+|---|---|---|
+| real-30cm | 13-15-15 | 46-52 |
+| real-50cm | 25-26-26 | 60-62 |
+| real-80cm | 35-36-36 | 74-76 |
+| real-turning a | 24-24-25 | 57-68 |
+| phone-photo b (after real-30cm / real-50cm) | 3-7-122 | 10-255 |
+| phone-video (after real-30cm / real-50cm) | 7-12-73 | 11-254 |
+
+- Trusted frames with cues. The real-face median rises with distance (exposure), up to 36.
+- `max_frame_median` is 100, margin 64 over the real maximum. 2 of the 48 phone frames read
+  above it (122 and 116, the first two trusted frames of phone-photo b) and stay `Unknown`.
+- With it, every phone frame past its track's 3-frame streak is IR Spoof. The IR share counted
+  from the session's 3rd trusted frame is 70 % (photo) and 55 % (video): the RGB tracker gives
+  the phone a new track id as it moves (6 ids over the trusted frames of phone-photo b, 8 over
+  those of phone-video, replayed after real-50cm), and each new
+  id must build its own streak. MiniFASNet's Spoof covers those frames.
 
 ### In ISO/IEC 30107-3 terms
 
@@ -163,12 +199,13 @@ the distinct frame counts are given here.
   - real-turning session b replayed after real-50cm: 1 of 15. That frame was RGB Spoof while IR
     was below its streak.
 - **APCER, phone photo (session b):** 0 of 23 distinct frames accepted as Live. IR evidence
-  alone called a spoof on 22 of 92 frame-replays (24 %).
-- **APCER, phone video:** 0 of 20 distinct frames accepted as Live. IR alone: 27 of 80 (34 %).
-- **Open item:** IR alone does not yet hold the phone. The flood check reads the ring around the
-  mapped box, so a phone close to the emitter looks like sunlight. Telling a local reflection
-  apart from a flooded scene needs a frame-wide flood measure, and that is a design decision for
-  the owner.
+  alone called a spoof on 64 of 92 frame-replays (70 %; 24 % before fix round 1), and on all
+  64 that were past their track's spoof streak.
+- **APCER, phone video:** 0 of 20 distinct frames accepted as Live. IR alone: 44 of 80 (55 %;
+  34 % before), and all 44 past the streak.
+- **Open item:** the frames IR alone misses are a new track's first two frames. The phone gets
+  a new RGB track id as it moves, which restarts the spoof streak.
+- The frame-wide flood threshold is not verified in sunlight: none was recorded.
 
 Not measured, so no claim is made:
 - printed photo, monitor, NIR-emitting screen, mask;

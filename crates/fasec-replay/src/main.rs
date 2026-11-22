@@ -993,7 +993,9 @@ mod tests {
     ///   whose IR mapping is trusted (from the fifth lit frame on);
     /// - `phone-*`, each replayed after each `real-*` through one pipeline: Spoof on ≥ 99 % of
     ///   its tracks once the mapping is trusted and the spoof streak can be met (from its
-    ///   `spoof_frames`-th trusted frame with a face on).
+    ///   `spoof_frames`-th trusted frame with a face on);
+    /// - and IR evidence alone Spoof on ≥ 90 % of the phone tracks from each track's own
+    ///   `spoof_frames`-th trusted frame on (a new track id starts a new streak).
     #[test]
     #[ignore = "needs local recordings"]
     fn exit_criteria_on_the_owner_recordings() {
@@ -1071,6 +1073,9 @@ mod tests {
         // label -> (tracks, Spoof, of which by IR evidence)
         let mut spoof: std::collections::BTreeMap<String, (usize, usize, usize)> =
             Default::default();
+        // label -> (tracks past their own streak, IR evidence Spoof)
+        let mut by_ir_streak: std::collections::BTreeMap<String, (usize, usize)> =
+            Default::default();
         let skip = usize::from(cfg.ir.spoof_frames) - 1;
         for (_, r) in &real {
             for (label, p) in &phone {
@@ -1088,14 +1093,33 @@ mod tests {
                 let s = t.iter().filter(|(t, _)| t["liveness"]["Spoof"].is_object());
                 let by_ir = s.clone().filter(|(_, i)| i["evidence"]["kind"] == "Spoof");
                 let (s, by_ir) = (s.count(), by_ir.count());
+                // IR alone, on the tracks from their own `spoof_frames`-th trusted frame: a new
+                // RGB track id (the phone moved) starts a new streak
+                let mut seen: std::collections::HashMap<u64, usize> = Default::default();
+                let streak: Vec<bool> = lines
+                    .iter()
+                    .filter(|l| l["ir"]["session"] == 1)
+                    .filter(trusted)
+                    .flat_map(|l| l["ir"]["tracks"].as_array().unwrap().clone())
+                    .filter_map(|i| {
+                        let k = seen.entry(i["track"].as_u64().unwrap()).or_default();
+                        *k += 1;
+                        (*k > skip).then(|| i["evidence"]["kind"] == "Spoof")
+                    })
+                    .collect();
+                let streak_ir = streak.iter().filter(|&&b| b).count();
                 eprintln!(
-                    "{} -> {}: {} tracks, {s} Spoof ({by_ir} by IR)",
+                    "{} -> {}: {} tracks, {s} Spoof ({by_ir} by IR); IR on {streak_ir} of {} \
+                     tracks past their own streak",
                     r.file_name().unwrap().display(),
                     p.file_name().unwrap().display(),
-                    t.len()
+                    t.len(),
+                    streak.len()
                 );
                 let e = spoof.entry(label.clone()).or_default();
                 (e.0, e.1, e.2) = (e.0 + t.len(), e.1 + s, e.2 + by_ir);
+                let e = by_ir_streak.entry(label.clone()).or_default();
+                (e.0, e.1) = (e.0 + streak.len(), e.1 + streak_ir);
             }
         }
         for (label, (n, ok)) in &live {
@@ -1111,8 +1135,17 @@ mod tests {
         for (label, (n, ok)) in &live {
             assert!(*n > 0 && pct(*ok, *n) >= 95.0, "{label}: {ok} of {n}");
         }
+        for (label, (n, ir)) in &by_ir_streak {
+            eprintln!(
+                "{label}: IR alone {ir} of {n} = {:.1} % past each track's streak",
+                pct(*ir, *n)
+            );
+        }
         for (label, (n, s, _)) in &spoof {
             assert!(*n > 0 && pct(*s, *n) >= 99.0, "{label}: {s} of {n}");
+        }
+        for (label, (n, ir)) in &by_ir_streak {
+            assert!(*n > 0 && pct(*ir, *n) >= 90.0, "{label}: IR {ir} of {n}");
         }
     }
 

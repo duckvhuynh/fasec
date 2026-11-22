@@ -690,7 +690,7 @@ fn num(v: f32) -> String {
 }
 
 /// Every `IrCues` field with its value and the rule `judge` applies to it.
-fn cue_rows(c: &IrCues, cfg: &IrLivenessConfig) -> [(&'static str, String, String); 8] {
+fn cue_rows(c: &IrCues, cfg: &IrLivenessConfig) -> [(&'static str, String, String); 9] {
     [
         (
             "face_present",
@@ -718,7 +718,12 @@ fn cue_rows(c: &IrCues, cfg: &IrLivenessConfig) -> [(&'static str, String, Strin
         (
             "lit_background",
             num(c.lit_background),
-            format!("above {}: flooded, unknown", cfg.max_background),
+            "reported only (flooding reads the frame median)".into(),
+        ),
+        (
+            "lit_frame_median",
+            num(c.lit_frame_median),
+            format!("above {}: flooded, unknown", cfg.max_frame_median),
         ),
         (
             "lit_minus_ambient",
@@ -980,6 +985,7 @@ mod tests {
             glints: 1,
             lit_face: 120.0,
             lit_background: 30.0,
+            lit_frame_median: 12.0,
             ambient_background: f32::NAN,
         };
         let rows = cue_rows(&c, &IrLivenessConfig::default());

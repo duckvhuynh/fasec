@@ -45,10 +45,14 @@ pub struct IrCues {
     pub relief: f32,
     /// Eyes (0–2) with a small saturated spot in the lit frame that the ambient frame lacks.
     pub glints: u8,
-    /// Lit-frame means over the face box and over the ring, for the signal floor, self-emission
-    /// and flooding checks only.
+    /// Lit-frame means over the face box and over the ring: the signal floor and self-emission
+    /// checks use the face; the ring is reported only (its signal is `face_vs_background`'s
+    /// denominator).
     pub lit_face: f32,
     pub lit_background: f32,
+    /// Median of the whole lit frame, for the flooding check: sunlight raises the whole scene,
+    /// a phone or hand close to the emitter only its own patch.
+    pub lit_frame_median: f32,
     /// Ambient-frame mean over the ring; NaN when the ambient frame is missing or blank. The
     /// ambient face mean is `lit_face - lit_minus_ambient`.
     pub ambient_background: f32,
@@ -86,9 +90,10 @@ pub struct IrLivenessConfig {
     /// recorded real face (`Unknown`); above it the face is flatter than any (`FlatReflectance`).
     pub min_relief: f32,
     pub max_relief: f32,
-    /// A lit background ring brighter than this means the scene is flooded with ambient IR and
-    /// the emitter contrast is lost (`Unknown`).
-    pub max_background: f32,
+    /// A lit frame whose median is brighter than this is flooded with ambient IR and the
+    /// emitter contrast is lost (`Unknown`). The ring around the face is not used here: a phone
+    /// held close lights it as brightly as sunlight would.
+    pub max_frame_median: f32,
     /// With a usable ambient frame, a face whose lit − ambient is below this fraction of its lit
     /// brightness gets too little of its light from the emitter: `SelfEmitting` if it also glows
     /// in the ambient frame (see `self_emit_contrast`), else `Unknown` (sun or window NIR).
@@ -114,8 +119,9 @@ impl Default for IrLivenessConfig {
             min_relief: 0.70,
             // real max 0.91; a flat print should read ≈ 1.0 (unverified: no printer)
             max_relief: 0.97,
-            // real lit_background max 76 (80 cm): margin 24
-            max_background: 100.0,
+            // real lit_frame_median 13–36 (30–80 cm): margin 64. A phone held close lights the
+            // ring up to 255 but the frame median to 3–73 (116 and 122 on 2 of 48 frames)
+            max_frame_median: 100.0,
             // not measurable: no usable ambient frame was recorded; placeholder
             min_emitter_fraction: 0.5,
             // not measurable: no usable ambient frame was recorded; placeholder
@@ -133,21 +139,18 @@ const GLINT_BONUS: f32 = 0.1;
 /// The IR verdict for one frame. Glints only raise a `Live` score; `Live` rests on the ratios.
 pub fn judge(cues: &IrCues, cfg: &IrLivenessConfig) -> IrVerdict {
     let spoof = |reason| IrVerdict::Spoof { score: 0.0, reason };
-    // before NoIrFace: in a flooded scene the IR detector may miss a real face
-    if cues.lit_background > cfg.max_background {
+    // before NoIrFace: in a flooded scene the IR detector may miss a real face. Frame-wide, so
+    // a phone or hand close to the emitter, which lights only its own surroundings, still
+    // reads NoIrFace.
+    if cues.lit_frame_median > cfg.max_frame_median {
         return IrVerdict::Unknown;
     }
     if !cues.face_present {
         return spoof(IrSpoofReason::NoIrFace);
     }
-    let finite = [
-        cues.face_vs_background,
-        cues.relief,
-        cues.lit_face,
-        cues.lit_background,
-    ]
-    .iter()
-    .all(|v| v.is_finite());
+    let finite = [cues.face_vs_background, cues.relief, cues.lit_face]
+        .iter()
+        .all(|v| v.is_finite());
     if !finite || cues.lit_face < cfg.min_lit_face {
         return IrVerdict::Unknown;
     }
@@ -296,6 +299,7 @@ pub fn ir_cues(
         glints,
         lit_face: mean(face, width, &lit_px) as f32,
         lit_background: ring_mean(&lit_px) as f32,
+        lit_frame_median: median(&lit.data),
         ambient_background: amb.map_or(f32::NAN, |a| ring_mean(&|i: usize| f64::from(a[i])) as f32),
     })
 }
@@ -307,6 +311,21 @@ pub fn ambient_is_blank(f: &IrFrame) -> bool {
     let total: u64 = f.data.iter().map(|&p| u64::from(p)).sum();
     let above = f.data.iter().filter(|&&p| p > 8).count();
     (total as f64) < n as f64 && above * 100 <= n
+}
+
+/// The lower median grey level of `px` (non-empty), from a 256-bin histogram.
+fn median(px: &[u8]) -> f32 {
+    let mut hist = [0usize; 256];
+    for &p in px {
+        hist[usize::from(p)] += 1;
+    }
+    let half = px.len().div_ceil(2);
+    let mut seen = 0;
+    let level = hist.iter().position(|&c| {
+        seen += c;
+        seen >= half
+    });
+    level.map_or(f32::NAN, |l| l as f32)
 }
 
 /// Whether the disc of `radius` px around `p` holds a small spot brighter than `GLINT_LEVEL` in
@@ -504,21 +523,23 @@ mod tests {
     }
 
     /// The owner's recorded real faces (Task 7, trusted frames at 30, 50 and 80 cm and turning):
-    /// face_vs_background 1.72–2.61, relief 0.81–0.91, lit_face 109–137, lit_background 46–76.
+    /// face_vs_background 1.72–2.61, relief 0.81–0.91, lit_face 109–137, lit_background 46–76,
+    /// lit_frame_median 13–36.
     #[test]
     fn recorded_real_face_extremes_are_live() {
         let cfg = IrLivenessConfig::default();
         let (base, _) = matched(&frame(true, real_face(20, 150, 130, false)), None);
-        for (fvb, relief, lit_face, lit_bg) in [
-            (1.72, 0.81, 128.0, 76.0),
-            (2.61, 0.91, 109.0, 46.0),
-            (2.07, 0.83, 137.0, 62.0),
+        for (fvb, relief, lit_face, lit_bg, median) in [
+            (1.72, 0.81, 128.0, 76.0, 36.0),
+            (2.61, 0.91, 109.0, 46.0, 13.0),
+            (2.07, 0.83, 137.0, 62.0, 25.0),
         ] {
             let c = IrCues {
                 face_vs_background: fvb,
                 relief,
                 lit_face,
                 lit_background: lit_bg,
+                lit_frame_median: median,
                 ..base
             };
             assert_eq!(judge(&c, &cfg), IrVerdict::Live { score: 0.8 }, "{c:?}");
@@ -746,7 +767,7 @@ mod tests {
         let cfg = IrLivenessConfig::default();
         assert!(
             c.lit_minus_ambient < cfg.min_emitter_fraction * c.lit_face
-                && c.lit_background <= cfg.max_background
+                && c.lit_frame_median <= cfg.max_frame_median
                 && (c.ambient_background - 90.0).abs() < 1e-3,
             "{c:?}"
         );
@@ -768,7 +789,46 @@ mod tests {
         let lit = frame(true, real_face(150, 200, 250, false));
         let c = ir_cues(&lit, None, &trusted_identity(), FACE, &[], None).unwrap();
         assert!(!c.face_present, "{c:?}");
-        assert_eq!(judge(&c, &IrLivenessConfig::default()), IrVerdict::Unknown);
+        let cfg = IrLivenessConfig::default();
+        assert_eq!(judge(&c, &cfg), IrVerdict::Unknown);
+        // a frame median at the threshold is not flooded yet
+        let at = IrCues {
+            lit_frame_median: cfg.max_frame_median,
+            ..c
+        };
+        assert_eq!(reason(judge(&at, &cfg)), Some(IrSpoofReason::NoIrFace));
+    }
+
+    #[test]
+    fn phone_held_close_is_no_ir_face_though_its_ring_is_bright() {
+        // the hand and phone body near the emitter light the ring; the screen and the rest of
+        // the scene stay dark
+        let in_ring = |x: u32, y: u32| (20..80).contains(&x) && (20..80).contains(&y);
+        let lit = frame(true, |x, y| {
+            if in_ring(x, y) && !in_face(x, y) {
+                230
+            } else {
+                20
+            }
+        });
+        let c = ir_cues(&lit, None, &trusted_identity(), FACE, &[], None).unwrap();
+        let cfg = IrLivenessConfig::default();
+        assert!(
+            !c.face_present && c.lit_background > 200.0 && c.lit_frame_median == 20.0,
+            "{c:?}"
+        );
+        assert_eq!(reason(judge(&c, &cfg)), Some(IrSpoofReason::NoIrFace));
+    }
+
+    #[test]
+    fn frame_median_is_the_middle_grey_level() {
+        let c = |f: &dyn Fn(u32, u32) -> u8| matched(&frame(true, f), None).0.lit_frame_median;
+        // the face covers 16 % of the frame: the median is the background's
+        assert_eq!(c(&real_face(20, 150, 130, true)), 20.0);
+        // 51 % of the pixels at 200
+        assert_eq!(c(&|x, y| if x + W * y < 4900 { 30 } else { 200 }), 200.0);
+        // exactly half at 30: the lower median
+        assert_eq!(c(&|x, y| if x + W * y < 5000 { 30 } else { 200 }), 30.0);
     }
 
     #[test]
@@ -799,7 +859,7 @@ mod tests {
         // flooded and self-lit: flooding wins
         let (c, v) = matched(&frame(true, real_face(110, 170, 200, false)), Some(&amb));
         assert!(
-            self_lit(&c) && c.lit_background > cfg.max_background,
+            self_lit(&c) && c.lit_frame_median > cfg.max_frame_median,
             "{c:?}"
         );
         assert_eq!(v, IrVerdict::Unknown, "{c:?}");
@@ -833,7 +893,6 @@ mod tests {
             |c: &mut IrCues| c.face_vs_background = f32::NAN,
             |c: &mut IrCues| c.relief = f32::NAN,
             |c: &mut IrCues| c.lit_face = f32::NAN,
-            |c: &mut IrCues| c.lit_background = f32::NAN,
             |c: &mut IrCues| c.face_vs_background = f32::INFINITY,
         ] {
             let mut c = live;
