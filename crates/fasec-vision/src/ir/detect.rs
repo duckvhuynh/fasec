@@ -6,10 +6,16 @@ use crate::{Detection, FaceDetector, VisionError};
 
 /// Faces in `frame` (normalised to it), found by the RGB detector on the grey image replicated
 /// to three channels, so one YuNet instance and config serve both cameras.
+///
+/// An unlit frame is an `Input` error, not an empty list: no face in a lit frame is spoof
+/// evidence, so an unlit frame must never read as one.
 pub fn ir_faces(
     det: &mut dyn FaceDetector,
     frame: &IrFrame,
 ) -> Result<Vec<Detection>, VisionError> {
+    if !frame.illuminated {
+        return Err(VisionError::Input("IR frame is unlit".into()));
+    }
     let rgb: Vec<u8> = frame.data.iter().flat_map(|&p| [p; 3]).collect();
     let rgb = Frame::new(frame.seq, frame.ts_ms, frame.width, frame.height, rgb)
         .map_err(|e| VisionError::Input(format!("IR frame: {e}")))?;
@@ -63,6 +69,17 @@ mod tests {
         // `IrFrame` fields are public, so the length invariant can be broken after construction
         let mut ir = IrFrame::new(0, 0, 4, 2, true, vec![1; 8]).unwrap();
         ir.data = vec![1; 7].into();
+        let mut spy = Spy(None);
+        assert!(matches!(
+            ir_faces(&mut spy, &ir),
+            Err(VisionError::Input(_))
+        ));
+        assert!(spy.0.is_none());
+    }
+
+    #[test]
+    fn unlit_frame_is_an_input_error() {
+        let ir = IrFrame::new(0, 0, 2, 2, false, vec![9; 4]).unwrap();
         let mut spy = Spy(None);
         assert!(matches!(
             ir_faces(&mut spy, &ir),
