@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(lines[6]["ir"]["ambient"], "blank");
         assert!(track(6)["cues"]["lit_minus_ambient"].is_null());
         // a flat face: a spoof on every lit frame, the pipeline's evidence after three in a row
-        for (i, evidence) in [(7, "Absent"), (8, "Absent"), (9, "Spoof")] {
+        for (i, evidence) in [(7, "Suspect"), (8, "Suspect"), (9, "Spoof")] {
             assert_eq!(track(i)["verdict"]["reason"], "FlatReflectance", "{i}");
             assert!(close(&track(i)["cues"]["relief"], 1.0), "{i}");
             assert_eq!(track(i)["evidence"]["kind"], evidence, "{i}");
@@ -973,17 +973,21 @@ mod tests {
         }
         assert_eq!(ir(5)["tracks"][0]["evidence"]["kind"], "Live");
         // trust earned on the face carries into the phone recording: no IR face is a spoof,
-        // the pipeline's evidence after three lit frames in a row, beating the RGB Live
+        // the pipeline's evidence after three lit frames in a row, beating the RGB Live; while
+        // the streak builds the pending spoof blocks that Live
         for (i, l) in lines.iter().enumerate().skip(6) {
             let ir = &l["ir"];
             assert_eq!((&ir["trusted"], &ir["ir_faces"]), (&true.into(), &0.into()));
             let t = &ir["tracks"][0];
             assert_eq!(t["verdict"]["reason"], "NoIrFace", "{i}");
-            let want = if i < 8 { "Absent" } else { "Spoof" };
+            let want = if i < 8 { "Suspect" } else { "Spoof" };
             assert_eq!(t["evidence"]["kind"], want, "{i}");
             let live = &l["tracks"][0]["liveness"];
-            let want = if i < 8 { "Live" } else { "Spoof" };
-            assert!(live.get(want).is_some(), "{i}: {live}");
+            if i < 8 {
+                assert_eq!(live, "Unknown", "{i}");
+            } else {
+                assert!(live.get("Spoof").is_some(), "{i}: {live}");
+            }
         }
     }
 
@@ -991,9 +995,9 @@ mod tests {
     /// (`<label>-<yyyymmdd-hhmmss>` from `ir_debug`), per label, with the numbers printed:
     /// - `real-*`, each replayed alone: Live on the IR tier on ≥ 95 % of the tracks on frames
     ///   whose IR mapping is trusted (from the fifth lit frame on);
-    /// - `phone-*`, each replayed after each `real-*` through one pipeline: Spoof on ≥ 99 % of
-    ///   its tracks once the mapping is trusted and the spoof streak can be met (from its
-    ///   `spoof_frames`-th trusted frame with a face on);
+    /// - `phone-*`, each replayed after each `real-*` through one pipeline: Live on none of its
+    ///   tracks once the mapping is trusted and the spoof streak can be met (from its
+    ///   `spoof_frames`-th trusted frame with a face on), the Spoof and Unknown shares printed;
     /// - and IR evidence alone Spoof on ≥ 90 % of the phone tracks from each track's own
     ///   `spoof_frames`-th trusted frame on (a new track id starts a new streak).
     #[test]
@@ -1070,8 +1074,8 @@ mod tests {
             let e = live.entry(label.clone()).or_default();
             (e.0, e.1) = (e.0 + t.len(), e.1 + ok);
         }
-        // label -> (tracks, Spoof, of which by IR evidence)
-        let mut spoof: std::collections::BTreeMap<String, (usize, usize, usize)> =
+        // label -> (tracks, Live, Spoof, of which by IR evidence)
+        let mut spoof: std::collections::BTreeMap<String, (usize, usize, usize, usize)> =
             Default::default();
         // label -> (tracks past their own streak, IR evidence Spoof)
         let mut by_ir_streak: std::collections::BTreeMap<String, (usize, usize)> =
@@ -1093,6 +1097,8 @@ mod tests {
                 let s = t.iter().filter(|(t, _)| t["liveness"]["Spoof"].is_object());
                 let by_ir = s.clone().filter(|(_, i)| i["evidence"]["kind"] == "Spoof");
                 let (s, by_ir) = (s.count(), by_ir.count());
+                let live = t.iter().filter(|(t, _)| t["liveness"]["Live"].is_object());
+                let live = live.count();
                 // IR alone, on the tracks from their own `spoof_frames`-th trusted frame: a new
                 // RGB track id (the phone moved) starts a new streak
                 let mut seen: std::collections::HashMap<u64, usize> = Default::default();
@@ -1109,15 +1115,15 @@ mod tests {
                     .collect();
                 let streak_ir = streak.iter().filter(|&&b| b).count();
                 eprintln!(
-                    "{} -> {}: {} tracks, {s} Spoof ({by_ir} by IR); IR on {streak_ir} of {} \
-                     tracks past their own streak",
+                    "{} -> {}: {} tracks, {live} Live, {s} Spoof ({by_ir} by IR); IR on \
+                     {streak_ir} of {} tracks past their own streak",
                     r.file_name().unwrap().display(),
                     p.file_name().unwrap().display(),
                     t.len(),
                     streak.len()
                 );
                 let e = spoof.entry(label.clone()).or_default();
-                (e.0, e.1, e.2) = (e.0 + t.len(), e.1 + s, e.2 + by_ir);
+                (e.0, e.1, e.2, e.3) = (e.0 + t.len(), e.1 + live, e.2 + s, e.3 + by_ir);
                 let e = by_ir_streak.entry(label.clone()).or_default();
                 (e.0, e.1) = (e.0 + streak.len(), e.1 + streak_ir);
             }
@@ -1125,11 +1131,15 @@ mod tests {
         for (label, (n, ok)) in &live {
             eprintln!("{label}: Live/Ir {ok} of {n} = {:.1} %", pct(*ok, *n));
         }
-        for (label, (n, s, by_ir)) in &spoof {
+        for (label, (n, live, s, by_ir)) in &spoof {
+            let unknown = n - live - s;
             eprintln!(
-                "{label}: Spoof {s} of {n} = {:.1} % (by IR {by_ir} = {:.1} %)",
+                "{label}: of {n}, Live {live} = {:.1} %, Spoof {s} = {:.1} % (by IR {by_ir} = \
+                 {:.1} %), Unknown {unknown} = {:.1} %",
+                pct(*live, *n),
                 pct(*s, *n),
-                pct(*by_ir, *n)
+                pct(*by_ir, *n),
+                pct(unknown, *n)
             );
         }
         for (label, (n, ok)) in &live {
@@ -1141,8 +1151,8 @@ mod tests {
                 pct(*ir, *n)
             );
         }
-        for (label, (n, s, _)) in &spoof {
-            assert!(*n > 0 && pct(*s, *n) >= 99.0, "{label}: {s} of {n}");
+        for (label, (n, live, _, _)) in &spoof {
+            assert!(*n > 0 && *live == 0, "{label}: Live {live} of {n}");
         }
         for (label, (n, ir)) in &by_ir_streak {
             assert!(*n > 0 && pct(*ir, *n) >= 90.0, "{label}: IR {ir} of {n}");

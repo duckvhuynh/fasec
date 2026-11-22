@@ -227,6 +227,7 @@ pub fn track_ir_label(ir: &TrackIr) -> String {
         IrEvidence::Absent => return "IR -".into(),
         IrEvidence::Live { score } => format!("IR live {score:.2}"),
         IrEvidence::Spoof { score, reason } => format!("IR SPOOF {reason:?} {score:.2}"),
+        IrEvidence::Suspect { score, reason } => format!("IR suspect {reason:?} {score:.2}"),
     };
     if ir.ambient {
         verdict
@@ -313,6 +314,14 @@ mod tests {
             reason: IrSpoofReason::NoIrFace,
         };
         assert_eq!(track_ir_label(&ir(spoof, true)), "IR SPOOF NoIrFace 0.00");
+        let suspect = IrEvidence::Suspect {
+            score: 0.0,
+            reason: IrSpoofReason::NoIrFace,
+        };
+        assert_eq!(
+            track_ir_label(&ir(suspect, true)),
+            "IR suspect NoIrFace 0.00"
+        );
     }
 
     fn lit(seq: u64) -> IrFrame {

@@ -93,6 +93,19 @@ Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
   - *Residual risk:* a screen that emits the owner's NIR image as well as a visible face. The
     self-emission cue that should catch it needs a usable ambient frame, and this laptop blanks
     every one.
+  - **Fix round 2 (ruling R10): a pending IR spoof blocks Live.** A fresh IR `Spoof` whose
+    track has not yet reached the 3-lit-frame streak is `Suspect`, and fuses to `Unknown` on
+    tier Ir whatever RGB says. A moving phone gets a new RGB track id often, each starting its
+    streak over, so a fooled MiniFASNet could otherwise make it `Live` on those frames. Cost: a
+    real face with a single-frame IR miss reads `Unknown` for that frame. The fusion table
+    (`fuse` in `crates/fasec-vision/src/pipeline.rs`):
+
+    | IR evidence | RGB | result |
+    |---|---|---|
+    | Spoof (streak met) | any | Spoof, tier Ir |
+    | Suspect (Spoof, streak not met) | any | Unknown, tier Ir |
+    | Live | any, Spoof included | Live, tier Ir |
+    | Absent (untrusted, stale, unhealthy, IR `Unknown`) | any | the RGB verdict |
 - **D2, relief from real faces only.** Live needs relief in `[0.70, 0.97]`.
   - Relief above 0.97 is `Spoof(FlatReflectance)`. This rule is meant for a flat print, which
     should read about 1.0. **It is not verified against a printed photo, since none was
@@ -148,6 +161,19 @@ own 3rd trusted frame, since a new RGB track id starts a new spoof streak:
 Real faces are unchanged: Live on tier Ir on 17, 17, 13 and 11 of 17, 17, 13 and 11 trusted
 tracks.
 
+After fix round 2 (ruling R10, a pending IR spoof blocks Live). Same tracks as above:
+
+| label | tracks | Live | Spoof (fused) | of which IR evidence Spoof | Unknown |
+|---|---|---|---|---|---|
+| phone-photo (session b) | 92 | 0 (0 %) | 68 (73.9 %) | 64 (69.6 %) | 24 (26.1 %) |
+| phone-video | 80 | 0 (0 %) | 44 (55.0 %) | 44 (55.0 %) | 36 (45.0 %) |
+
+- The Spoof share fell from 100 %: the first two lit frames of each new track id, which
+  MiniFASNet's Spoof used to cover, now read `Unknown` on tier Ir. No phone frame is `Live`
+  whatever MiniFASNet says on those frames.
+- Real faces are unchanged: 17, 17, 13 and 11 of 17, 17, 13 and 11 trusted tracks Live on
+  tier Ir.
+
 - When the predecessor is real-turning session b, the phone sessions add nothing: no trust was
   earned.
 - Phone-photo session a (8 steps) is left out of the criterion, because the owner's real face is
@@ -197,14 +223,16 @@ the distinct frame counts are given here.
 - **BPCER** (bona fide presentations classified as attacks), on trusted frames of the real
   sessions replayed alone: 0 of 58.
   - real-turning session b replayed after real-50cm: 1 of 15. That frame was RGB Spoof while IR
-    was below its streak.
+    was below its streak. Under R10 it would read `Unknown` instead (inferred, not re-run).
 - **APCER, phone photo (session b):** 0 of 23 distinct frames accepted as Live. IR evidence
   alone called a spoof on 64 of 92 frame-replays (70 %; 24 % before fix round 1), and on all
   64 that were past their track's spoof streak.
 - **APCER, phone video:** 0 of 20 distinct frames accepted as Live. IR alone: 44 of 80 (55 %;
   34 % before), and all 44 past the streak.
 - **Open item:** the frames IR alone misses are a new track's first two frames. The phone gets
-  a new RGB track id as it moves, which restarts the spoof streak.
+  a new RGB track id as it moves, which restarts the spoof streak. Since fix round 2 those
+  frames read `Unknown`, never `Live`, so they no longer rest on MiniFASNet; they are still
+  not called a spoof.
 - The frame-wide flood threshold is not verified in sunlight: none was recorded.
 
 Not measured, so no claim is made:

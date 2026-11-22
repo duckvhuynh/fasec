@@ -78,11 +78,15 @@ pub struct ProcessOutput {
 /// `Live` already implies IR healthy, the mapping trusted and the track matched to an IR face.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrEvidence {
-    /// IR unhealthy, absent or stale, an `Unknown` verdict, or a spoof streak still short of
-    /// `IrLivenessConfig::spoof_frames`.
+    /// IR unhealthy, absent or stale, or an `Unknown` verdict.
     Absent,
     Live {
         score: f32,
+    },
+    /// A fresh IR `Spoof` verdict whose streak is still short of `IrLivenessConfig::spoof_frames`.
+    Suspect {
+        score: f32,
+        reason: IrSpoofReason,
     },
     Spoof {
         score: f32,
@@ -421,6 +425,7 @@ impl Pipeline {
                 {
                     IrEvidence::Spoof { score, reason }
                 }
+                Some(IrVerdict::Spoof { score, reason }) => IrEvidence::Suspect { score, reason },
                 _ => IrEvidence::Absent,
             };
             let (liveness, tier) = fuse(&st.liveness, evidence);
@@ -520,11 +525,16 @@ impl Pipeline {
 
 /// The fusion table. Fusion runs per RGB track, so IR alone never makes anything `Live`.
 ///
-/// | IR evidence | RGB | result           |
-/// |-------------|-----|------------------|
-/// | Spoof       | any | Spoof, tier `Ir` |
-/// | Live        | any | Live, tier `Ir`  |
-/// | Absent      | any | the RGB verdict  |
+/// | IR evidence | RGB | result             |
+/// |-------------|-----|--------------------|
+/// | Spoof       | any | Spoof, tier `Ir`   |
+/// | Suspect     | any | Unknown, tier `Ir` |
+/// | Live        | any | Live, tier `Ir`    |
+/// | Absent      | any | the RGB verdict    |
+///
+/// A pending IR spoof (`Suspect`) blocks Live (ruling R10): a moving phone keeps getting new RGB
+/// track ids, each starting its streak over, so on those first lit frames a fooled RGB model
+/// must not decide. A real face with a single-frame IR miss reads Unknown for that frame.
 ///
 /// IR `Live` overrides an RGB `Spoof` (owner decision, Task 7): MiniFASNet calls the owner
 /// `Spoof` on most frames at laptop distance (real-30cm 15 of 22, real-80cm 17 of 17), while
@@ -536,6 +546,7 @@ fn fuse(rgb: &LivenessState, ir: IrEvidence) -> (LivenessState, LivenessTier) {
     let tier = LivenessTier::Ir;
     match ir {
         IrEvidence::Spoof { score, .. } => (LivenessState::Spoof { score, tier }, tier),
+        IrEvidence::Suspect { .. } => (LivenessState::Unknown, tier),
         IrEvidence::Live { score } => (LivenessState::Live { score, tier }, tier),
         IrEvidence::Absent => match rgb {
             LivenessState::Live { tier, .. } | LivenessState::Spoof { tier, .. } => {
@@ -1361,6 +1372,18 @@ mod tests {
         for rgb in &all {
             assert_eq!(fuse(rgb, ir_spoof), (IR_SPOOF, LivenessTier::Ir), "{rgb:?}");
         }
+        // IR spoof pending (streak short): never Live, never Spoof, whatever RGB says
+        let ir_suspect = IrEvidence::Suspect {
+            score: 0.0,
+            reason: IrSpoofReason::NoIrFace,
+        };
+        for rgb in &all {
+            assert_eq!(
+                fuse(rgb, ir_suspect),
+                (LivenessState::Unknown, LivenessTier::Ir),
+                "{rgb:?}"
+            );
+        }
         // IR live overrides any RGB verdict: MiniFASNet calls the owner Spoof at a laptop
         for rgb in &all {
             assert_eq!(fuse(rgb, ir_live), (IR_LIVE, LivenessTier::Ir), "{rgb:?}");
@@ -1442,11 +1465,11 @@ mod tests {
             let mut r = IrRig::new();
             assert_eq!(live0(&r.warm()), IR_LIVE);
             *r.ir.lock().unwrap() = faces.clone();
-            // two spoof frames: below the streak, the RGB verdict stands
+            // two spoof frames: below the streak, a pending spoof blocks the RGB Live
             for _ in 0..2 {
                 let out = r.lit(scene);
-                assert_eq!(live0(&out), RGB_LIVE);
-                assert_eq!(out.ir[0].evidence, IrEvidence::Absent);
+                assert_eq!(live0(&out), LivenessState::Unknown);
+                assert!(matches!(out.ir[0].evidence, IrEvidence::Suspect { .. }));
             }
             let out = r.lit(scene);
             assert_eq!(live0(&out), IR_SPOOF);
@@ -1457,12 +1480,33 @@ mod tests {
             for _ in 0..3 {
                 *r.ir.lock().unwrap() = faces.clone();
                 for _ in 0..2 {
-                    assert_eq!(live0(&r.lit(scene)), RGB_LIVE);
+                    assert_eq!(live0(&r.lit(scene)), LivenessState::Unknown);
                 }
                 *r.ir.lock().unwrap() = vec![ir_face()];
                 assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
             }
         }
+    }
+
+    #[test]
+    fn a_new_track_with_no_ir_face_is_never_live_while_its_streak_builds() {
+        let mut r = IrRig::new();
+        let first = r.warm().report.tracks[0].id;
+        // the phone moved: a new RGB track id, RGB fooled (Live), no IR face
+        *r.rgb.lock().unwrap() = vec![rgb_face(0.6)];
+        *r.ir.lock().unwrap() = Vec::new();
+        for k in 0..2 {
+            let out = r.lit(Scene::Empty);
+            assert_ne!(out.report.tracks[0].id, first, "lit frame {k}");
+            assert_eq!(live0(&out), LivenessState::Unknown, "lit frame {k}");
+            assert_eq!(out.ir[0].tier, LivenessTier::Ir, "lit frame {k}");
+            assert_eq!(
+                live0(&r.dark()),
+                LivenessState::Unknown,
+                "after lit frame {k}"
+            );
+        }
+        assert_eq!(live0(&r.lit(Scene::Empty)), IR_SPOOF);
     }
 
     #[test]
@@ -1476,7 +1520,11 @@ mod tests {
         // and three spoof lit frames make a streak, whatever the calls between them
         *r.ir.lock().unwrap() = Vec::new();
         for k in 0..3 {
-            let want = if k < 2 { RGB_LIVE } else { IR_SPOOF };
+            let want = if k < 2 {
+                LivenessState::Unknown
+            } else {
+                IR_SPOOF
+            };
             assert_eq!(live0(&r.lit(Scene::Empty)), want, "lit frame {k}");
             for _ in 0..2 {
                 assert_eq!(live0(&r.dark()), want, "after lit frame {k}");
@@ -1490,14 +1538,16 @@ mod tests {
         assert_eq!(live0(&r.warm()), IR_LIVE);
         *r.ir.lock().unwrap() = Vec::new();
         for _ in 0..2 {
-            assert_eq!(live0(&r.lit(Scene::Empty)), RGB_LIVE);
+            assert_eq!(live0(&r.lit(Scene::Empty)), LivenessState::Unknown);
         }
         *r.rgb.lock().unwrap() = Vec::new();
         assert!(r.lit(Scene::Empty).report.tracks.is_empty());
         *r.rgb.lock().unwrap() = vec![rgb_face(0.3)];
         // scattered spoof frames never add up: this is the first of a new streak
-        assert_eq!(live0(&r.lit(Scene::Empty)), RGB_LIVE);
-        assert_eq!(live0(&r.lit(Scene::Empty)), RGB_LIVE);
+        let out = r.lit(Scene::Empty);
+        assert!(matches!(out.ir[0].evidence, IrEvidence::Suspect { .. }));
+        assert_eq!(live0(&out), LivenessState::Unknown);
+        assert_eq!(live0(&r.lit(Scene::Empty)), LivenessState::Unknown);
         assert_eq!(live0(&r.lit(Scene::Empty)), IR_SPOOF);
     }
 

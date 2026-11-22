@@ -85,6 +85,9 @@ impl Verdict {
         match e {
             IrEvidence::Live { score } => Verdict::new("Live", Some(score), None),
             IrEvidence::Spoof { score, reason } => Verdict::new("Spoof", Some(score), Some(reason)),
+            IrEvidence::Suspect { score, reason } => {
+                Verdict::new("Suspect", Some(score), Some(reason))
+            }
             IrEvidence::Absent => Verdict::new("Absent", None, None),
         }
     }
