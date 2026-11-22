@@ -1,10 +1,10 @@
 //! ONNX Runtime wrapper: execution-provider selection and session creation.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use fasec_config::ExecutionProvider;
+use fasec_models::VerifiedModel;
 use ort::environment::Environment;
 use ort::session::Session;
 
@@ -46,47 +46,38 @@ impl Runtime {
         Ok(rt)
     }
 
-    /// Loads `model_path`; the caller must have SHA-256 verified it (`fasec_models::verify_file`).
-    pub fn session(&self, model_path: &Path) -> Result<Session, VisionError> {
-        self.session_with_ep(model_path).map(|(s, _)| s)
+    /// A session built from `model`'s verified bytes (never from the file on disk).
+    pub fn session_from_memory(&self, model: &VerifiedModel) -> Result<Session, VisionError> {
+        self.session_with_ep(model).map(|(s, _)| s)
     }
 
-    /// Like [`Runtime::session`], plus the EP that session runs on.
+    /// Like [`Runtime::session_from_memory`], plus the EP that session runs on.
     pub(crate) fn session_with_ep(
         &self,
-        model_path: &Path,
+        model: &VerifiedModel,
     ) -> Result<(Session, &'static str), VisionError> {
-        if !model_path.is_file() {
-            return Err(VisionError::Model(format!(
-                "model file not found: {}",
-                model_path.display()
-            )));
-        }
         if self.directml.load(Ordering::Relaxed) {
-            match directml::session(&self.env, model_path) {
+            match directml::session(&self.env, model.bytes()) {
                 Ok(s) => return Ok((s, "directml")),
                 Err(e) if self.requested == ExecutionProvider::Auto => {
-                    tracing::warn!(error = %e, model = %model_path.display(),
+                    tracing::warn!(error = %e, model = model.id(),
                         "DirectML session failed, falling back to CPU");
                     self.directml.store(false, Ordering::Relaxed);
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok((cpu_session(&self.env, model_path)?, "cpu"))
+        Ok((cpu_session(&self.env, model.bytes())?, "cpu"))
     }
 
     /// A session for one model stage. Under `Auto`, a DirectML session whose first run fails is
-    /// rebuilt on CPU (see [`StageSession::run`]).
-    pub(crate) fn stage_session(&self, model_path: &Path) -> Result<StageSession, VisionError> {
-        let (session, ep) = self.session_with_ep(model_path)?;
-        let rebuild: Option<Rebuild<Session>> =
-            if ep == "directml" && self.requested == ExecutionProvider::Auto {
-                let (env, path) = (self.env.clone(), model_path.to_path_buf());
-                Some(Box::new(move || cpu_session(&env, &path)))
-            } else {
-                None
-            };
+    /// rebuilt on CPU from the same verified bytes (see [`StageSession::run`]).
+    pub(crate) fn stage_session(&self, model: &VerifiedModel) -> Result<StageSession, VisionError> {
+        let (session, ep) = self.session_with_ep(model)?;
+        let rebuild = (ep == "directml" && self.requested == ExecutionProvider::Auto).then(|| {
+            let env = self.env.clone();
+            cpu_rebuild(model, move |bytes| cpu_session(&env, bytes))
+        });
         Ok(StageSession {
             session,
             ep,
@@ -119,11 +110,21 @@ fn shared_env() -> Result<Environment, VisionError> {
     Ok(e)
 }
 
-fn cpu_session(env: &Environment, model_path: &Path) -> Result<Session, VisionError> {
-    Ok(Session::builder(env)?.commit_from_file(model_path)?)
+fn cpu_session(env: &Environment, model: &[u8]) -> Result<Session, VisionError> {
+    Ok(Session::builder(env)?.commit_from_memory(model)?)
 }
 
 type Rebuild<S> = Box<dyn FnOnce() -> Result<S, VisionError> + Send>;
+
+/// A one-shot rebuild that holds its own handle on `model`'s verified bytes, so the fallback
+/// never re-reads the file.
+fn cpu_rebuild<S>(
+    model: &VerifiedModel,
+    build: impl FnOnce(&[u8]) -> Result<S, VisionError> + Send + 'static,
+) -> Rebuild<S> {
+    let model = model.clone();
+    Box::new(move || build(model.bytes()))
+}
 
 /// A model session and the EP it runs on, with an optional one-shot CPU rebuild.
 pub(crate) struct StageSession<S = Session> {
@@ -167,8 +168,6 @@ impl<S> StageSession<S> {
 
 #[cfg(windows)]
 mod directml {
-    use std::path::Path;
-
     use ort::environment::Environment;
     use ort::ep::{DirectML, ExecutionProvider};
     use ort::session::Session;
@@ -181,19 +180,17 @@ mod directml {
         }
     }
 
-    pub fn session(env: &Environment, model_path: &Path) -> ort::Result<Session> {
+    pub fn session(env: &Environment, model: &[u8]) -> ort::Result<Session> {
         Session::builder(env)?
             // DirectML does not support memory patterns (onnxruntime DirectML EP docs).
             .with_memory_pattern(false)?
             .with_execution_providers([DirectML::default().build().error_on_failure()])?
-            .commit_from_file(model_path)
+            .commit_from_memory(model)
     }
 }
 
 #[cfg(not(windows))]
 mod directml {
-    use std::path::Path;
-
     use ort::environment::Environment;
     use ort::session::Session;
 
@@ -201,24 +198,66 @@ mod directml {
         Err("DirectML is Windows-only".into())
     }
 
-    pub fn session(_env: &Environment, _model_path: &Path) -> ort::Result<Session> {
+    pub fn session(_env: &Environment, _model: &[u8]) -> ort::Result<Session> {
         Err(ort::Error::new("DirectML is Windows-only"))
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
-    pub(crate) fn verified_yunet() -> PathBuf {
-        let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-        let manifest = fasec_models::Manifest::load(models.join("manifest.toml")).unwrap();
-        let entry = manifest.get("yunet-2023mar").unwrap();
-        let path = fasec_models::model_path(&models, entry).unwrap();
-        fasec_models::verify_file(&path, &entry.sha256).unwrap();
-        path
+    fn models_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+    }
+
+    /// `models/<id>` verified against the embedded manifest.
+    pub(crate) fn verified(id: &str) -> VerifiedModel {
+        let entry = fasec_models::Manifest::embedded().get(id).unwrap();
+        VerifiedModel::load(&models_dir(), entry).unwrap()
+    }
+
+    pub(crate) fn verified_yunet() -> VerifiedModel {
+        verified("yunet-2023mar")
+    }
+
+    /// A verified "model" whose bytes are `hello fasec\n` (not ONNX).
+    fn fake_model(name: &str) -> VerifiedModel {
+        let dir = std::env::temp_dir().join(format!("fasec-rt-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.onnx"), b"hello fasec\n").unwrap();
+        let entry = fasec_models::ModelEntry {
+            id: "fake".into(),
+            task: "t".into(),
+            url: String::new(),
+            sha256: "67609a8d15c99c8fb9253f99ed4d678cbfd6fe88018366d0e68b46d77c4469a2".into(),
+            file: Some("m.onnx".into()),
+            size: None,
+            license: "MIT".into(),
+            source: "s".into(),
+            default: false,
+        };
+        VerifiedModel::load(&dir, &entry).unwrap()
+    }
+
+    #[test]
+    fn fallback_rebuild_uses_verified_bytes() {
+        let model = fake_model("rebuild");
+        let addr = model.bytes().as_ptr() as usize;
+        let rebuild = cpu_rebuild(&model, move |b| Ok(b.as_ptr() as usize == addr));
+        drop(model); // the rebuild keeps the verified bytes alive itself
+        assert!(
+            rebuild().unwrap(),
+            "rebuild got other bytes than the verified ones"
+        );
+    }
+
+    #[test]
+    fn session_from_memory_rejects_non_onnx_bytes() {
+        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
+        assert!(rt.session_from_memory(&fake_model("garbage")).is_err());
     }
 
     #[test]
@@ -279,16 +318,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn runtime_missing_model_is_error() {
-        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
-        assert!(rt.session(Path::new("does/not/exist.onnx")).is_err());
-    }
-
-    #[test]
     #[ignore = "needs models: run `cargo run -p fasec-models --example fetch`"]
     fn runtime_cpu_loads_yunet() {
         let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
-        let s = rt.session(&verified_yunet()).unwrap();
+        let s = rt.session_from_memory(&verified_yunet()).unwrap();
         assert_eq!(s.inputs().len(), 1);
         assert!(!s.outputs().is_empty());
         assert_eq!(rt.active_ep(), "cpu");
@@ -298,7 +331,7 @@ pub(crate) mod tests {
     #[ignore = "needs models: run `cargo run -p fasec-models --example fetch`"]
     fn runtime_auto_loads_yunet() {
         let rt = Runtime::new(ExecutionProvider::Auto).unwrap();
-        let s = rt.session(&verified_yunet()).unwrap();
+        let s = rt.session_from_memory(&verified_yunet()).unwrap();
         assert_eq!(s.inputs().len(), 1);
         println!("active_ep = {}", rt.active_ep());
         assert!(["directml", "cpu"].contains(&rt.active_ep()));

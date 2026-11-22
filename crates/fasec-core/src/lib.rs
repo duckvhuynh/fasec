@@ -2,11 +2,13 @@
 //!
 //! All coordinates in public types are normalised to 0..1 relative to frame width/height.
 
+pub mod embedding;
 pub mod frame;
 pub mod geom;
 pub mod threat;
 pub mod vision;
 
+pub use embedding::{Embedding, TrackEmbedding};
 pub use frame::Frame;
 pub use geom::{PointF, RectF};
 pub use threat::ThreatLevel;

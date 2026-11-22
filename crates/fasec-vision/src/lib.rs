@@ -13,6 +13,6 @@ pub mod traits;
 
 pub use detect::{YuNet, YuNetConfig};
 pub use error::VisionError;
-pub use pipeline::{Pipeline, PipelineConfig};
+pub use pipeline::{Pipeline, PipelineConfig, ProcessOutput};
 pub use runtime::Runtime;
 pub use traits::{Detection, FaceDetector, FaceEmbedder, LivenessModel, PoseEstimator};

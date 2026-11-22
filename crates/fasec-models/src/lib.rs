@@ -2,10 +2,12 @@
 
 mod fetch;
 mod manifest;
+mod verified;
 mod verify;
 
 pub use fetch::{ensure, model_path};
 pub use manifest::{Manifest, ModelEntry};
+pub use verified::VerifiedModel;
 pub use verify::{sha256_file, verify_file};
 
 #[derive(Debug, thiserror::Error)]
@@ -24,4 +26,6 @@ pub enum ModelError {
     },
     #[error("download failed: {0}")]
     Download(String),
+    #[error("model `{id}` has the wrong size: {reason}")]
+    Size { id: String, reason: String },
 }

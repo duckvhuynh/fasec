@@ -4,9 +4,8 @@
 //! OpenCV 4.x): 5-point similarity alignment to the ArcFace 112×112 template, then RGB float 0..255
 //! NCHW (`blobFromImage(..., swapRB=true)` on a BGR image) with no mean or scale.
 
-use std::path::Path;
-
 use fasec_core::{Frame, PointF};
+use fasec_models::VerifiedModel;
 use ort::session::Session;
 use ort::value::TensorRef;
 
@@ -40,11 +39,10 @@ pub struct SFace {
 }
 
 impl SFace {
-    /// `model` must be SHA-256 verified by the caller (`fasec_models::verify_file`).
-    pub fn new(rt: &Runtime, model: &Path) -> Result<SFace, VisionError> {
+    pub fn new(rt: &Runtime, model: &VerifiedModel) -> Result<SFace, VisionError> {
         let session = rt.stage_session(model)?;
         let s: &Session = session.session();
-        let bad = |why: String| VisionError::Model(format!("{}: {why}", model.display()));
+        let bad = |why: String| VisionError::Model(format!("{}: {why}", model.id()));
         let input = s
             .inputs()
             .iter()
@@ -115,14 +113,14 @@ impl FaceEmbedder for SFace {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::Path;
     use std::time::Instant;
 
     use fasec_config::ExecutionProvider;
     use image::RgbImage;
 
     use super::*;
-    use crate::runtime::tests::verified_yunet;
+    use crate::runtime::tests::{verified, verified_yunet};
     use crate::{FaceDetector, YuNet, YuNetConfig};
 
     #[test]
@@ -135,15 +133,6 @@ mod tests {
         // zero vectors and length mismatches never match
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
         assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0);
-    }
-
-    fn verified_sface() -> PathBuf {
-        let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-        let manifest = fasec_models::Manifest::load(models.join("manifest.toml")).unwrap();
-        let entry = manifest.get("sface-2021dec").unwrap();
-        let path = fasec_models::model_path(&models, entry).unwrap();
-        fasec_models::verify_file(&path, &entry.sha256).unwrap();
-        path
     }
 
     fn load(name: &str) -> Frame {
@@ -162,7 +151,7 @@ mod tests {
             let rt = Runtime::new(ep).unwrap();
             Models {
                 det: YuNet::new(&rt, &verified_yunet(), YuNetConfig::default()).unwrap(),
-                sface: SFace::new(&rt, &verified_sface()).unwrap(),
+                sface: SFace::new(&rt, &verified("sface-2021dec")).unwrap(),
             }
         }
 

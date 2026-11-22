@@ -4,9 +4,8 @@
 //! OpenCV 4.x): BGR float 0..255 NCHW input with the image in the top-left and zero padding to
 //! the right/bottom, then per-stride anchor decoding and NMS.
 
-use std::path::Path;
-
 use fasec_core::{Frame, PointF, RectF};
+use fasec_models::VerifiedModel;
 use ndarray::{Array4, s};
 use ort::session::Session;
 use ort::value::TensorRef;
@@ -56,11 +55,14 @@ pub struct YuNet {
 }
 
 impl YuNet {
-    /// `model` must be SHA-256 verified by the caller (`fasec_models::verify_file`).
-    pub fn new(rt: &Runtime, model: &Path, cfg: YuNetConfig) -> Result<YuNet, VisionError> {
+    pub fn new(
+        rt: &Runtime,
+        model: &VerifiedModel,
+        cfg: YuNetConfig,
+    ) -> Result<YuNet, VisionError> {
         let session = rt.stage_session(model)?;
         let s: &Session = session.session();
-        let bad = |why: &str| VisionError::Model(format!("{}: {why}", model.display()));
+        let bad = |why: &str| VisionError::Model(format!("{}: {why}", model.id()));
         let [input] = s.inputs() else {
             return Err(bad("expected exactly one input"));
         };
@@ -186,6 +188,7 @@ fn decode(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Instant;
 
     use fasec_config::ExecutionProvider;
