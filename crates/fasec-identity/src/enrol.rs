@@ -55,7 +55,8 @@ impl Default for EnrolConfig {
             min_face_px: 112.0,
             min_sharpness: DEFAULT_MIN_SHARPNESS,
             pose_windows: [
-                (Pose::Front, w((-10.0, 10.0), (-10.0, 10.0))),
+                // Front pitch up to +15°: the same CoarsePose bias reads a straight look as ≈+11°.
+                (Pose::Front, w((-10.0, 10.0), (-10.0, 15.0))),
                 (Pose::Left, w((-45.0, -15.0), free)),
                 (Pose::Right, w((15.0, 45.0), free)),
                 (Pose::Up, w(free, (-40.0, -6.0))),
@@ -501,7 +502,7 @@ mod tests {
     fn rejects_wrong_pose_with_target() {
         let want = RejectReason::WrongPose { want: Pose::Front };
         assert_rejected(|_, r, _| r.tracks[0] = track(1, -25.0, 0.0), want);
-        assert_rejected(|_, r, _| r.tracks[0] = track(1, 0.0, 10.5), want);
+        assert_rejected(|_, r, _| r.tracks[0] = track(1, 0.0, 15.5), want);
         assert_rejected(|_, r, _| r.tracks[0] = track(1, f32::NAN, 0.0), want);
         assert_rejected(|_, r, _| r.tracks[0].head_pose = None, want);
     }
@@ -1064,8 +1065,8 @@ mod tests {
     #[test]
     fn front_stays_absolute() {
         let mut e = Enrolment::new(EnrolConfig::default());
-        assert_eq!(offer_at(&mut e, 1, 0.0, 10.5), wrong(Pose::Front));
-        assert_eq!(offer_at(&mut e, 2, 0.0, 10.0), accepted(Pose::Front));
+        assert_eq!(offer_at(&mut e, 1, 0.0, 15.5), wrong(Pose::Front));
+        assert_eq!(offer_at(&mut e, 2, 0.0, 15.0), accepted(Pose::Front));
         // a baseline from the first sample does not shift the second Front sample's window
         assert_eq!(offer_at(&mut e, 3, 0.0, -10.5), wrong(Pose::Front));
     }
@@ -1087,30 +1088,9 @@ mod tests {
     #[test]
     fn up_passes_on_the_measured_hardware_readings() {
         // looking straight read pitch +11, a full chin-up tilt about +1 (2026-11-22). The
-        // absolute Front window stops at +10, so +11 itself never becomes the baseline: the
-        // Front samples land at +10 (+9 and +11 averaged the same) and +11 is refused.
+        // default Front window admits +11, so it becomes the baseline; +5 (relative −6) is the
+        // Up edge, +6 (relative −5) is not enough, +4 (relative −7) and +1 pass.
         let mut e = Enrolment::new(EnrolConfig::default());
-        assert_eq!(offer_at(&mut e, 1, 0.0, 11.0), wrong(Pose::Front));
-        assert_eq!(offer_at(&mut e, 2, -3.0, 9.0), accepted(Pose::Front));
-        assert_eq!(offer_at(&mut e, 3, 3.0, 11.0), wrong(Pose::Front));
-        assert_eq!(offer_at(&mut e, 4, 3.0, 10.0), accepted(Pose::Front));
-        assert_eq!(e.frontal_baseline(), Some((0.0, 9.5)));
-        for (ts, yaw) in [(5, -25.0), (6, -25.0), (7, 25.0), (8, 25.0)] {
-            assert!(matches!(
-                offer_at(&mut e, ts, yaw, 9.5),
-                SampleVerdict::Accepted { .. }
-            ));
-        }
-        // +3 is relative −6.5 and the full-tilt +1 relative −8.5: accepted for Up;
-        // +4 (relative −5.5) is not
-        assert_eq!(offer_at(&mut e, 9, 0.0, 4.0), wrong(Pose::Up));
-        assert_eq!(offer_at(&mut e, 10, 0.0, 3.0), accepted(Pose::Up));
-        assert_eq!(offer_at(&mut e, 11, -3.0, 1.0), accepted(Pose::Up));
-
-        // the exact readings, with a Front window that admits +11: +4 is relative −7
-        let mut cfg = EnrolConfig::default();
-        cfg.pose_windows[0].1.pitch = (-10.0, 15.0);
-        let mut e = Enrolment::new(cfg);
         for (ts, yaw) in [
             (1, 0.0),
             (2, 0.0),
@@ -1125,7 +1105,9 @@ mod tests {
             ));
         }
         assert_eq!(e.frontal_baseline(), Some((0.0, 11.0)));
-        assert_eq!(offer_at(&mut e, 7, 0.0, 4.0), accepted(Pose::Up));
+        assert_eq!(offer_at(&mut e, 7, 0.0, 6.0), wrong(Pose::Up));
+        assert_eq!(offer_at(&mut e, 8, 0.0, 4.0), accepted(Pose::Up));
+        assert_eq!(offer_at(&mut e, 9, -3.0, 1.0), accepted(Pose::Up));
     }
 
     #[test]
