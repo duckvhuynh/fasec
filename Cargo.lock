@@ -1522,7 +1522,10 @@ dependencies = [
  "fasec-camera",
  "fasec-config",
  "fasec-core",
+ "fasec-identity",
+ "fasec-platform",
  "fasec-vision",
+ "zeroize",
 ]
 
 [[package]]
