@@ -20,10 +20,15 @@ anyhow = "1.0.104"
 clap = { version = "4.6.9", features = ["derive"] }
 fasec-config = { version = "0.0.1", path = "../fasec-config" }
 fasec-core = { version = "0.0.1", path = "../fasec-core" }
+fasec-identity = { version = "0.0.1", path = "../fasec-identity" }
 fasec-vision = { version = "0.0.1", path = "../fasec-vision" }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 
 [dev-dependencies]
+fasec-identity = { path = "../fasec-identity", features = ["testing"] }
 tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+fasec-platform = { version = "0.0.1", path = "../fasec-platform", features = ["identity"] }

@@ -1,6 +1,7 @@
 //! Offline replay CLI: run the vision pipeline on recorded frames or video with a simulated
 //! clock and write one `VisionReport` per line (JSONL). Embeddings, when asked for, go to a
-//! separate `<out>.embeddings.jsonl` file, never into the report lines.
+//! separate `<out>.embeddings.jsonl` file, never into the report lines. With `--gallery`, each
+//! track's identity is matched against an encrypted face gallery (DPAPI, Windows only).
 
 mod input;
 mod output;
@@ -8,11 +9,13 @@ mod output;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fasec_config::ExecutionProvider;
 use fasec_core::{CameraHealth, Frame};
+use fasec_identity::{Gallery, IdentityTracker, MatcherConfig, SecretProtector, VoterConfig};
 use fasec_vision::{Pipeline, PipelineConfig, ProcessOutput, Runtime};
 
 use crate::input::{Ffmpeg, RawFrame};
@@ -54,6 +57,10 @@ struct RunArgs {
     /// Include wall-clock stage timings (makes output non-reproducible).
     #[arg(long)]
     with_timings: bool,
+    /// Encrypted face gallery (DPAPI, Windows only): tracks become Known/Stranger instead of
+    /// staying Pending.
+    #[arg(long)]
+    gallery: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -86,6 +93,52 @@ impl Process for Pipeline {
     fn desired_interval_ms(&self) -> u64 {
         Pipeline::desired_interval_ms(self)
     }
+}
+
+/// Recogniser whose embeddings the pipeline emits (the SFace model `Pipeline::from_models`
+/// loads); only gallery templates tagged with it are compared (FR-ID-008).
+const RECOGNISER_MODEL_ID: &str = "sface-2021dec";
+
+/// `inner` followed by the identity vote, which writes each track's `identity`.
+struct WithIdentity<'a> {
+    inner: &'a mut dyn Process,
+    tracker: IdentityTracker,
+}
+
+impl Process for WithIdentity<'_> {
+    fn process(&mut self, frame: &Frame) -> Result<ProcessOutput> {
+        let mut out = self.inner.process(frame)?;
+        self.tracker.apply(&mut out.report, &out.embeddings);
+        Ok(out)
+    }
+    fn desired_interval_ms(&self) -> u64 {
+        self.inner.desired_interval_ms()
+    }
+}
+
+#[cfg(windows)]
+fn gallery_protector() -> Result<Arc<dyn SecretProtector>> {
+    Ok(Arc::new(fasec_platform::Dpapi::new()))
+}
+
+#[cfg(not(windows))]
+fn gallery_protector() -> Result<Arc<dyn SecretProtector>> {
+    anyhow::bail!("--gallery: DPAPI unsupported on this platform")
+}
+
+/// Any gallery, decrypt or model-id error fails the run: identity is never guessed.
+fn open_identity(path: &Path) -> Result<IdentityTracker> {
+    // `Gallery::open` would create a missing file, silently making everyone a stranger.
+    anyhow::ensure!(path.is_file(), "gallery not found: {}", path.display());
+    let g = Gallery::open(path, gallery_protector()?)
+        .with_context(|| format!("opening gallery {}", path.display()))?;
+    IdentityTracker::from_gallery(
+        &g,
+        RECOGNISER_MODEL_ID,
+        MatcherConfig::default(),
+        VoterConfig::default(),
+    )
+    .with_context(|| format!("loading gallery {}", path.display()))
 }
 
 /// Feeds every frame to `p` (no skipping) and writes one line each to `w`, plus each embedding
@@ -126,12 +179,22 @@ fn replay(args: &RunArgs) -> Result<u64> {
         !args.with_embeddings || args.out.is_some(),
         EMBEDDINGS_NEED_OUT
     );
-    // Opened first so a bad input fails before the models load.
+    // Gallery and input opened first so either fails before the models load.
+    let tracker = args.gallery.as_deref().map(open_identity).transpose()?;
     let frames = input::open(&args.input, &Ffmpeg::default())?;
     let rt = Runtime::new(args.ep.into())?;
     let mut p = Pipeline::from_models(&rt, &args.models, PipelineConfig::default())
         .with_context(|| format!("loading models from {}", args.models.display()))?;
-    write_outputs(args, frames, &mut p)
+    match tracker {
+        Some(tracker) => {
+            let mut p = WithIdentity {
+                inner: &mut p,
+                tracker,
+            };
+            write_outputs(args, frames, &mut p)
+        }
+        None => write_outputs(args, frames, &mut p),
+    }
 }
 
 /// Creates the output file(s) `args` asks for and runs `p` over `frames` into them.
@@ -318,6 +381,7 @@ mod tests {
             out,
             with_embeddings,
             with_timings: false,
+            gallery: None,
         }
     }
 
@@ -415,6 +479,7 @@ mod tests {
                 out: Some(out.clone()),
                 with_embeddings: true,
                 with_timings: false,
+                gallery: None,
             };
             assert_eq!(replay(&args).unwrap(), 3);
             let side = output::embeddings_path(&out);
@@ -428,5 +493,128 @@ mod tests {
         );
         assert!(!report.contains("embedding"), "{report}");
         assert!(side.contains("\"embedding\":["), "no face found: {side}");
+    }
+
+    fn identities(jsonl: &str) -> Vec<Vec<IdentityState>> {
+        jsonl
+            .lines()
+            .map(|l| {
+                let r: VisionReport = serde_json::from_str(l).unwrap();
+                r.tracks.into_iter().map(|t| t.identity).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identity_tracker_sets_track_identity() {
+        use fasec_identity::protect::testing::XorProtector;
+        // Empty gallery: the mock's track is Pending until the vote window makes it a Stranger.
+        let g = Gallery::open_in_memory(std::sync::Arc::new(XorProtector::default())).unwrap();
+        let tracker = IdentityTracker::from_gallery(
+            &g,
+            RECOGNISER_MODEL_ID,
+            MatcherConfig::default(),
+            VoterConfig::default(),
+        )
+        .unwrap();
+        let mut mock = Mock::default();
+        let mut p = WithIdentity {
+            inner: &mut mock,
+            tracker,
+        };
+        let frames = (0..5).map(|i| raw(2, 2, i));
+        let mut out = Vec::new();
+        run(frames, &mut p, 10, OutputOptions::default(), &mut out, None).unwrap();
+        let ids = identities(&String::from_utf8(out).unwrap());
+        assert_eq!(ids[..4], vec![vec![IdentityState::Pending]; 4][..]);
+        assert!(
+            matches!(ids[4][..], [IdentityState::Stranger { .. }]),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn missing_gallery_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.db");
+        let mut a = args(None, false);
+        a.gallery = Some(path.clone());
+        let e = replay(&a).unwrap_err();
+        assert!(format!("{e:#}").contains("gallery not found"), "{e:#}");
+        assert!(!path.exists(), "a missing gallery must not be created");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "needs models and .assets portraits (gitignored)"]
+    fn gallery_flag_sets_identity() {
+        use fasec_identity::{Pose, Role};
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let assets = root.join(".assets");
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Enrol face-a-1's embedding, computed by the real pipeline, into a DPAPI gallery.
+        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
+        let mut p =
+            Pipeline::from_models(&rt, &root.join("models"), PipelineConfig::default()).unwrap();
+        let img = image::open(assets.join("face-a-1.jpg"))
+            .unwrap()
+            .into_rgb8();
+        let frame = Frame::new(0, 0, img.width(), img.height(), img.into_raw()).unwrap();
+        let out = p.process(&frame, CameraHealth::Ok).unwrap();
+        assert_eq!(out.embeddings.len(), 1, "face-a-1 must show one face");
+        let gallery = tmp.path().join("gallery.db");
+        let owner = {
+            let dpapi = std::sync::Arc::new(fasec_platform::Dpapi::new());
+            let mut g = Gallery::open(&gallery, dpapi).unwrap();
+            let id = g.add_person("a", Role::Owner).unwrap();
+            let e = out.embeddings[0].embedding.as_slice();
+            g.add_template(&id, RECOGNISER_MODEL_ID, Pose::Front, 0.9, e)
+                .unwrap();
+            id.0
+        };
+
+        // 12 copies at 2 fps: recognition runs every 1000 ms, so 6 votes per face.
+        let go = |face: &str| {
+            let dir = tmp.path().join(face);
+            std::fs::create_dir(&dir).unwrap();
+            for i in 0..12 {
+                let src = assets.join(format!("{face}.jpg"));
+                std::fs::copy(src, dir.join(format!("{i:02}.jpg"))).unwrap();
+            }
+            let out = tmp.path().join(format!("{face}.jsonl"));
+            let args = RunArgs {
+                input: dir,
+                fps: 2,
+                models: root.join("models"),
+                ep: Ep::Cpu,
+                out: Some(out.clone()),
+                with_embeddings: false,
+                with_timings: false,
+                gallery: Some(gallery.clone()),
+            };
+            assert_eq!(replay(&args).unwrap(), 12);
+            let ids = identities(&std::fs::read_to_string(out).unwrap());
+            eprintln!("{face}: {ids:?}");
+            ids
+        };
+
+        let a = go("face-a-2");
+        assert!(
+            matches!(&a[11][..], [IdentityState::Known { person, .. }] if *person == owner),
+            "{a:?}"
+        );
+        let b = go("face-b-1");
+        assert!(
+            b.iter()
+                .flatten()
+                .all(|s| !matches!(s, IdentityState::Known { .. })),
+            "{b:?}"
+        );
+        assert!(
+            matches!(b[11][..], [IdentityState::Stranger { .. }]),
+            "{b:?}"
+        );
     }
 }

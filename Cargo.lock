@@ -1486,6 +1486,7 @@ dependencies = [
 name = "fasec-platform"
 version = "0.0.1"
 dependencies = [
+ "fasec-identity",
  "thiserror 2.0.21",
  "windows",
  "zeroize",
@@ -1503,6 +1504,8 @@ dependencies = [
  "clap",
  "fasec-config",
  "fasec-core",
+ "fasec-identity",
+ "fasec-platform",
  "fasec-vision",
  "image",
  "serde",
