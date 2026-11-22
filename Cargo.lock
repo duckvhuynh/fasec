@@ -1409,6 +1409,7 @@ dependencies = [
 name = "fasec-identity"
 version = "0.0.1"
 dependencies = [
+ "fasec-core",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.21",

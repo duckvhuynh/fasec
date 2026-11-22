@@ -16,6 +16,7 @@ workspace = true
 testing = []
 
 [dependencies]
+fasec-core = { version = "0.0.1", path = "../fasec-core" }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"
