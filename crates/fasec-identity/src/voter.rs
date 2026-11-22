@@ -13,6 +13,9 @@ pub struct VoterConfig {
     pub window: usize,
     /// Consecutive contrary results needed to change a decided identity.
     pub flip_after: usize,
+    /// `IdentityTracker` forgets a track unseen for longer than this; matches the vision
+    /// tracker's `track_ttl_ms`, so a missed detection keeps the vote.
+    pub ttl_ms: u64,
 }
 
 impl Default for VoterConfig {
@@ -20,6 +23,7 @@ impl Default for VoterConfig {
         Self {
             window: 5,
             flip_after: 3,
+            ttl_ms: 1000,
         }
     }
 }
@@ -312,6 +316,7 @@ mod tests {
         let mut v = Voter::new(VoterConfig {
             window: 0,
             flip_after: 0,
+            ttl_ms: 0,
         });
         feed(&mut v, T, &[known("a", 0.7)]);
         assert!(is_known(&v.observe(T, &known("a", 0.7), 0), "a"));

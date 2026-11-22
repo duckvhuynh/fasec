@@ -17,6 +17,11 @@ pub struct IdentityTracker {
     model_id: String,
     /// The voter's latest state per live track, for frames without a new embedding.
     states: HashMap<TrackId, IdentityState>,
+    /// `ts_ms` of the last report each track appeared in.
+    last_seen: HashMap<TrackId, u64>,
+    /// `ts_ms` of the last report, to spot time going backwards (camera restart).
+    last_ts: Option<u64>,
+    ttl_ms: u64,
 }
 
 impl IdentityTracker {
@@ -55,6 +60,9 @@ impl IdentityTracker {
             voter: Voter::new(voter),
             model_id: current_model_id.to_owned(),
             states: HashMap::new(),
+            last_seen: HashMap::new(),
+            last_ts: None,
+            ttl_ms: voter.ttl_ms,
         })
     }
 
@@ -64,12 +72,28 @@ impl IdentityTracker {
 
     /// Feeds `embeddings` (those computed on this frame) through matcher and voter, then
     /// writes `identity` for every track in `report`: `Pending` until the voter decides.
-    /// Voter state of tracks no longer in `report` is dropped.
+    ///
+    /// A track missing from a report keeps its vote until it has been unseen for more than
+    /// `VoterConfig::ttl_ms` (the vision tracker keeps its id that long). A report older than
+    /// the previous one (camera restart) clears every vote first.
     pub fn apply(&mut self, report: &mut VisionReport, embeddings: &[TrackEmbedding]) {
-        let live: Vec<TrackId> = report.tracks.iter().map(|t| t.id).collect();
+        let now = report.ts_ms;
+        if self.last_ts.is_some_and(|last| now < last) {
+            self.voter.retain(&[]);
+            self.states.clear();
+            self.last_seen.clear();
+        }
+        self.last_ts = Some(now);
+        let in_report: Vec<TrackId> = report.tracks.iter().map(|t| t.id).collect();
+        for id in &in_report {
+            self.last_seen.insert(*id, now);
+        }
+        let ttl = self.ttl_ms;
+        self.last_seen.retain(|_, seen| now - *seen <= ttl);
+        let live: Vec<TrackId> = self.last_seen.keys().copied().collect();
         self.voter.retain(&live);
         self.states.retain(|t, _| live.contains(t));
-        for te in embeddings.iter().filter(|te| live.contains(&te.track)) {
+        for te in embeddings.iter().filter(|te| in_report.contains(&te.track)) {
             let result = self.matcher.best(te.embedding.as_slice());
             let state = self.voter.observe(te.track, &result, te.ts_ms);
             self.states.insert(te.track, state);
@@ -97,6 +121,10 @@ mod tests {
     use crate::store::{EMBEDDING_DIM, Pose, Role};
 
     const MODEL: &str = "sface-2021dec";
+    const LIVE: LivenessState = LivenessState::Live {
+        score: 0.9,
+        tier: LivenessTier::Rgb,
+    };
 
     fn unit(i: usize) -> Vec<f32> {
         let mut v = vec![0.0; EMBEDDING_DIM];
@@ -136,7 +164,7 @@ mod tests {
                     landmarks5: [p; 5],
                     det_score: 0.9,
                     identity: IdentityState::Unknown,
-                    liveness: LivenessState::Unknown,
+                    liveness: LIVE,
                     head_pose: None,
                     face_width_px: 10.0,
                     age_ms: 0,
@@ -294,20 +322,87 @@ mod tests {
     }
 
     #[test]
-    fn tracker_forgets_dead_tracks() {
+    fn tracker_forgets_tracks_unseen_past_ttl() {
         let g = gallery(MODEL);
         let mut t = tracker(&g);
         let mut r = report(0, &[1]);
         t.apply(&mut r, &[emb(1, 0, unit(0))]);
         assert!(is_known_owner(&ids(&r)[0]));
-        // track 1 leaves; if the same id came back it must start over
-        t.apply(&mut report(100, &[2]), &[]);
-        let mut r = report(200, &[1]);
+        // track 1 is unseen for 1001 ms (> ttl 1000): if the same id came back it starts over
+        t.apply(&mut report(500, &[2]), &[]);
+        t.apply(&mut report(1001, &[2]), &[]);
+        let mut r = report(1100, &[1]);
         t.apply(&mut r, &[]);
         assert_eq!(ids(&r), [IdentityState::Pending]);
         // and the voter starts over too: one non-match does not decide anything
-        let mut r = report(300, &[1]);
-        t.apply(&mut r, &[emb(1, 300, unit(1))]);
+        let mut r = report(1200, &[1]);
+        t.apply(&mut r, &[emb(1, 1200, unit(1))]);
+        assert_eq!(ids(&r), [IdentityState::Pending]);
+    }
+
+    #[test]
+    fn tracker_keeps_track_unseen_for_exactly_ttl() {
+        let g = gallery(MODEL);
+        let mut t = tracker(&g);
+        t.apply(&mut report(0, &[1]), &[emb(1, 0, unit(0))]);
+        t.apply(&mut report(1000, &[2]), &[]);
+        let mut r = report(1100, &[1]);
+        t.apply(&mut r, &[]);
+        assert!(is_known_owner(&ids(&r)[0]), "{:?}", ids(&r));
+    }
+
+    #[test]
+    fn decided_stranger_stays_stranger_across_a_missed_detection() {
+        let g = gallery(MODEL);
+        let mut t = tracker(&g);
+        for ts in 0..5 {
+            let mut r = report(ts * 100, &[1]);
+            t.apply(&mut r, &[emb(1, ts * 100, unit(1))]);
+        }
+        let mut r = report(500, &[1]);
+        t.apply(&mut r, &[]);
+        assert!(matches!(ids(&r)[0], IdentityState::Stranger { .. }));
+        // one frame without the detection, then it is back with one accepted match
+        t.apply(&mut report(600, &[]), &[]);
+        let mut r = report(700, &[1]);
+        t.apply(&mut r, &[emb(1, 700, unit(0))]);
+        assert!(
+            matches!(ids(&r)[0], IdentityState::Stranger { .. }),
+            "one match must not flip a decided stranger: {:?}",
+            ids(&r)
+        );
+        // flip_after = 3 in a row does
+        for ts in [800, 900] {
+            let mut r = report(ts, &[1]);
+            t.apply(&mut r, &[emb(1, ts, unit(0))]);
+            if ts == 900 {
+                assert!(is_known_owner(&ids(&r)[0]), "{:?}", ids(&r));
+            }
+        }
+    }
+
+    #[test]
+    fn known_owner_stays_known_across_a_missed_detection() {
+        let g = gallery(MODEL);
+        let mut t = tracker(&g);
+        t.apply(&mut report(0, &[1]), &[emb(1, 0, unit(0))]);
+        t.apply(&mut report(100, &[]), &[]);
+        let mut r = report(200, &[1]);
+        t.apply(&mut r, &[]);
+        assert!(is_known_owner(&ids(&r)[0]), "{:?}", ids(&r));
+    }
+
+    #[test]
+    fn time_going_backwards_clears_every_vote() {
+        let g = gallery(MODEL);
+        let mut t = tracker(&g);
+        t.apply(&mut report(5000, &[1]), &[emb(1, 5000, unit(0))]);
+        // camera restart: ts starts again near 0 and track 1 may be someone else
+        let mut r = report(10, &[1]);
+        t.apply(&mut r, &[]);
+        assert_eq!(ids(&r), [IdentityState::Pending]);
+        let mut r = report(20, &[1]);
+        t.apply(&mut r, &[emb(1, 20, unit(1))]);
         assert_eq!(ids(&r), [IdentityState::Pending]);
     }
 }
