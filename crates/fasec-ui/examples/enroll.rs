@@ -8,8 +8,9 @@
 //! PIN, 3 attempts, FR-ID-006); only then the camera starts. Threads follow `live_debug`: the UI
 //! thread draws and owns the gallery, one worker owns the `Pipeline`, `Capture` and `Enrolment`
 //! and stops the camera as soon as the last sample is accepted or the window closes. Nothing is
-//! written until all samples are in; then person, templates and (new owner) PIN are written
-//! together. `--seconds N` closes the window after N s (unattended smoke runs).
+//! written until all samples are in; then person, templates and (new owner) PIN go in one
+//! transaction (`Gallery::enrol`). The preview is mirrored for display (selfie view) and the
+//! prompts are worded for it. `--seconds N` closes the window after N s (smoke runs).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -26,8 +27,8 @@ use fasec_camera::{Capture, LatestFrame};
 use fasec_config::{CameraConfig, ExecutionProvider};
 use fasec_core::{CameraHealth, Frame, HeadPose, TrackObs};
 use fasec_identity::{
-    EnrolConfig, EnrolledSample, Enrolment, Gallery, IdentityError, PersonId, Pose, RejectReason,
-    Role, SampleVerdict,
+    EnrolConfig, EnrolledSample, Enrolment, Gallery, IdentityError, NewTemplate, PersonId, Pose,
+    RejectReason, Role, SampleVerdict,
 };
 use fasec_platform::Dpapi;
 use fasec_vision::{Pipeline, PipelineConfig, RECOGNISER_MODEL_ID, Runtime};
@@ -116,13 +117,16 @@ fn valid_pin(pin: &str) -> bool {
     (4..=12).contains(&pin.len()) && pin.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn pose_instruction(p: Pose) -> &'static str {
+/// Prompt text and screen arrow (unit vector, y down) for `p` in the mirrored preview.
+/// `enrol.rs` poses are image-relative (+yaw = nose towards image right), so `Pose::Left` is the
+/// nose moving to image-left: screen-right once mirrored, i.e. the user's own right.
+fn prompt(p: Pose) -> (&'static str, Option<Vec2>) {
     match p {
-        Pose::Front => "Look straight at the camera",
-        Pose::Left => "Turn slightly left",
-        Pose::Right => "Turn slightly right",
-        Pose::Up => "Tilt your head slightly up",
-        Pose::Down => "Tilt your head slightly down",
+        Pose::Front => ("Look straight at the camera", None),
+        Pose::Left => ("Turn slightly right", Some(Vec2::new(1.0, 0.0))),
+        Pose::Right => ("Turn slightly left", Some(Vec2::new(-1.0, 0.0))),
+        Pose::Up => ("Tilt your head slightly up", Some(Vec2::new(0.0, -1.0))),
+        Pose::Down => ("Tilt your head slightly down", Some(Vec2::new(0.0, 1.0))),
     }
 }
 
@@ -134,7 +138,7 @@ fn reject_message(r: RejectReason) -> &'static str {
         RejectReason::Blurry => "Hold still: image is blurry",
         RejectReason::NotLive => "Checking it is a live face: hold still in good light",
         RejectReason::SpoofDetected => "Looks like a photo or a screen: a real face is needed",
-        RejectReason::WrongPose { want } => pose_instruction(want),
+        RejectReason::WrongPose { want } => prompt(want).0,
         RejectReason::NoEmbeddingYet => "Hold that pose…",
         RejectReason::CameraUnhealthy => {
             "Camera problem: check the camera is connected and uncovered"
@@ -143,47 +147,27 @@ fn reject_message(r: RejectReason) -> &'static str {
     }
 }
 
-/// Unit vector (image coordinates, y down) the nose should move along. Pose sign convention is
-/// image-relative (`enrol.rs`: +yaw = nose towards image right), so is the arrow.
-fn pose_arrow(p: Pose) -> Option<Vec2> {
-    match p {
-        Pose::Front => None,
-        Pose::Left => Some(Vec2::new(-1.0, 0.0)),
-        Pose::Right => Some(Vec2::new(1.0, 0.0)),
-        Pose::Up => Some(Vec2::new(0.0, -1.0)),
-        Pose::Down => Some(Vec2::new(0.0, 1.0)),
-    }
-}
-
-/// Writes the person, every template and (new owner) the PIN, PIN last. On any failure the
-/// person is removed again (templates cascade) so no half-enrolled person is left behind.
-/// shortcut: compensating delete, not one transaction (`Gallery` exposes none); a crash in the
-/// middle can still leave a partial person — upgrade to a transactional `Gallery` call.
+/// Writes the person, every template (SFace model id) and the new owner PIN in one
+/// transaction (`Gallery::enrol`): all or nothing.
 fn commit(
     g: &mut Gallery,
     name: &str,
     role: Role,
     new_pin: Option<&str>,
     samples: &[EnrolledSample],
-) -> Result<PersonId> {
-    let id = g.add_person(name, role)?;
-    let rest = (|| -> Result<(), IdentityError> {
-        for s in samples {
-            let emb = s.embedding.as_slice();
-            g.add_template(&id, RECOGNISER_MODEL_ID, s.pose, s.quality, emb)?;
-        }
-        if let Some(pin) = new_pin {
-            g.set_pin(pin)?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = rest {
-        return Err(match g.remove_person(&id) {
-            Ok(()) => anyhow!("{e}; nothing was kept"),
-            Err(re) => anyhow!("{e}; removing the partial person also failed: {re}"),
-        });
-    }
-    Ok(id)
+) -> Result<PersonId, IdentityError> {
+    let templates: Vec<NewTemplate<'_>> = samples
+        .iter()
+        .map(|s| {
+            (
+                RECOGNISER_MODEL_ID,
+                s.pose,
+                s.quality,
+                s.embedding.as_slice(),
+            )
+        })
+        .collect();
+    g.enrol(name, role, new_pin, &templates)
 }
 
 fn main() -> Result<()> {
@@ -253,6 +237,8 @@ struct Shared {
     target: Option<Pose>,
     progress: (usize, usize),
     last_reject: Option<RejectReason>,
+    /// Models loaded; the worker waits for `Cmd::Start`.
+    ready: bool,
     /// Set once every sample is collected and the camera is stopped.
     complete: bool,
 }
@@ -263,6 +249,8 @@ enum Stage {
         fields: [Zeroizing<String>; 2],
         wrong: u32,
         error: String,
+        /// Focus the first field on the next paint.
+        autofocus: bool,
     },
     Capture,
     Finished {
@@ -322,6 +310,7 @@ impl App {
                 fields: std::array::from_fn(|_| Zeroizing::new(String::with_capacity(32))),
                 wrong: 0,
                 error: String::new(),
+                autofocus: true,
             },
             new_pin: None,
             shared,
@@ -353,12 +342,14 @@ impl App {
         self.close_at = Some(self.close_at.map_or(at, |t| t.min(at)));
     }
 
-    fn pin_screen(&mut self, ui: &mut egui::Ui) {
+    /// `ready`: models are loaded, so a correct PIN leads straight to the camera.
+    fn pin_screen(&mut self, ui: &mut egui::Ui, ready: bool) {
         let Stage::Pin {
             step,
             fields,
             wrong,
             error,
+            autofocus,
         } = &mut self.stage
         else {
             return;
@@ -379,7 +370,8 @@ impl App {
                 .password(true)
                 .char_limit(12);
             let r = ui.add(edit);
-            if i == 0 && ui.memory(|m| m.focused().is_none()) {
+            // Once per (re)shown form, so focus is never grabbed back from field 2.
+            if i == 0 && std::mem::take(autofocus) {
                 r.request_focus();
             }
             if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
@@ -394,7 +386,13 @@ impl App {
         if !error.is_empty() {
             ui.colored_label(Color32::RED, error.as_str());
         }
-        if !(ui.button("Continue").clicked() || enter) {
+        if !ready {
+            ui.label("Loading models…");
+        }
+        let clicked = ui
+            .add_enabled(ready, egui::Button::new("Continue"))
+            .clicked();
+        if !(ready && (clicked || enter)) {
             return;
         }
         let [first, second] = fields;
@@ -429,7 +427,7 @@ impl App {
                 let _ = self.tx.send(Cmd::Start(self.camera.clone()));
                 self.stage = Stage::Capture;
             }
-            Retry(msg) => *error = msg,
+            Retry(msg) => (*error, *autofocus) = (msg, true),
             Fail(msg) => self.finish(false, msg),
         }
     }
@@ -437,11 +435,11 @@ impl App {
     fn info_panel(&self, ui: &mut egui::Ui, s: &Shared) {
         let (have, need) = s.progress;
         match s.target {
-            Some(p) => ui.heading(RichText::new(pose_instruction(p)).size(26.0).strong()),
+            Some(p) => ui.heading(RichText::new(prompt(p).0).size(26.0).strong()),
             None if s.complete => ui.heading("All samples collected"),
             None => ui.heading("…"),
         };
-        if pose_arrow(s.target.unwrap_or(Pose::Front)).is_some() {
+        if s.target.and_then(|p| prompt(p).1).is_some() {
             ui.label("Follow the arrow on the picture.");
         }
         let frac = if need == 0 {
@@ -488,9 +486,10 @@ impl App {
         let scale = (avail.x / fw).min(avail.y / fh).max(0.01);
         let (resp, painter) = ui.allocate_painter(Vec2::new(fw, fh) * scale, Sense::hover());
         let r = resp.rect;
-        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        // Mirrored for display only (a selfie view); frame data and boxes stay image-relative.
+        let uv = Rect::from_min_max(Pos2::new(1.0, 0.0), Pos2::new(0.0, 1.0));
         painter.image(tex.id(), r, uv, Color32::WHITE);
-        let at = |x: f32, y: f32| r.min + Vec2::new(x * r.width(), y * r.height());
+        let at = |x: f32, y: f32| r.min + Vec2::new((1.0 - x) * r.width(), y * r.height());
         let color = if s.tracks.len() == 1 {
             Color32::GREEN
         } else {
@@ -498,11 +497,11 @@ impl App {
         };
         for t in &s.tracks {
             let b = t.bbox;
-            let rect = Rect::from_min_max(at(b.x, b.y), at(b.x + b.w, b.y + b.h));
+            let rect = Rect::from_two_pos(at(b.x, b.y), at(b.x + b.w, b.y + b.h));
             painter.rect_stroke(rect, 0.0, Stroke::new(2.0, color), StrokeKind::Outside);
         }
         // From the face (or the picture's centre) towards where the nose should go.
-        if let Some(dir) = s.target.and_then(pose_arrow) {
+        if let Some(dir) = s.target.and_then(|p| prompt(p).1) {
             let centre = match s.tracks.as_slice() {
                 [t] => at(t.bbox.x + t.bbox.w / 2.0, t.bbox.y + t.bbox.h / 2.0),
                 _ => r.center(),
@@ -543,13 +542,14 @@ impl eframe::App for App {
         // Keeps status and the close timer ticking while no frames arrive.
         ui.ctx().request_repaint_after(Duration::from_millis(200));
         let s = lock(&self.shared).clone();
-        if matches!(self.stage, Stage::Capture) {
+        // In the PIN stage a finished worker can only mean a model-load failure: report it now.
+        if !matches!(self.stage, Stage::Finished { .. }) {
             self.poll_worker();
         }
         match &self.stage {
             Stage::Pin { .. } => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
-                    self.pin_screen(ui);
+                    self.pin_screen(ui, s.ready);
                     ui.add_space(16.0);
                     ui.small(&s.status);
                 });
@@ -624,7 +624,7 @@ fn worker(
     };
     let mut enrol = Enrolment::new(EnrolConfig::default());
     publish(&shared, &ctx, |s| {
-        s.status = "models loaded".into();
+        (s.status, s.ready) = ("models loaded".into(), true);
         (s.target, s.progress) = (enrol.current_target(), enrol.progress());
     });
     let id = match rx.recv() {
@@ -765,6 +765,10 @@ mod tests {
         assert_eq!(reject_message(MultipleFaces), "Only one face please");
         assert_eq!(
             reject_message(WrongPose { want: Pose::Left }),
+            "Turn slightly right"
+        );
+        assert_eq!(
+            reject_message(WrongPose { want: Pose::Right }),
             "Turn slightly left"
         );
         let all = [
@@ -786,14 +790,18 @@ mod tests {
     }
 
     #[test]
-    fn arrows_follow_the_pose_sign_convention() {
-        // Left window is negative yaw = nose towards image left.
-        let (l, u) = (
-            pose_arrow(Pose::Left).unwrap(),
-            pose_arrow(Pose::Up).unwrap(),
-        );
-        assert!(l.x < 0.0 && u.y < 0.0);
-        assert_eq!(pose_arrow(Pose::Front), None);
+    fn prompts_are_from_the_users_view_of_the_mirrored_preview() {
+        // Pose::Left = negative yaw = nose to image-left = screen-right when mirrored.
+        let (text, arrow) = prompt(Pose::Left);
+        assert_eq!(text, "Turn slightly right");
+        assert!(arrow.unwrap().x > 0.0);
+        let (text, arrow) = prompt(Pose::Right);
+        assert_eq!(text, "Turn slightly left");
+        assert!(arrow.unwrap().x < 0.0);
+        // Vertical is not mirrored: +pitch = looking down.
+        assert!(prompt(Pose::Up).1.unwrap().y < 0.0);
+        assert!(prompt(Pose::Down).1.unwrap().y > 0.0);
+        assert_eq!(prompt(Pose::Front).1, None);
     }
 
     fn samples(dim: usize) -> Vec<EnrolledSample> {

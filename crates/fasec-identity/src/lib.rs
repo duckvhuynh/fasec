@@ -17,7 +17,8 @@ pub use error::IdentityError;
 pub use matcher::{MatchResult, Matcher, MatcherConfig};
 pub use protect::{ProtectError, SecretProtector};
 pub use store::{
-    DecryptedTemplate, EMBEDDING_DIM, Gallery, Person, PersonId, Pose, Role, StoredTemplate,
+    DecryptedTemplate, EMBEDDING_DIM, Gallery, NewTemplate, Person, PersonId, Pose, Role,
+    StoredTemplate,
 };
 pub use tracker::IdentityTracker;
 pub use voter::{Voter, VoterConfig};

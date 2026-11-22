@@ -21,6 +21,9 @@ const SCHEMA_VERSION: u32 = 1;
 /// One decrypted template: owner, role and embedding (zeroised on drop).
 pub type DecryptedTemplate = (PersonId, Role, Zeroizing<Vec<f32>>);
 
+/// One template for [`Gallery::enrol`]: model id, pose, quality and embedding.
+pub type NewTemplate<'a> = (&'a str, Pose, f32, &'a [f32]);
+
 /// UUID v4 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PersonId(pub String);
@@ -139,20 +142,71 @@ impl Gallery {
     }
 
     pub fn add_person(&mut self, name: &str, role: Role) -> Result<PersonId> {
-        let id = PersonId(uuid::Uuid::new_v4().to_string());
-        let now = now();
-        let res = self.conn.execute(
-            "INSERT INTO person (id, name, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![id.0, name, role.as_str(), now],
-        );
-        match res {
-            Err(e) if role == Role::Owner && is_constraint(&e) => Err(IdentityError::OwnerExists),
-            Err(e) => Err(e.into()),
-            Ok(_) => {
-                tracing::info!(person = %id.0, role = role.as_str(), "person added");
-                Ok(id)
-            }
+        insert_person(&self.conn, name, role)
+    }
+
+    /// Adds a person with all their templates and, for an owner, optionally the PIN, in one
+    /// transaction. Everything is validated, encrypted and hashed before the transaction
+    /// opens; on any error nothing is written (no half-enrolled person).
+    pub fn enrol(
+        &mut self,
+        name: &str,
+        role: Role,
+        new_pin: Option<&str>,
+        templates: &[NewTemplate<'_>],
+    ) -> Result<PersonId> {
+        if templates.is_empty() {
+            return Err(IdentityError::InvalidTemplate(
+                "no templates to enrol".into(),
+            ));
         }
+        if new_pin.is_some() && role != Role::Owner {
+            return Err(IdentityError::Pin(
+                "only an owner enrolment may set the PIN".into(),
+            ));
+        }
+        // Early, clear refusal; the one-owner index still guards the insert itself.
+        if role == Role::Owner && self.has_owner()? {
+            return Err(IdentityError::OwnerExists);
+        }
+        for (_, _, quality, embedding) in templates {
+            check_template(*quality, embedding)?;
+        }
+        let blobs = templates
+            .iter()
+            .map(|(_, _, _, e)| self.encrypt(e))
+            .collect::<Result<Vec<_>>>()?;
+        let phc = new_pin
+            .map(|p| crate::pin::hash(p).map(Zeroizing::new))
+            .transpose()?;
+        let tx = self.conn.transaction()?;
+        let id = insert_person(&tx, name, role)?;
+        for ((model_id, pose, quality, _), blob) in templates.iter().zip(&blobs) {
+            insert_template(&tx, &id, model_id, *pose, *quality, blob)?;
+        }
+        if let Some(phc) = &phc {
+            store_pin(&tx, phc)?;
+        }
+        tx.commit()?;
+        tracing::info!(person = %id.0, templates = templates.len(), "person enrolled");
+        Ok(id)
+    }
+
+    fn has_owner(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM person WHERE role = 'owner')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Protector ciphertext of the little-endian f32s.
+    fn encrypt(&self, embedding: &[f32]) -> Result<Vec<u8>> {
+        let mut plain = Zeroizing::new(Vec::with_capacity(EMBEDDING_DIM * 4));
+        for v in embedding {
+            plain.extend_from_slice(&v.to_le_bytes());
+        }
+        Ok(self.protector.protect(&plain)?)
     }
 
     pub fn persons(&self) -> Result<Vec<Person>> {
@@ -204,38 +258,9 @@ impl Gallery {
         quality: f32,
         embedding: &[f32],
     ) -> Result<i64> {
-        if embedding.len() != EMBEDDING_DIM || !embedding.iter().all(|v| v.is_finite()) {
-            return Err(IdentityError::InvalidEmbedding);
-        }
-        // `contains` is false for NaN, which would otherwise bind as SQL NULL
-        if !(0.0..=1.0).contains(&quality) {
-            return Err(IdentityError::InvalidTemplate(
-                "quality must be a finite value in [0, 1]".into(),
-            ));
-        }
-        let mut plain = Zeroizing::new(Vec::with_capacity(EMBEDDING_DIM * 4));
-        for v in embedding {
-            plain.extend_from_slice(&v.to_le_bytes());
-        }
-        let blob = self.protector.protect(&plain)?;
-        let res = self.conn.execute(
-            "INSERT INTO template (person_id, model_id, blob, pose, quality, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                person.0,
-                model_id,
-                blob,
-                pose.as_str(),
-                f64::from(quality),
-                now()
-            ],
-        );
-        match res {
-            // The FK on person_id means the person does not exist; any other failure is `Db`.
-            Err(e) if is_foreign_key(&e) => Err(IdentityError::NotFound),
-            Err(e) => Err(e.into()),
-            Ok(_) => Ok(self.conn.last_insert_rowid()),
-        }
+        check_template(quality, embedding)?;
+        let blob = self.encrypt(embedding)?;
+        insert_template(&self.conn, person, model_id, pose, quality, &blob)
     }
 
     /// Metadata of one person's templates (no embeddings).
@@ -312,13 +337,7 @@ impl Gallery {
     /// Sets or replaces the owner PIN (4–12 ASCII digits), stored as an Argon2id PHC string.
     pub fn set_pin(&mut self, pin: &str) -> Result<()> {
         let phc = Zeroizing::new(crate::pin::hash(pin)?);
-        self.conn.execute(
-            "INSERT INTO secret (kind, hash) VALUES ('pin', ?1)
-             ON CONFLICT (kind) DO UPDATE SET hash = excluded.hash",
-            [phc.as_str()],
-        )?;
-        tracing::info!("owner PIN set");
-        Ok(())
+        store_pin(&self.conn, &phc)
     }
 
     /// `Ok(false)` on a wrong or malformed PIN, or when no PIN is set. Errors only on
@@ -367,6 +386,73 @@ impl Gallery {
         tracing::info!("all biometric data deleted");
         Ok(())
     }
+}
+
+fn insert_person(conn: &Connection, name: &str, role: Role) -> Result<PersonId> {
+    let id = PersonId(uuid::Uuid::new_v4().to_string());
+    let res = conn.execute(
+        "INSERT INTO person (id, name, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![id.0, name, role.as_str(), now()],
+    );
+    match res {
+        Err(e) if role == Role::Owner && is_constraint(&e) => Err(IdentityError::OwnerExists),
+        Err(e) => Err(e.into()),
+        Ok(_) => {
+            tracing::info!(person = %id.0, role = role.as_str(), "person added");
+            Ok(id)
+        }
+    }
+}
+
+fn check_template(quality: f32, embedding: &[f32]) -> Result<()> {
+    if embedding.len() != EMBEDDING_DIM || !embedding.iter().all(|v| v.is_finite()) {
+        return Err(IdentityError::InvalidEmbedding);
+    }
+    // `contains` is false for NaN, which would otherwise bind as SQL NULL
+    if !(0.0..=1.0).contains(&quality) {
+        return Err(IdentityError::InvalidTemplate(
+            "quality must be a finite value in [0, 1]".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_template(
+    conn: &Connection,
+    person: &PersonId,
+    model_id: &str,
+    pose: Pose,
+    quality: f32,
+    blob: &[u8],
+) -> Result<i64> {
+    let res = conn.execute(
+        "INSERT INTO template (person_id, model_id, blob, pose, quality, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            person.0,
+            model_id,
+            blob,
+            pose.as_str(),
+            f64::from(quality),
+            now()
+        ],
+    );
+    match res {
+        // The FK on person_id means the person does not exist; any other failure is `Db`.
+        Err(e) if is_foreign_key(&e) => Err(IdentityError::NotFound),
+        Err(e) => Err(e.into()),
+        Ok(_) => Ok(conn.last_insert_rowid()),
+    }
+}
+
+fn store_pin(conn: &Connection, phc: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO secret (kind, hash) VALUES ('pin', ?1)
+         ON CONFLICT (kind) DO UPDATE SET hash = excluded.hash",
+        [phc],
+    )?;
+    tracing::info!("owner PIN set");
+    Ok(())
 }
 
 fn is_constraint(e: &rusqlite::Error) -> bool {
@@ -866,5 +952,83 @@ mod tests {
             let side = dir.path().join(format!("gallery.{ext}"));
             assert!(!side.exists() || std::fs::metadata(side).unwrap().len() == 0);
         }
+    }
+
+    fn five_poses(embs: &[Vec<f32>]) -> Vec<NewTemplate<'_>> {
+        let poses = [Pose::Front, Pose::Left, Pose::Right, Pose::Up, Pose::Down];
+        embs.iter()
+            .enumerate()
+            .map(|(i, e)| (MODEL, poses[i % 5], 0.9, e.as_slice()))
+            .collect()
+    }
+
+    #[test]
+    fn enrol_writes_person_templates_and_pin() {
+        let mut g = gallery();
+        let embs: Vec<_> = (0..10).map(|i| embedding(i as f32)).collect();
+        let id = g
+            .enrol("Ann", Role::Owner, Some("2468"), &five_poses(&embs))
+            .unwrap();
+        assert_eq!(g.persons().unwrap()[0].id, id);
+        assert_eq!(g.templates(&id).unwrap().len(), 10);
+        let back = g.templates_for_model(MODEL).unwrap();
+        assert_eq!(back.len(), 10);
+        assert_eq!(back[3].2.as_slice(), embs[3].as_slice());
+        assert!(g.verify_pin("2468").unwrap());
+        // An authorised person needs no PIN argument and keeps the owner's PIN.
+        g.enrol("Bob", Role::Authorised, None, &five_poses(&embs[..2]))
+            .unwrap();
+        assert_eq!(count(&g, "person"), 2);
+        assert!(g.verify_pin("2468").unwrap());
+    }
+
+    #[test]
+    fn enrol_writes_nothing_when_any_input_is_invalid() {
+        let embs: Vec<_> = (0..10).map(|i| embedding(i as f32)).collect();
+        let short = vec![0.1; 3];
+        let mut nan = embedding(0.0);
+        nan[5] = f32::NAN;
+        let cases: Vec<(Role, Option<&str>, Vec<NewTemplate<'_>>)> = vec![
+            (Role::Owner, Some("2468"), {
+                let mut t = five_poses(&embs);
+                t[7].3 = &short;
+                t
+            }),
+            (Role::Owner, Some("2468"), {
+                let mut t = five_poses(&embs);
+                t[9].3 = &nan;
+                t
+            }),
+            (Role::Owner, Some("2468"), {
+                let mut t = five_poses(&embs);
+                t[2].2 = 1.5;
+                t
+            }),
+            (Role::Owner, Some("12"), five_poses(&embs)),
+            (Role::Authorised, Some("2468"), five_poses(&embs)),
+            (Role::Owner, Some("2468"), Vec::new()),
+        ];
+        for (i, (role, pin, templates)) in cases.into_iter().enumerate() {
+            let mut g = gallery();
+            assert!(g.enrol("Ann", role, pin, &templates).is_err(), "case {i}");
+            for table in ["person", "template", "secret"] {
+                assert_eq!(count(&g, table), 0, "case {i}: {table}");
+            }
+        }
+    }
+
+    #[test]
+    fn enrol_refuses_second_owner_and_keeps_the_first() {
+        let mut g = gallery();
+        let embs: Vec<_> = (0..10).map(|i| embedding(i as f32)).collect();
+        let first = g
+            .enrol("Ann", Role::Owner, Some("2468"), &five_poses(&embs))
+            .unwrap();
+        let err = g.enrol("Eve", Role::Owner, Some("1357"), &five_poses(&embs));
+        assert!(matches!(err, Err(IdentityError::OwnerExists)), "{err:?}");
+        assert_eq!(count(&g, "person"), 1);
+        assert_eq!(count(&g, "template"), 10);
+        assert_eq!(g.persons().unwrap()[0].id, first);
+        assert!(g.verify_pin("2468").unwrap() && !g.verify_pin("1357").unwrap());
     }
 }
