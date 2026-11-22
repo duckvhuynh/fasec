@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fasec_config::ExecutionProvider;
 use fasec_core::{CameraHealth, Frame};
 use fasec_identity::{Gallery, IdentityTracker, MatcherConfig, SecretProtector, VoterConfig};
-use fasec_vision::{Pipeline, PipelineConfig, ProcessOutput, Runtime};
+use fasec_vision::{Pipeline, PipelineConfig, ProcessOutput, RECOGNISER_MODEL_ID, Runtime};
 
 use crate::input::{Ffmpeg, RawFrame};
 use crate::output::OutputOptions;
@@ -94,10 +94,6 @@ impl Process for Pipeline {
         Pipeline::desired_interval_ms(self)
     }
 }
-
-/// Recogniser whose embeddings the pipeline emits (the SFace model `Pipeline::from_models`
-/// loads); only gallery templates tagged with it are compared (FR-ID-008).
-const RECOGNISER_MODEL_ID: &str = "sface-2021dec";
 
 /// `inner` followed by the identity vote, which writes each track's `identity`.
 struct WithIdentity<'a> {

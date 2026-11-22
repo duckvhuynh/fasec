@@ -22,7 +22,9 @@ pub struct IdentityTracker {
 impl IdentityTracker {
     /// Loads the templates enrolled with `current_model_id`. A gallery holding templates only
     /// for other models is `ModelMismatch` (FR-ID-008); an empty gallery is fine (everyone
-    /// becomes `Stranger`). Any load or decrypt error is returned, never a partial matcher.
+    /// becomes `Stranger`). Templates of other models beside current ones are ignored with a
+    /// "re-enrolment required" warning. Any load or decrypt error is returned, never a
+    /// partial matcher.
     pub fn from_gallery(
         gallery: &Gallery,
         current_model_id: &str,
@@ -36,12 +38,18 @@ impl IdentityTracker {
                 current: current_model_id.to_owned(),
             });
         }
-        let templates = gallery
-            .templates_for_model(current_model_id)?
-            .into_iter()
-            // `take` hands the buffer over without making another plaintext copy.
-            .map(|(p, r, mut e)| (p, r, std::mem::take(&mut *e)))
-            .collect();
+        // in_use is empty or contains current_model_id
+        let other_models = in_use.len().saturating_sub(1);
+        // Decrypted rows go to the matcher as they are, so they stay `Zeroizing` throughout.
+        let templates = gallery.templates_for_model(current_model_id)?;
+        if other_models > 0 {
+            // FR-ID-008: counts only, never template content.
+            tracing::warn!(
+                other_models,
+                current_templates = templates.len(),
+                "gallery has templates for other recogniser models; re-enrolment required for those"
+            );
+        }
         Ok(IdentityTracker {
             matcher: Matcher::new(templates, matcher)?,
             voter: Voter::new(voter),
@@ -217,6 +225,24 @@ mod tests {
             t.apply(&mut r, &[emb(1, ts, unit(0))]);
         }
         assert!(matches!(ids(&r)[0], IdentityState::Stranger { .. }));
+    }
+
+    #[test]
+    fn tracker_ignores_other_model_templates_in_mixed_gallery() {
+        // "old" enrolled under another model: never compared, so it cannot be recognised.
+        let mut g = gallery(MODEL);
+        let old = g.add_person("old", Role::Authorised).unwrap();
+        g.add_template(&old, "other-model", Pose::Front, 0.9, &unit(1))
+            .unwrap();
+        let mut t = tracker(&g);
+        let mut r = report(0, &[1, 2]);
+        for ts in 0..5 {
+            r = report(ts, &[1, 2]);
+            t.apply(&mut r, &[emb(1, ts, unit(0)), emb(2, ts, unit(1))]);
+        }
+        let s = ids(&r);
+        assert!(is_known_owner(&s[0]), "{s:?}");
+        assert!(matches!(s[1], IdentityState::Stranger { .. }), "{s:?}");
     }
 
     #[test]

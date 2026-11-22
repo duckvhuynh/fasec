@@ -122,7 +122,7 @@ impl Pipeline {
         };
         // All four verified before the first session is created.
         let yunet = verified("yunet-2023mar")?;
-        let sface = verified("sface-2021dec")?;
+        let sface = verified(crate::RECOGNISER_MODEL_ID)?;
         let v2 = verified("minifasnet-v2")?;
         let v1se = verified("minifasnet-v1se")?;
         Ok(Pipeline::new(

@@ -3,4 +3,4 @@
 pub mod align;
 pub mod sface;
 
-pub use sface::{SFACE_COSINE_THRESHOLD, SFace, cosine};
+pub use sface::{RECOGNISER_MODEL_ID, SFACE_COSINE_THRESHOLD, SFace, cosine};

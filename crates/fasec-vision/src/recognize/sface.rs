@@ -17,7 +17,8 @@ use crate::{Detection, FaceEmbedder, Runtime, VisionError};
 /// Cosine similarity above which two SFace embeddings are the same person (OpenCV zoo).
 pub const SFACE_COSINE_THRESHOLD: f32 = 0.363;
 
-const MODEL_ID: &str = "sface-2021dec";
+/// Model id of the SFace embedder; gallery templates are tagged with it (FR-ID-008).
+pub const RECOGNISER_MODEL_ID: &str = "sface-2021dec";
 const SIZE: u32 = 112;
 const DIM: usize = 128;
 const INPUT: &str = "data";
@@ -107,7 +108,7 @@ impl FaceEmbedder for SFace {
     }
 
     fn model_id(&self) -> &str {
-        MODEL_ID
+        RECOGNISER_MODEL_ID
     }
 }
 

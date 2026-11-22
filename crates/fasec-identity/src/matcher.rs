@@ -1,7 +1,8 @@
 //! Margin-gated cosine matcher over the enrolled gallery (FR-ID-009).
 
 use crate::error::IdentityError;
-use crate::store::{PersonId, Role};
+use crate::store::{DecryptedTemplate, PersonId, Role};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MatcherConfig {
@@ -34,9 +35,12 @@ pub enum MatchResult {
     },
 }
 
-/// Holds normalised templates; `Debug` deliberately omits them (NFR-PRIV-003).
+/// One person's normalised templates, each zeroised on drop.
+type PersonTemplates = (PersonId, Role, Vec<Zeroizing<Vec<f32>>>);
+
+/// Holds normalised templates, zeroised on drop; `Debug` deliberately omits them (NFR-PRIV-003).
 pub struct Matcher {
-    persons: Vec<(PersonId, Role, Vec<Vec<f32>>)>,
+    persons: Vec<PersonTemplates>,
     cfg: MatcherConfig,
     /// False if any template was non-finite, zero or of a different length.
     valid: bool,
@@ -60,7 +64,7 @@ impl Matcher {
     /// threshold or margin, threshold outside (0, 1], margin outside [0, 1)
     /// (`InvalidConfig`), or one person listed with two roles (`InconsistentGallery`).
     pub fn new(
-        templates: Vec<(PersonId, Role, Vec<f32>)>,
+        templates: Vec<DecryptedTemplate>,
         cfg: MatcherConfig,
     ) -> Result<Self, IdentityError> {
         // `contains` is false for NaN
@@ -71,7 +75,7 @@ impl Matcher {
         }
         let dim = templates.first().map(|t| t.2.len());
         let mut valid = true;
-        let mut persons: Vec<(PersonId, Role, Vec<Vec<f32>>)> = Vec::new();
+        let mut persons: Vec<PersonTemplates> = Vec::new();
         for (person, role, t) in templates {
             if persons.iter().any(|p| p.0 == person && p.1 != role) {
                 return Err(IdentityError::InconsistentGallery(format!(
@@ -113,7 +117,7 @@ impl Matcher {
                 if t.len() != q.len() {
                     return NONE;
                 }
-                score = score.max(t.iter().zip(&q).map(|(a, b)| a * b).sum());
+                score = score.max(t.iter().zip(q.iter()).map(|(a, b)| a * b).sum());
             }
             if !score.is_finite() {
                 return NONE;
@@ -148,10 +152,10 @@ impl Matcher {
     }
 }
 
-/// L2-normalised copy, or `None` if empty, non-finite or zero.
-fn normalised(v: &[f32]) -> Option<Vec<f32>> {
+/// L2-normalised copy (zeroised on drop), or `None` if empty, non-finite or zero.
+fn normalised(v: &[f32]) -> Option<Zeroizing<Vec<f32>>> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    (norm.is_finite() && norm > 0.0).then(|| v.iter().map(|x| x / norm).collect())
+    (norm.is_finite() && norm > 0.0).then(|| Zeroizing::new(v.iter().map(|x| x / norm).collect()))
 }
 
 #[cfg(test)]
@@ -161,11 +165,11 @@ mod tests {
     const DIM: usize = 128;
 
     /// Unit vector with cosine `cos` to axis 0, rotated towards `axis`.
-    fn at(cos: f32, axis: usize) -> Vec<f32> {
+    fn at(cos: f32, axis: usize) -> Zeroizing<Vec<f32>> {
         let mut v = vec![0.0; DIM];
         v[0] = cos;
         v[axis] = (1.0 - cos * cos).sqrt();
-        v
+        Zeroizing::new(v)
     }
 
     fn pid(s: &str) -> PersonId {
@@ -173,7 +177,7 @@ mod tests {
     }
 
     fn query() -> Vec<f32> {
-        at(1.0, 1)
+        at(1.0, 1).to_vec()
     }
 
     #[test]
@@ -199,7 +203,7 @@ mod tests {
 
     #[test]
     fn unnormalised_template_and_query_still_match() {
-        let t: Vec<f32> = at(0.9, 1).iter().map(|x| x * 7.0).collect();
+        let t = Zeroizing::new(at(0.9, 1).iter().map(|x| x * 7.0).collect());
         let q: Vec<f32> = query().iter().map(|x| x * 0.01).collect();
         let m = Matcher::new(vec![(pid("a"), Role::Owner, t)], MatcherConfig::default()).unwrap();
         match m.best(&q) {
@@ -315,7 +319,8 @@ mod tests {
         // Dropping b's corrupt template would widen a's margin; refuse instead.
         let mut bad = at(0.47, 2);
         bad[3] = f32::NAN;
-        for b in [bad, vec![0.0; DIM], at(0.47, 2)[..64].to_vec()] {
+        let short = Zeroizing::new(at(0.47, 2)[..64].to_vec());
+        for b in [bad, Zeroizing::new(vec![0.0; DIM]), short] {
             let m = Matcher::new(
                 vec![
                     (pid("a"), Role::Owner, at(0.50, 1)),
@@ -326,6 +331,21 @@ mod tests {
             .unwrap();
             assert_eq!(m.best(&query()), MatchResult::Stranger { best: 0.0 });
         }
+    }
+
+    #[test]
+    fn takes_and_keeps_zeroizing_templates() {
+        // The gallery's decrypted rows go in as they are, so no unzeroised copy is made on the
+        // way, and every stored template is `Zeroizing` (wiped when the matcher drops).
+        let _: fn(Vec<DecryptedTemplate>, MatcherConfig) -> Result<Matcher, IdentityError> =
+            Matcher::new;
+        let m = Matcher::new(
+            vec![(pid("a"), Role::Owner, at(0.9, 1))],
+            MatcherConfig::default(),
+        )
+        .unwrap();
+        let _: &Zeroizing<Vec<f32>> = &m.persons[0].2[0];
+        let _: Option<Zeroizing<Vec<f32>>> = normalised(&query());
     }
 
     #[test]

@@ -14,5 +14,6 @@ pub mod traits;
 pub use detect::{YuNet, YuNetConfig};
 pub use error::VisionError;
 pub use pipeline::{Pipeline, PipelineConfig, ProcessOutput};
+pub use recognize::RECOGNISER_MODEL_ID;
 pub use runtime::Runtime;
 pub use traits::{Detection, FaceDetector, FaceEmbedder, LivenessModel, PoseEstimator};
