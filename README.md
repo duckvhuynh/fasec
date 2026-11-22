@@ -70,6 +70,48 @@ cargo run -p fasec-ui --example live_debug --release -- --gallery gallery.db
 `…` while the vote is still pending. A gallery that cannot be read is shown in the side panel
 and nobody is recognised. `*.db` is git-ignored; never commit a gallery.
 
+### IR liveness (Windows Hello IR camera)
+
+An IR camera is optional. fasec uses the Windows Hello IR camera paired with the RGB webcam (same
+frame source group, else same USB device) when it finds one. It opens it read-only and shared
+(`SharedReadOnly`), so no admin rights are needed. Set it in `%APPDATA%\fasec\config.toml`:
+
+```toml
+[liveness]
+ir = "prefer"   # default: use the paired IR camera when present and healthy
+# ir = "off"    # never open the IR camera
+```
+
+Each face carries a liveness tier. `Rgb` means the verdict comes from MiniFASNet alone. `Ir`
+means the IR camera decided it. The tier is `Ir` only while the IR camera is healthy, its latest
+lit frame is at most 500 ms old and the IR↔RGB box mapping is trusted. The mapping is trusted
+after 5 lit frames in a row that each show exactly one face on both cameras, in agreement. In
+every other case fasec falls back to the `Rgb` tier.
+
+How the verdict is fused:
+- IR alone never makes a face live. The RGB camera must see the same face.
+- A face that looks live in IR is `Live` on tier `Ir`, even when MiniFASNet calls it a spoof.
+  MiniFASNet calls a real face at laptop distance a spoof on most frames.
+- An RGB face with no IR face, or a flat IR face, is a spoof after 3 lit IR frames in a row. Until
+  then it is `Unknown`, never `Live`.
+- A new face is `Unknown` until the next lit IR frame judges it.
+
+What IR catches: phone photo and phone video replays of the owner. A phone screen shows a face to
+the RGB camera and none to the IR camera. On the owner's recordings no phone frame was `Live`.
+What is not verified: printed photos, monitors, screens that emit near-infrared, masks, strong
+sunlight, other people and other cameras. Whether Windows Hello sign-in keeps working while fasec
+holds the IR camera is not verified yet. The numbers are in
+[SP-7](docs/spikes/SP-7-ir.md#decision).
+
+`ir_debug` shows the RGB and IR frames side by side with every IR cue per face. It records only
+when you switch Record on or pass `--record <label>`. Recordings are the face images of whoever is
+in view. They are written only under `%LOCALAPPDATA%\fasec\recordings\` and never leave the PC.
+Replay one with `fasec-replay run --ir-input <dir>`.
+
+```sh
+cargo run -p fasec-ui --example ir_debug --release [-- --record <label>]
+```
+
 DirectML is used when available (`DirectML.dll` from `System32`; ort copies it next to the
 built examples). A packaged release has to ship it beside the exe.
 

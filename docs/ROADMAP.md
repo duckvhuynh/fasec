@@ -229,12 +229,22 @@ start in parallel with M2 if there are two contributors.
 - [ ] Dense landmarks (Face Landmarker ONNX) for eye aspect ratio → blink detection.
 - [ ] Non-rigid motion cue (landmark residual after rigid fit) → static-photo rejection.
 - [ ] Fusion model for liveness score (simple logistic fusion, tuned on replay set).
-- [ ] IR source pairing UI (`MediaFrameSourceGroup`), RGB↔IR alignment (box mapping by calibration or same-group intrinsics).
-- [ ] IR liveness checks: face present in IR, reflectance statistics, screen-replay rejection.
-- [ ] Liveness tier indicator in tray/status.
+- [x] IR source pairing (`MediaFrameSourceGroup`, else same USB device), RGB↔IR alignment (box mapping learned online from frames with one face on each camera). Shown in `live_debug` and `ir_debug`; no app UI yet.
+- [x] IR liveness checks: face present in IR, reflectance statistics, screen-replay rejection. See [SP-7](spikes/SP-7-ir.md#decision).
+- [ ] Liveness tier indicator in tray/status. *The tier is shown in `live_debug`; there is no tray yet.*
 - [ ] Active challenge (random head-turn sequence) for enrolment and optional unlock.
-- [ ] Spoof attack replay set expanded (print, phone, tablet, monitor, cut-out with eye holes).
+- [ ] Depth liveness (stays P2, M11).
+- [ ] Spoof attack replay set expanded (print, phone, tablet, monitor, cut-out with eye holes). *Phone photo and phone video are recorded; print and monitor are not.*
+- [ ] IR follow-up: keep the IR spoof streak across RGB track-id churn on a spoof face. A moving phone gets a new track id, so its first two lit frames read `Unknown`, not `Spoof`.
+- [ ] IR follow-up: record a printed photo and a monitor replay, and check the `FlatReflectance` and `NoIrFace` rules on them.
+- [ ] IR follow-up: check `max_frame_median` (100) in strong sunlight. None was recorded.
 - **Exit:** with IR: ≥ 99 % rejection of print/phone/tablet attacks in test set; RGB-only: ≥ 95 % with temporal cues.
+
+**Status (2026-11-22):** IR liveness is in. On the owner's recordings (one subject, one device),
+no phone photo or phone video frame was accepted as live, and every trusted frame of the real
+sessions replayed alone was live on tier `ir`. The sample is too small to support the 99 % exit criterion (see SP-7). Print
+and tablet attacks are not recorded. Windows Hello sign-in while fasec holds the IR camera is
+pending an owner check.
 
 ## M8 → v0.3.0: Attention+ and targeted actions (5 weeks)
 

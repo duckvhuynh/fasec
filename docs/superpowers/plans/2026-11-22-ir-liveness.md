@@ -47,7 +47,7 @@
 ### Task 0 (resolved by measurement): unlit frames are blanked on the dev laptop
 SP-7 measured mean 0.0 on every unlit Gray8 frame; u8 pixels are non-negative, so every unlit pixel is 0 — the driver blanks them. Task 3's lit−unlit cue must detect an all-zero unlit frame at runtime and switch itself off (other devices may deliver real ambient frames), so on this laptop the decision rests on the lit-frame cues plus RGB↔IR consistency.
 
-*Correction (Tasks 1 and 7):* the unlit frames are near-black, not all-zero: mean ≈ 0.00 with a maximum pixel of 1–4 (Task 1). "Mean 0.0" was rounded to one decimal. The blank check is `ambient_is_blank` (mean < 1 and 99th percentile ≤ 8), not `IrFrame::is_blank`.
+*Correction (2026-11-22, Tasks 1 and 7):* the claim above that the unlit frames are all-zero is wrong. They are near-black, not all-zero: mean ≈ 0.00 with a maximum pixel of 1–4 (Task 1). "Mean 0.0" was rounded to one decimal. The blank check is `ambient_is_blank` (mean < 1 and 99th percentile ≤ 8), not `IrFrame::is_blank`.
 
 ### Task 1: IR capture in `fasec-camera`
 

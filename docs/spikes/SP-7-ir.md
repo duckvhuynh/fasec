@@ -35,10 +35,10 @@ Checks, one table row each:
 
 | Machine | Windows build | Camera / IR device | Check | Mode that worked | Format | Illuminated/ambient alternate? | Hello still OK? | Notes |
 |---|---|---|---|---|---|---|---|---|
-| | | | 1 IR group / Color+IR group | | | | | |
-| | | | 2 during Hello enrolment | | | | | |
-| | | | 3 Hello unlock while reading | | | | | |
-| | | | 4 call app holds RGB | | | | | |
+| ASUS laptop | 10.0.26300.9974 | ASUS IR camera | 1 IR group / Color+IR group | SharedReadOnly | L8 640x360 @ 15 | yes | not checked | both groups work (below) |
+| ASUS laptop | 10.0.26300 | ASUS IR camera | 2 during Hello enrolment | | | | pending owner check | |
+| ASUS laptop | 10.0.26300 | ASUS IR camera | 3 Hello unlock while reading | | | | pending owner check | |
+| ASUS laptop | 10.0.26300.9974 | ASUS IR camera | 4 call app holds RGB | SharedReadOnly | L8 640x360 @ 15 | yes | not checked | another process held RGB through nokhwa/MF |
 
 ## Decision
 
@@ -48,6 +48,14 @@ subject, one device, one room. Only numbers are kept here: the recordings stay o
 **IR is read with `SharedReadOnly`, and IR liveness is on by default (`[liveness] ir =
 "prefer"`).** The thresholds in `IrLivenessConfig::default()` are set from the table below. Each
 constant's comment names the measurement it came from.
+
+**Owner live check (2026-11-22).** `live_debug --gallery` on the dev machine, debug build, face
+about 240–276 px wide in the RGB frame (normal laptop distance). The owner was shown `Known` as
+owner, match score 0.85. Liveness tier `Ir`, IR verdict `Live` 0.80, no usable ambient frame. IR
+source opened `SharedReadOnly`, health `Ok`, about 3 lit frames/s.
+
+**Windows Hello coexistence (checks 2 and 3): pending owner check.** It is not verified that
+Windows Hello sign-in keeps working while fasec holds the IR camera.
 
 ### Recordings and method
 
@@ -93,19 +101,6 @@ Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
   - *Residual risk:* a screen that emits the owner's NIR image as well as a visible face. The
     self-emission cue that should catch it needs a usable ambient frame, and this laptop blanks
     every one.
-  - **Fix round 2 (ruling R10): a pending IR spoof blocks Live.** A fresh IR `Spoof` whose
-    track has not yet reached the 3-lit-frame streak is `Suspect`, and fuses to `Unknown` on
-    tier Ir whatever RGB says. A moving phone gets a new RGB track id often, each starting its
-    streak over, so a fooled MiniFASNet could otherwise make it `Live` on those frames. Cost: a
-    real face with a single-frame IR miss reads `Unknown` for that frame. The fusion table
-    (`fuse` in `crates/fasec-vision/src/pipeline.rs`):
-
-    | IR evidence | RGB | result |
-    |---|---|---|
-    | Spoof (streak met) | any | Spoof, tier Ir |
-    | Suspect (Spoof, streak not met) | any | Unknown, tier Ir |
-    | Live | any, Spoof included | Live, tier Ir |
-    | Absent (untrusted, stale, unhealthy, IR `Unknown`) | any | the RGB verdict |
 - **D2, relief from real faces only.** Live needs relief in `[0.70, 0.97]`.
   - Relief above 0.97 is `Spoof(FlatReflectance)`. This rule is meant for a flat print, which
     should read about 1.0. **It is not verified against a printed photo, since none was
@@ -118,6 +113,29 @@ Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
       flood check below.
     - `min_lit_face 20`: real minimum 109.
   - `min_emitter_fraction` and `self_emit_contrast` stay unmeasured placeholders.
+
+### Fusion
+
+`fuse` in `crates/fasec-vision/src/pipeline.rs` fuses each RGB track's verdict with its IR
+evidence:
+
+| IR evidence | RGB | result |
+|---|---|---|
+| Spoof (3 lit frames in a row) | any | Spoof, tier Ir |
+| Suspect (Spoof, streak not met; or a track the latest lit frame has not judged) | any | Unknown, tier Ir |
+| Live | any, Spoof included | Live, tier Ir |
+| Absent (IR off, unhealthy, untrusted, stale; IR `Unknown`) | any | the RGB verdict |
+
+- **Fix round 2 (ruling R10): a pending IR spoof blocks Live.** A moving phone gets a new RGB
+  track id often, and each id starts its streak over. Without this row a fooled MiniFASNet could
+  make it `Live` on those frames. Cost: a real face with a single-frame IR miss reads `Unknown`
+  for that frame.
+- **Fix round 3: a track new since the latest lit frame is `Suspect`.** RGB runs faster than the
+  lit IR frames. A track created on a call without a new lit frame has no IR verdict yet. While
+  IR is healthy, trusted and fresh, it reads `Unknown` until the next lit frame judges it. It
+  used to take the RGB verdict for that gap.
+- An IR face-detector error on a lit frame resets IR, as an unhealthy IR camera does. The
+  previous lit frame's evidence no longer counts.
 
 ### Result after tuning
 
@@ -174,23 +192,21 @@ After fix round 2 (ruling R10, a pending IR spoof blocks Live). Same tracks as a
 - Real faces are unchanged: 17, 17, 13 and 11 of 17, 17, 13 and 11 trusted tracks Live on
   tier Ir.
 
+After fix round 3 (a track new since the latest lit frame is `Suspect`): every number above is
+unchanged. Real faces: 17, 17, 13 and 11 of 17, 17, 13 and 11 Live on tier Ir. Phone photo: 0 of
+92 Live, 68 Spoof, 24 Unknown. Phone video: 0 of 80 Live, 44 Spoof, 36 Unknown. The recordings
+pair a lit frame with every RGB frame, so replay never makes a call without a new lit frame. The
+change is covered by unit tests only.
+
 - When the predecessor is real-turning session b, the phone sessions add nothing: no trust was
   earned.
 - Phone-photo session a (8 steps) is left out of the criterion, because the owner's real face is
   in view during it. Its first 5 steps show an IR face with live cues at the real-50cm box, and a
   second large face with live IR cues appears later. Replayed after real-50cm, it reads Live on
   tier Ir for the owner's track, and the small phone face is RGB Spoof.
-- **IR catches the phone on only a quarter to a third of its frames. MiniFASNet catches the
-  rest.**
-  - With trust earned, the IR verdict on the phone track is NoIrFace on 13 of 26 frames
-    (photo, after real-50cm) and 16 of 22 (video).
-  - Most other frames read `Unknown`. A phone held close reflects the emitter, so the
-    background ring under the mapped box reads `lit_background` 100–255, against a real-face
-    maximum of 76. The flood rule (`> 100` → `Unknown`) then fires before NoIrFace.
-  - Those Unknown frames, and new RGB track ids as the phone moves, keep breaking the 3-frame
-    streak.
-  - Under D1 the RGB verdict decides while IR is Unknown. So a phone that fooled MiniFASNet and
-    also flooded the ring would pass as RGB Live.
+- *Superseded by fix round 1:* before it, IR evidence alone called the phone a spoof on only
+  24 % (photo) and 34 % (video) of these frames. The ring-based flood rule fired on a phone held
+  close (ring 100–255, real maximum 76) and broke the streak.
 
 **Flood check, fix round 1 (ruling R9).** The flood check now reads `lit_frame_median`, the
 median grey level of the whole lit frame (a 256-bin histogram, lower median), instead of the
@@ -213,12 +229,18 @@ ring stays as the denominator of `face_vs_background`.
   from the session's 3rd trusted frame is 70 % (photo) and 55 % (video): the RGB tracker gives
   the phone a new track id as it moves (6 ids over the trusted frames of phone-photo b, 8 over
   those of phone-video, replayed after real-50cm), and each new
-  id must build its own streak. MiniFASNet's Spoof covers those frames.
+  id must build its own streak. Since fix round 2 those frames read `Unknown`, never `Live`.
 
 ### In ISO/IEC 30107-3 terms
 
 Frame-level rates, one subject and one device. The counts above come from overlapping replays, so
 the distinct frame counts are given here.
+
+Sample sizes, in distinct trusted frames: real-30cm 17, real-50cm 17, real-80cm 13, real-turning
+a 11 (58 bona fide in all); phone photo 23; phone video 20. Frames of one session are not
+independent, so the true sample is smaller still. Zero errors in n frames bounds the error rate
+at about 3/n (95 % confidence): 5 % for 58, 13 % for 23, 15 % for 20. **These counts do not
+support a 99 % claim.** That needs about 300 attack presentations per species with no error.
 
 - **BPCER** (bona fide presentations classified as attacks), on trusted frames of the real
   sessions replayed alone: 0 of 58.

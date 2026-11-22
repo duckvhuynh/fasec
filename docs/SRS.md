@@ -274,6 +274,37 @@ pub enum ThreatLevel { None, Notice, Onlooker, Spoof, OwnerAbsent, CameraLost, M
 | FR-LV-007 | P1 | Active challenge (random head-turn sequence) SHOULD be available for enrolment and unlock. | M |
 | FR-LV-008 | P2 | Depth liveness: face depth relief ≥ `min_relief_mm` across nose–cheek–ear region. | T |
 
+**FR-LV-006 note (2026-11-22).** IR liveness uses the Windows Hello IR camera paired with the RGB
+webcam (`[liveness] ir = "prefer"`, the default; `"off"` never opens it). It runs per lit IR
+frame and per RGB track, through an IR↔RGB box mapping that must be trusted first. The thresholds
+come from the owner's recordings on one device ([SP-7](spikes/SP-7-ir.md#decision)). The cues, in
+the order they are judged:
+
+1. Lit-frame median above 100 (flooded, e.g. sunlight): no verdict.
+2. No IR face where the mapping puts the RGB face: spoof (`NoIrFace`, phone or monitor).
+3. Lit face mean below 20 grey levels, or a cue not computable: no verdict.
+4. With a usable unlit frame: a face lit mostly by itself, not by the emitter, is a spoof
+   (`SelfEmitting`). Not measured: the unlit frame was blank on every recorded frame.
+5. Face ÷ background ring below 1.5: no verdict.
+6. Relief (nose ÷ cheeks) above 0.97: spoof (`FlatReflectance`, meant for a print, not verified).
+   Below 0.70: no verdict. Otherwise live.
+
+A track is an IR spoof after 3 lit frames in a row with a spoof verdict. The IR evidence is
+fused with the RGB verdict per track:
+
+| IR evidence | RGB verdict | Result |
+|---|---|---|
+| Spoof (3 lit frames in a row) | any | `Spoof`, tier `ir` |
+| Suspect (a spoof verdict, streak not met; or a track not judged by the latest lit frame) | any | `Unknown`, tier `ir` |
+| Live | any, `Spoof` included | `Live`, tier `ir` |
+| Absent (IR off, unhealthy, untrusted, stale or no verdict) | any | the RGB verdict, tier `rgb` |
+
+- IR `Live` overrides an RGB `Spoof` (owner decision D1): MiniFASNet calls the real owner a
+  spoof on most frames at laptop distance. The RGB camera must still see the face.
+- A pending IR spoof blocks `Live`: a moving phone gets new track ids, and each must build its
+  own streak.
+- So "failure means spoof" above holds after the streak. A single failing frame gives `Unknown`.
+
 ### 4.4 Attention (`fasec-vision::attention`)
 
 | ID | Pri | Requirement | Verify |
