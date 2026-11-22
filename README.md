@@ -85,8 +85,10 @@ ir = "prefer"   # default: use the paired IR camera when present and healthy
 Each face carries a liveness tier. `Rgb` means the verdict comes from MiniFASNet alone. `Ir`
 means the IR camera decided it. The tier is `Ir` only while the IR camera is healthy, its latest
 lit frame is at most 500 ms old and the IR↔RGB box mapping is trusted. The mapping is trusted
-after 5 lit frames in a row that each show exactly one face on both cameras, in agreement. In
-every other case fasec falls back to the `Rgb` tier.
+after 5 consistent pairs. A pair is a lit frame with exactly one face on each camera whose boxes
+agree. A frame with no face or 2 or more faces on either camera neither advances nor breaks the
+count. A single-face pair that disagrees starts it over. In every other case fasec falls back to
+the `Rgb` tier.
 
 How the verdict is fused:
 - IR alone never makes a face live. The RGB camera must see the same face.
@@ -95,9 +97,25 @@ How the verdict is fused:
 - An RGB face with no IR face, or a flat IR face, is a spoof after 3 lit IR frames in a row. Until
   then it is `Unknown`, never `Live`.
 - A new face is `Unknown` until the next lit IR frame judges it.
+- While the tier is `Ir`, a face that IR cannot judge is never `Live`. That covers a flooded lit
+  frame, an IR face that two RGB faces compete for, a face mostly off the IR frame and a face out
+  of IR range. Where MiniFASNet says live it is `Unknown`. A MiniFASNet spoof stands.
+- An RGB face with no IR face counts as a spoof only within the measured IR range: at least
+  150 px wide on a 1280 px wide RGB frame, the same fraction at other widths. The narrowest
+  recorded real face was 188 px. A narrower face gets no IR verdict.
+- An IR face-detector error drops the IR evidence until the next lit frame. The mapping stays
+  trusted.
 
 What IR catches: phone photo and phone video replays of the owner. A phone screen shows a face to
 the RGB camera and none to the IR camera. On the owner's recordings no phone frame was `Live`.
+IR catches a phone only once the mapping has been trusted on a real face since the IR camera
+started. On a cold start, or after an IR restart, MiniFASNet decides alone until then.
+
+Known gap: identity is matched in RGB only. So an RGB face can borrow IR liveness from a live face
+that overlaps it. An example is a dye-ink transparency of the owner's photo held over an
+attacker's own face: IR sees through it to a real face. Binding the two cameras is on the
+[roadmap](docs/ROADMAP.md).
+
 What is not verified: printed photos, monitors, screens that emit near-infrared, masks, strong
 sunlight, other people and other cameras. Whether Windows Hello sign-in keeps working while fasec
 holds the IR camera is not verified yet. The numbers are in

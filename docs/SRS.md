@@ -281,7 +281,10 @@ come from the owner's recordings on one device ([SP-7](spikes/SP-7-ir.md#decisio
 the order they are judged:
 
 1. Lit-frame median above 100 (flooded, e.g. sunlight): no verdict.
-2. No IR face where the mapping puts the RGB face: spoof (`NoIrFace`, phone or monitor).
+2. No IR face where the mapping puts the RGB face: spoof (`NoIrFace`, phone or monitor). Only
+   within the measured IR range: the RGB face is at least 150 px wide at 1280 px (the same
+   fraction at other widths; the narrowest recorded real face was 188 px). A narrower face gets
+   no verdict.
 3. Lit face mean below 20 grey levels, or a cue not computable: no verdict.
 4. With a usable unlit frame: a face lit mostly by itself, not by the emitter, is a spoof
    (`SelfEmitting`). Not measured: the unlit frame was blank on every recorded frame.
@@ -297,13 +300,26 @@ fused with the RGB verdict per track:
 | Spoof (3 lit frames in a row) | any | `Spoof`, tier `ir` |
 | Suspect (a spoof verdict, streak not met; or a track not judged by the latest lit frame) | any | `Unknown`, tier `ir` |
 | Live | any, `Spoof` included | `Live`, tier `ir` |
-| Absent (IR off, unhealthy, untrusted, stale or no verdict) | any | the RGB verdict, tier `rgb` |
+| Unknown (no verdict, IR healthy, trusted and fresh) | `Live` | `Unknown`, tier `ir` |
+| Unknown (no verdict, IR healthy, trusted and fresh) | `Spoof` or `Unknown` | the RGB verdict, tier `rgb` |
+| Absent (IR off, unhealthy, untrusted or stale) | any | the RGB verdict, tier `rgb` |
 
 - IR `Live` overrides an RGB `Spoof` (owner decision D1): MiniFASNet calls the real owner a
   spoof on most frames at laptop distance. The RGB camera must still see the face.
 - A pending IR spoof blocks `Live`: a moving phone gets new track ids, and each must build its
   own streak.
+- While IR is trusted and fresh, an IR frame with no verdict (flooded, a contested IR face, a
+  face mostly off the IR frame or out of range) never lets an RGB `Live` through.
+- An IR face-detector error drops the IR evidence until the next lit frame and keeps the mapping.
 - So "failure means spoof" above holds after the streak. A single failing frame gives `Unknown`.
+- IR catches a phone only once the mapping has been trusted on a real face since the IR camera
+  started. On a cold start, or after an IR restart, the RGB verdict decides alone until then.
+- Residual risk: identity is matched in RGB only, so an RGB face can borrow IR liveness from an
+  overlapping live face. An example is a dye-ink transparency of the owner's photo held over the
+  attacker's own face; IR sees through it to a real face. Mitigation on the roadmap (M7): bind
+  the modalities, by IR↔RGB landmark agreement or by an IR-crop embedding check when IR `Live`
+  overrides an RGB `Spoof`.
+- Owner acknowledgement: <pending>
 
 ### 4.4 Attention (`fasec-vision::attention`)
 

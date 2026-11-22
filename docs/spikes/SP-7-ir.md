@@ -96,11 +96,21 @@ Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
   distance. So IR `Live` now beats an RGB `Spoof` (result `Live`, tier `Ir`). This is the bar
   Windows Hello holds since CVE-2025-26644: an IR face that looks live plus an RGB camera that
   sees the same face. IR alone still never gives `Live`: fusion runs per RGB track. With IR
-  unknown, absent, untrusted, stale or unhealthy, the RGB verdict still decides, `Spoof`
-  included. An IR `Spoof` (3 lit frames in a row) still beats everything.
+  absent, untrusted, stale or unhealthy, the RGB verdict still decides, `Spoof` included. With IR
+  `Unknown` while trusted and fresh, an RGB `Spoof` decides but an RGB `Live` reads `Unknown`
+  (final fix wave). An IR `Spoof` (3 lit frames in a row) still beats everything.
   - *Residual risk:* a screen that emits the owner's NIR image as well as a visible face. The
     self-emission cue that should catch it needs a usable ambient frame, and this laptop blanks
     every one.
+  - *Residual risk:* identity is matched in RGB only. So an RGB face can borrow IR liveness from
+    an overlapping live face. An example is a dye-ink transparency of the owner's photo held over
+    the attacker's own face: IR sees through it to a real face. Not recorded. Mitigation on the
+    roadmap: bind the modalities, by IR↔RGB landmark agreement or by an IR-crop embedding check
+    when D1 overrides an RGB `Spoof`.
+  - *Residual risk:* IR catches a phone only once the mapping has been trusted on a real face
+    since the IR camera started. On a cold start, or after an IR restart, the RGB verdict
+    decides alone until then.
+  - Owner acknowledgement: <pending>
 - **D2, relief from real faces only.** Live needs relief in `[0.70, 0.97]`.
   - Relief above 0.97 is `Spoof(FlatReflectance)`. This rule is meant for a flat print, which
     should read about 1.0. **It is not verified against a printed photo, since none was
@@ -124,7 +134,9 @@ evidence:
 | Spoof (3 lit frames in a row) | any | Spoof, tier Ir |
 | Suspect (Spoof, streak not met; or a track the latest lit frame has not judged) | any | Unknown, tier Ir |
 | Live | any, Spoof included | Live, tier Ir |
-| Absent (IR off, unhealthy, untrusted, stale; IR `Unknown`) | any | the RGB verdict |
+| Unknown (IR `Unknown`, IR healthy, trusted and fresh) | Live | Unknown, tier Ir |
+| Unknown (as above) | Spoof or Unknown | the RGB verdict |
+| Absent (IR off, unhealthy, untrusted, stale) | any | the RGB verdict |
 
 - **Fix round 2 (ruling R10): a pending IR spoof blocks Live.** A moving phone gets a new RGB
   track id often, and each id starts its streak over. Without this row a fooled MiniFASNet could
@@ -134,8 +146,19 @@ evidence:
   lit IR frames. A track created on a call without a new lit frame has no IR verdict yet. While
   IR is healthy, trusted and fresh, it reads `Unknown` until the next lit frame judges it. It
   used to take the RGB verdict for that gap.
-- An IR face-detector error on a lit frame resets IR, as an unhealthy IR camera does. The
-  previous lit frame's evidence no longer counts.
+- **Final fix wave (F1): IR `Unknown` blocks an RGB `Live` while IR is trusted and fresh.** IR
+  `Unknown` comes from a flooded frame, a contested IR face, a face mostly off the IR frame or
+  out of range. A phone held close can flood the frame, so a fooled MiniFASNet must not decide
+  then. An RGB `Spoof` or `Unknown` stands. Untrusted, stale or unhealthy IR still falls back to
+  RGB.
+- **F2: an IR face-detector error keeps the mapping.** It drops the last lit frame and every
+  track's IR verdict and streak, so the track falls back to RGB until the next lit frame. The
+  mapping stays trusted. A change of IR frame size still resets it. Fix round 3 had reset IR
+  fully here.
+- **F3: range gate for `NoIrFace`.** No IR face counts as `NoIrFace` only when the RGB face is
+  at least 150 px wide on a 1280 px wide RGB frame (the same fraction at other widths). The
+  narrowest recorded real face was 188 px (real-80cm), and IR found it on every trusted frame. A
+  narrower face gets no cues, so IR `Unknown`, which F1 keeps from becoming `Live`.
 
 ### Result after tuning
 
@@ -197,6 +220,24 @@ unchanged. Real faces: 17, 17, 13 and 11 of 17, 17, 13 and 11 Live on tier Ir. P
 92 Live, 68 Spoof, 24 Unknown. Phone video: 0 of 80 Live, 44 Spoof, 36 Unknown. The recordings
 pair a lit frame with every RGB frame, so replay never makes a call without a new lit frame. The
 change is covered by unit tests only.
+
+After the final fix wave (F1–F3), from the same test:
+
+| label | tracks | Live | Spoof (fused) | of which IR evidence Spoof | Unknown |
+|---|---|---|---|---|---|
+| phone-photo (session b) | 92 | 0 (0 %) | 68 (73.9 %) | 64 (69.6 %) | 24 (26.1 %) |
+| phone-video | 80 | 0 (0 %) | 48 (60.0 %) | 44 (55.0 %) | 32 (40.0 %) |
+
+- Real faces are unchanged: 17, 17, 13 and 11 of 17, 17, 13 and 11 trusted tracks Live on tier
+  Ir. IR past each track's streak: 64 of 64 (photo), 44 of 44 (video).
+- Phone video gained 4 Spoof (1 per predecessor) and lost 4 Unknown. Replayed after real-50cm,
+  its first 3 trusted frames show a phone face 117, 88 and 95 px wide. F3 makes them IR
+  `Unknown`, so MiniFASNet's `Spoof` stands where a pending `NoIrFace` (`Suspect`) read `Unknown`
+  before. 1 of them falls in the counted frames. That is inferred from the totals; the base was
+  not re-run frame by frame.
+- F1 is not exercised by the recordings. Replayed after real-50cm, MiniFASNet called every
+  trusted phone frame with IR `Unknown` a spoof (4 photo, 3 video). Only the unit tests cover a
+  fooled MiniFASNet.
 
 - When the predecessor is real-turning session b, the phone sessions add nothing: no trust was
   earned.
