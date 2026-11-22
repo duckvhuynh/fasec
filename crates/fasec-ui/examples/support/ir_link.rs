@@ -12,12 +12,21 @@ use fasec_core::{CameraHealth, IrFrame, LivenessTier};
 use fasec_vision::{IrEvidence, TrackIr};
 
 /// Longer than the ASUS IR camera's lit-frame period (~128 ms, 24 lit frames in 3 s in Task 1),
-/// so with healthy IR every pipeline call carries a new lit pair: IR evidence is fresh for one
-/// call only and a spoof streak needs lit frames on consecutive calls.
+/// so with healthy IR most calls carry a new lit pair with the RGB frame taken just after it.
+/// Freshness does not depend on it: the pipeline counts lit frames and RGB time.
 const LIT_WAIT: Duration = Duration::from_millis(200);
 
 /// A lit IR frame and its ambient (unlit) partner.
 pub type IrPair = (IrFrame, Option<IrFrame>);
+/// What the next `process_with_ir` call gets: a lit pair (if any) and the IR health.
+pub type IrOffer = (Option<IrPair>, CameraHealth);
+
+const LOST: IrOffer = (None, CameraHealth::Lost);
+
+/// The pending offer, or a newly polled one that then stays pending until `delivered`.
+fn offer(pending: &mut Option<IrOffer>, poll: impl FnOnce() -> IrOffer) -> IrOffer {
+    pending.get_or_insert_with(poll).clone()
+}
 
 /// `[liveness] ir` from `%APPDATA%\fasec\config.toml` (SRS §6.2); no file means `prefer`.
 pub fn ir_mode_from_config() -> Result<IrMode, String> {
@@ -62,8 +71,9 @@ pub struct IrLink {
     cap: Option<IrCapture>,
     source: Option<String>,
     state: IrState,
-    /// The next call reports IR `Lost` so the pipeline drops IR trust from the previous run.
-    restarted: bool,
+    /// The offer handed out until a pipeline call takes it. A (re)start sets it to `Lost`, so
+    /// the pipeline drops IR trust from the previous run before it sees the new capture.
+    pending: Option<IrOffer>,
     last_seq: u64,
     window: (Instant, u32),
     fps: f32,
@@ -77,7 +87,7 @@ impl IrLink {
             cap: None,
             source: None,
             state: IrState::NotStarted,
-            restarted: true,
+            pending: Some(LOST),
             last_seq: 0,
             window: (Instant::now(), 0),
             fps: 0.0,
@@ -86,6 +96,7 @@ impl IrLink {
 
     /// Stops any IR capture, then opens the IR camera paired with RGB camera `rgb_id`. Blocks
     /// up to ~5 s. Every failure only leaves IR off: RGB carries on.
+    // shortcut: runs on the RGB worker, so a slow open delays RGB (5 s max); a stuck stop detaches
     pub fn start(&mut self, rgb_id: &str) {
         self.stop();
         if self.mode == IrMode::Off {
@@ -114,34 +125,40 @@ impl IrLink {
     /// Stops the IR capture (bounded at ~2 s).
     pub fn stop(&mut self) {
         self.cap = None;
-        (self.source, self.state, self.restarted) = (None, IrState::NotStarted, true);
+        (self.source, self.state, self.pending) = (None, IrState::NotStarted, Some(LOST));
         (self.window, self.fps) = ((Instant::now(), 0), 0.0);
     }
 
     /// The lit pair for the next `process_with_ir` call and the IR health to pass with it.
-    /// With healthy IR this waits up to `LIT_WAIT` for a new lit pair.
-    pub fn next(&mut self) -> (Option<IrPair>, CameraHealth) {
-        let Some(cap) = &self.cap else {
-            return (None, CameraHealth::Lost);
-        };
-        if std::mem::take(&mut self.restarted) {
-            return (None, CameraHealth::Lost);
-        }
-        let health = cap.health();
-        if health != CameraHealth::Ok {
-            return (None, health);
-        }
-        let pair = self.slot.take_newer(self.last_seq, LIT_WAIT);
-        if let Some((lit, _)) = &pair {
-            self.last_seq = lit.seq;
-            self.window.1 += 1;
-        }
-        let secs = self.window.0.elapsed().as_secs_f32();
-        if secs >= 1.0 {
-            self.fps = self.window.1 as f32 / secs;
-            self.window = (Instant::now(), 0);
-        }
-        (pair, CameraHealth::Ok)
+    /// The same offer comes back until `delivered`, so neither a taken pair nor the `Lost` of a
+    /// restart is lost on an iteration without an RGB frame. With healthy IR a new poll waits up
+    /// to `LIT_WAIT` for a new lit pair.
+    pub fn next(&mut self) -> IrOffer {
+        offer(&mut self.pending, || {
+            let Some(cap) = &self.cap else {
+                return LOST;
+            };
+            let health = cap.health();
+            if health != CameraHealth::Ok {
+                return (None, health);
+            }
+            let pair = self.slot.take_newer(self.last_seq, LIT_WAIT);
+            if let Some((lit, _)) = &pair {
+                self.last_seq = lit.seq;
+                self.window.1 += 1;
+            }
+            let secs = self.window.0.elapsed().as_secs_f32();
+            if secs >= 1.0 {
+                self.fps = self.window.1 as f32 / secs;
+                self.window = (Instant::now(), 0);
+            }
+            (pair, CameraHealth::Ok)
+        })
+    }
+
+    /// The offer from `next` reached a `process_with_ir` call: the next `next` polls afresh.
+    pub fn delivered(&mut self) {
+        self.pending = None;
     }
 
     pub fn view(&self) -> IrView {
@@ -282,6 +299,32 @@ mod tests {
             reason: IrSpoofReason::NoIrFace,
         };
         assert_eq!(track_ir_label(&ir(spoof, true)), "IR SPOOF NoIrFace 0.00");
+    }
+
+    #[test]
+    fn restart_lost_and_a_taken_pair_wait_for_a_pipeline_call() {
+        let lit = |seq| IrFrame::new(seq, 0, 2, 2, true, vec![9; 4]).unwrap();
+        let seq = |o: &IrOffer| o.0.as_ref().map(|(l, _)| l.seq);
+        let mut link = IrLink::new(IrMode::Prefer);
+        link.stop(); // a restart
+        // the RGB frame is missing on two iterations: Lost is still what the next call gets
+        for _ in 0..2 {
+            let o = offer(&mut link.pending, || {
+                (Some((lit(1), None)), CameraHealth::Ok)
+            });
+            assert_eq!((seq(&o), o.1), (None, CameraHealth::Lost));
+        }
+        link.delivered();
+        // a taken pair is offered again until a call takes it
+        let o = offer(&mut link.pending, || {
+            (Some((lit(2), None)), CameraHealth::Ok)
+        });
+        assert_eq!((seq(&o), o.1), (Some(2), CameraHealth::Ok));
+        let o = offer(&mut link.pending, || (None, CameraHealth::Ok));
+        assert_eq!(seq(&o), Some(2));
+        link.delivered();
+        let o = offer(&mut link.pending, || (None, CameraHealth::Ok));
+        assert_eq!((seq(&o), o.1), (None, CameraHealth::Ok));
     }
 
     #[test]

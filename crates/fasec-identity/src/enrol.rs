@@ -232,10 +232,15 @@ impl Enrolment {
             return Err(TooSmall);
         }
         // before the liveness gate: a too-close face is `Unknown`, and "move back" is the fix.
-        // The IR tier has no crop limit, so there the liveness gate alone decides.
-        if report.liveness_tier != LivenessTier::Ir
-            && !liveness_fits(frame.width, frame.height, t.bbox)
-        {
+        // IR has no crop limit, so a face whose own verdict is IR Live skips it.
+        let ir_live = matches!(
+            t.liveness,
+            LivenessState::Live {
+                tier: LivenessTier::Ir,
+                ..
+            }
+        );
+        if !ir_live && !liveness_fits(frame.width, frame.height, t.bbox) {
             return Err(TooClose);
         }
         if !(self.cfg.min_sharpness..).contains(&sharpness(frame, t.bbox)) {
@@ -503,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn close_face_on_the_ir_tier_needs_only_live() {
+    fn close_face_passes_only_on_its_own_ir_live() {
         let close = RectF {
             x: 0.25,
             y: 0.25,
@@ -522,14 +527,20 @@ mod tests {
             e.offer(&frame(10, true), &r, Some(&emb(1, 10))),
             SampleVerdict::Accepted { pose: Pose::Front }
         );
-        // the IR tier lifts only the crop limit: no Live verdict, no sample
-        assert_rejected(
-            |_, r, _| {
-                (r.liveness_tier, r.tracks[0].bbox) = (LivenessTier::Ir, close);
-                r.tracks[0].liveness = LivenessState::Unknown;
-            },
-            RejectReason::NotLive,
-        );
+        // only the track's own IR Live lifts the crop limit, not the report's tier
+        let rgb_live = LivenessState::Live {
+            score: 0.9,
+            tier: LivenessTier::Rgb,
+        };
+        for liveness in [LivenessState::Unknown, rgb_live] {
+            assert_rejected(
+                |_, r, _| {
+                    (r.liveness_tier, r.tracks[0].bbox) = (LivenessTier::Ir, close);
+                    r.tracks[0].liveness = liveness.clone();
+                },
+                RejectReason::TooClose,
+            );
+        }
     }
 
     #[test]

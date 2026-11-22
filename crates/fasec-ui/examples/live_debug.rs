@@ -548,6 +548,7 @@ fn worker(
             }
             continue;
         };
+        ir.delivered();
         seq = frame.seq;
         let health = c.health();
         let ir_frames = ir_pair.as_ref().map(|(lit, amb)| (lit, amb.as_ref()));

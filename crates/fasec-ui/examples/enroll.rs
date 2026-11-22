@@ -687,6 +687,7 @@ fn worker(
             }
             continue;
         };
+        ir.delivered();
         seq = frame.seq;
         let ir_frames = ir_pair.as_ref().map(|(lit, amb)| (lit, amb.as_ref()));
         let out = match pipeline.process_with_ir(&frame, ir_frames, cap.health(), ir_health) {
