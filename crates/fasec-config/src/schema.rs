@@ -14,6 +14,7 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub owner_absent: OwnerAbsentConfig,
     pub snapshots: SnapshotsConfig,
+    pub liveness: LivenessConfig,
 }
 
 impl Default for Config {
@@ -25,8 +26,26 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             owner_absent: OwnerAbsentConfig::default(),
             snapshots: SnapshotsConfig::default(),
+            liveness: LivenessConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LivenessConfig {
+    pub ir: IrMode,
+}
+
+/// Whether the Windows Hello IR camera paired with the RGB camera is used for liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrMode {
+    /// Use the paired IR camera when present and healthy, else the RGB tier.
+    #[default]
+    Prefer,
+    /// Never open the IR camera.
+    Off,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

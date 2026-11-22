@@ -5,8 +5,8 @@
 //! relative to the mean of the accepted Front samples (the user's frontal baseline). No frame or crop is kept: only accepted embeddings (FR-ID-005).
 
 use fasec_core::{
-    CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, VisionReport,
-    liveness_fits,
+    CameraHealth, Embedding, Frame, LivenessState, LivenessTier, RectF, TrackEmbedding,
+    VisionReport, liveness_fits,
 };
 use zeroize::Zeroizing;
 
@@ -231,8 +231,16 @@ impl Enrolment {
         if !(self.cfg.min_face_px..).contains(&t.face_width_px) {
             return Err(TooSmall);
         }
-        // before the liveness gate: a too-close face is `Unknown`, and "move back" is the fix
-        if !liveness_fits(frame.width, frame.height, t.bbox) {
+        // before the liveness gate: a too-close face is `Unknown`, and "move back" is the fix.
+        // IR has no crop limit, so a face whose own verdict is IR Live skips it.
+        let ir_live = matches!(
+            t.liveness,
+            LivenessState::Live {
+                tier: LivenessTier::Ir,
+                ..
+            }
+        );
+        if !ir_live && !liveness_fits(frame.width, frame.height, t.bbox) {
             return Err(TooClose);
         }
         if !(self.cfg.min_sharpness..).contains(&sharpness(frame, t.bbox)) {
@@ -497,6 +505,42 @@ mod tests {
             },
             RejectReason::TooClose,
         );
+    }
+
+    #[test]
+    fn close_face_passes_only_on_its_own_ir_live() {
+        let close = RectF {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
+        let ir_live = LivenessState::Live {
+            score: 0.8,
+            tier: LivenessTier::Ir,
+        };
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let mut r = report(10, vec![track(1, 0.0, 0.0)]);
+        (r.liveness_tier, r.tracks[0].bbox) = (LivenessTier::Ir, close);
+        r.tracks[0].liveness = ir_live;
+        assert_eq!(
+            e.offer(&frame(10, true), &r, Some(&emb(1, 10))),
+            SampleVerdict::Accepted { pose: Pose::Front }
+        );
+        // only the track's own IR Live lifts the crop limit, not the report's tier
+        let rgb_live = LivenessState::Live {
+            score: 0.9,
+            tier: LivenessTier::Rgb,
+        };
+        for liveness in [LivenessState::Unknown, rgb_live] {
+            assert_rejected(
+                |_, r, _| {
+                    (r.liveness_tier, r.tracks[0].bbox) = (LivenessTier::Ir, close);
+                    r.tracks[0].liveness = liveness.clone();
+                },
+                RejectReason::TooClose,
+            );
+        }
     }
 
     #[test]

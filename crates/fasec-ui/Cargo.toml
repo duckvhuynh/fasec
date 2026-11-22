@@ -19,6 +19,7 @@ fasec-config = { version = "0.0.1", path = "../fasec-config" }
 fasec-core = { version = "0.0.1", path = "../fasec-core" }
 fasec-identity = { version = "0.0.1", path = "../fasec-identity" }
 fasec-platform = { version = "0.0.1", path = "../fasec-platform", features = ["identity"] }
+fasec-replay = { version = "0.0.1", path = "../fasec-replay" }
 fasec-vision = { version = "0.0.1", path = "../fasec-vision" }
 zeroize = "1.9.2"
 
@@ -29,4 +30,8 @@ test = true
 
 [[example]]
 name = "live_debug"
+test = true
+
+[[example]]
+name = "ir_debug"
 test = true

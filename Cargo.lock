@@ -1505,6 +1505,7 @@ dependencies = [
  "fasec-config",
  "fasec-core",
  "fasec-identity",
+ "fasec-models",
  "fasec-platform",
  "fasec-vision",
  "image",
@@ -1524,6 +1525,7 @@ dependencies = [
  "fasec-core",
  "fasec-identity",
  "fasec-platform",
+ "fasec-replay",
  "fasec-vision",
  "zeroize",
 ]

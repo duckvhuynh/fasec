@@ -24,6 +24,11 @@ tracing = "0.1.44"
 windows = { version = "0.62", features = [
     "Devices_Enumeration",
     "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Capture_Frames",
+    "Media_MediaProperties",
+    "Storage_Streams",
     "Win32_System_Com",
     "Win32_System_Registry",
 ] }
@@ -32,12 +37,3 @@ windows = { version = "0.62", features = [
 anyhow = "1.0.104"
 ctrlc = "3.5.3"
 
-[target.'cfg(windows)'.dev-dependencies]
-# Extra WinRT features for the ir_probe example only; the library build does not get them.
-windows = { version = "0.62", features = [
-    "Foundation_Collections",
-    "Graphics_Imaging",
-    "Media_Capture_Frames",
-    "Media_MediaProperties",
-    "Storage_Streams",
-] }

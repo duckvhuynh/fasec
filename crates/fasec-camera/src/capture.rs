@@ -17,7 +17,7 @@ use crate::permission::{self, Access};
 use crate::{CameraError, HealthConfig, HealthMonitor, LatestFrame, transform};
 
 /// How long `stop`/`Drop` waits for the capture thread before detaching it.
-const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long `start` waits for the first frame. Busy surfaces only on the first read.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// Covered detection averages every 61st pixel: a full-frame mean on every 720p frame costs
@@ -237,7 +237,7 @@ fn explain(e: CameraError, access: Access) -> CameraError {
 /// Combines the monitor's verdict with the current capture error.
 /// Busy and PermissionDenied say why frames stopped, so they beat the monitor's Lost/Covered;
 /// a generic error only shows while the monitor still says Ok.
-fn with_error(health: CameraHealth, error: Option<CameraError>) -> CameraHealth {
+pub(crate) fn with_error(health: CameraHealth, error: Option<CameraError>) -> CameraHealth {
     match (error, health) {
         (Some(CameraError::Busy), _) => CameraHealth::Busy,
         (Some(CameraError::PermissionDenied), _) => CameraHealth::PermissionDenied,
@@ -247,7 +247,7 @@ fn with_error(health: CameraHealth, error: Option<CameraError>) -> CameraHealth 
     }
 }
 
-fn ms_since(t0: Instant) -> u64 {
+pub(crate) fn ms_since(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
