@@ -92,8 +92,8 @@ pub fn paired_ir_for(rgb_id: &str) -> Result<Option<IrSourceInfo>, CameraError> 
     Ok(pick_paired(rgb_id, &frame_sources()?))
 }
 
-/// An IR source in a group that also holds the RGB camera, else one on the same USB
-/// `VID_xxxx&PID_xxxx`, else `None`.
+/// An IR source in a group that also holds the RGB camera, else the one IR device on the same
+/// USB `VID_xxxx&PID_xxxx` (`None` if two devices share it), else `None`.
 pub(crate) fn pick_paired(rgb_id: &str, sources: &[FrameSourceEntry]) -> Option<IrSourceInfo> {
     let rgb = normalize_id(rgb_id);
     let groups: Vec<&str> = sources
@@ -101,12 +101,17 @@ pub(crate) fn pick_paired(rgb_id: &str, sources: &[FrameSourceEntry]) -> Option<
         .filter(|s| !s.infrared && normalize_id(&s.info.device_id) == rgb)
         .map(|s| s.info.group_id.as_str())
         .collect();
-    let mut ir = sources.iter().filter(|s| s.infrared).map(|s| &s.info);
+    let ir = sources.iter().filter(|s| s.infrared).map(|s| &s.info);
     let same_group = ir.clone().find(|s| groups.contains(&s.group_id.as_str()));
     same_group
         .or_else(|| {
             let usb = usb_vid_pid(&rgb)?;
-            ir.find(|s| usb_vid_pid(&normalize_id(&s.device_id)) == Some(usb))
+            let mut same_usb = ir.filter(|s| usb_vid_pid(&normalize_id(&s.device_id)) == Some(usb));
+            let first = same_usb.next()?;
+            // Two identical cameras: guessing could pair the RGB with the other one's IR.
+            same_usb
+                .all(|s| normalize_id(&s.device_id) == normalize_id(&first.device_id))
+                .then_some(first)
         })
         .cloned()
 }
@@ -115,7 +120,7 @@ pub(crate) fn pick_paired(rgb_id: &str, sources: &[FrameSourceEntry]) -> Option<
 fn usb_vid_pid(id: &str) -> Option<&str> {
     let at = id.find("vid_")?;
     let key = id.get(at..at + "vid_xxxx&pid_xxxx".len())?;
-    key[8..].starts_with("&pid_").then_some(key)
+    key.as_bytes()[8..].starts_with(b"&pid_").then_some(key)
 }
 
 #[cfg(windows)]
@@ -335,5 +340,39 @@ mod tests {
             "truncated id"
         );
         assert_eq!(pick_paired(ASUS_RGB_MF, &[]), None);
+    }
+
+    #[test]
+    fn two_ir_devices_on_the_same_vid_pid_are_ambiguous() {
+        let mut sources: Vec<_> = asus(false)
+            .into_iter()
+            .filter(|s| s.info.group_id != "dmft")
+            .collect();
+        // The same IR device listed in a second group is still one device.
+        let mut again = sources.last().expect("ir-only source").clone();
+        again.info.group_id = "other group".into();
+        sources.push(again);
+        assert!(pick_paired(ASUS_RGB_MF, &sources).is_some());
+        // A second, identical USB camera: no group match, so we cannot tell which IR is ours.
+        let twin = r"\\?\usb#vid_3277&pid_0096&mi_02#7&1234abc&0&0002#{24e552d7}\global";
+        let mut other = sources.last().expect("ir-only source").clone();
+        other.info.group_id = twin.into();
+        other.info.device_id = twin.into();
+        sources.push(other);
+        assert_eq!(pick_paired(ASUS_RGB_MF, &sources), None);
+    }
+
+    #[test]
+    fn a_non_ascii_id_does_not_panic() {
+        // 'é' straddles byte 8 of the would-be `vid_xxxx&pid_xxxx` key.
+        assert_eq!(usb_vid_pid(r"\\?\usb#vid_123é&pid_0096&mi_00"), None);
+        assert_eq!(
+            pick_paired(r"\\?\usb#vid_123é&pid_0096&mi_00", &asus(false)),
+            None
+        );
+        assert_eq!(
+            usb_vid_pid(r"\\?\usb#vid_3277&pid_0096&mi_00"),
+            Some("vid_3277&pid_0096")
+        );
     }
 }

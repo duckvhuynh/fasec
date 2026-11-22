@@ -18,7 +18,16 @@ const POLL: Duration = Duration::from_millis(5);
 /// Health luma samples every 61st pixel, as `capture::LUMA_STRIDE` does for RGB.
 const LUMA_STRIDE: usize = 61;
 
-/// The newest illuminated frame, paired with the unlit (ambient) frame closest before it.
+/// An unlit frame older than this no longer shows the lit frame's scene (the ASUS camera
+/// alternates every ~64 ms, so this spans about three frame periods).
+const AMBIENT_MAX_AGE_MS: u64 = 200;
+
+/// The newest illuminated frame, paired with the unlit (ambient) frame just before it.
+///
+/// One capture owns the slot at a time. `IrCapture::start` takes it over and drops every
+/// stored frame; stopping (or dropping) the capture drops them again, and a stopped or detached
+/// capture can never store another frame. A new capture numbers its frames after the slot's
+/// last seq, so an `after_seq` from a previous capture on the same slot stays valid.
 #[derive(Debug, Default)]
 pub struct LatestIrPair {
     slot: Mutex<Pair>,
@@ -27,10 +36,22 @@ pub struct LatestIrPair {
 
 #[derive(Debug, Default)]
 struct Pair {
-    /// Newest unconsumed lit frame and the ambient frame that was latest when it arrived.
+    /// Newest unconsumed lit frame and its ambient partner.
     lit: Option<(IrFrame, Option<IrFrame>)>,
     /// Latest ambient frame; kept after a take so the next lit frame can pair with it.
     ambient: Option<IrFrame>,
+    /// Token of the capture that may `put`; bumped whenever the slot changes hands.
+    owner: u64,
+    /// Highest seq ever stored.
+    last_seq: u64,
+}
+
+impl Pair {
+    fn reset(&mut self) {
+        self.owner += 1;
+        self.lit = None;
+        self.ambient = None;
+    }
 }
 
 impl LatestIrPair {
@@ -38,12 +59,38 @@ impl LatestIrPair {
         Self::default()
     }
 
-    /// Stores `f`. A lit frame replaces an unconsumed older lit frame; an unlit one only
-    /// becomes the ambient partner of the next lit frame.
-    pub fn put(&self, f: IrFrame) {
+    /// Hands the slot to a new capture: drops every stored frame. Returns the capture's
+    /// token and the seq its frames are numbered after.
+    fn claim(&self) -> (u64, u64) {
         let mut p = self.lock();
+        p.reset();
+        (p.owner, p.last_seq)
+    }
+
+    /// Ends `owner`'s claim and drops its frames; a no-op if another capture claimed since.
+    fn release(&self, owner: u64) {
+        let mut p = self.lock();
+        if p.owner == owner {
+            p.reset();
+        }
+    }
+
+    /// Stores `f` if `owner` still holds the slot. A lit frame replaces an unconsumed older lit
+    /// frame and pairs with the latest unlit one if that is at most `AMBIENT_MAX_AGE_MS`
+    /// older; an unlit one only becomes the ambient partner of later lit frames.
+    fn put(&self, owner: u64, f: IrFrame) {
+        let mut p = self.lock();
+        if p.owner != owner {
+            return;
+        }
+        p.last_seq = p.last_seq.max(f.seq);
         if f.illuminated {
-            p.lit = Some((f, p.ambient.clone()));
+            let ambient = p.ambient.clone().filter(|a| {
+                f.ts_ms
+                    .checked_sub(a.ts_ms)
+                    .is_some_and(|age| age <= AMBIENT_MAX_AGE_MS)
+            });
+            p.lit = Some((f, ambient));
             drop(p);
             self.cv.notify_all();
         } else {
@@ -93,6 +140,8 @@ pub struct IrCapture {
     t0: Instant,
     sharing_mode: &'static str,
     thread: Option<JoinHandle<()>>,
+    slot: Arc<LatestIrPair>,
+    owner: u64,
 }
 
 struct Status {
@@ -129,11 +178,20 @@ impl IrCapture {
         }));
         let t0 = Instant::now();
         let (tx, rx) = mpsc::sync_channel(1);
-        let (t_stop, t_status) = (Arc::clone(&stop), Arc::clone(&status));
+        let (owner, last_seq) = slot.claim();
+        let (t_stop, t_status, t_slot) =
+            (Arc::clone(&stop), Arc::clone(&status), Arc::clone(&slot));
         let thread = std::thread::Builder::new()
             .name("fasec-ir".into())
             .spawn(move || match open() {
-                Ok((mut src, mode)) => run(&mut src, mode, tx, &slot, &t_stop, &t_status, t0),
+                Ok((mut src, mode)) => {
+                    let out = Output {
+                        slot: &t_slot,
+                        owner,
+                        last_seq,
+                    };
+                    run(&mut src, mode, tx, out, &t_stop, &t_status, t0);
+                }
                 Err(e) => {
                     let _ = tx.send(Err(e));
                 }
@@ -147,6 +205,8 @@ impl IrCapture {
             t0,
             sharing_mode: "",
             thread: Some(thread),
+            slot,
+            owner,
         };
         match started {
             Ok(Ok(mode)) => {
@@ -183,6 +243,8 @@ impl IrCapture {
 impl Drop for IrCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // First, so no frame of this capture is handed out while (or after) it stops.
+        self.slot.release(self.owner);
         let Some(t) = self.thread.take() else {
             return;
         };
@@ -198,18 +260,26 @@ impl Drop for IrCapture {
     }
 }
 
+/// Where the frame loop publishes: its claim on the slot.
+struct Output<'a> {
+    slot: &'a LatestIrPair,
+    owner: u64,
+    /// Frames are numbered after this.
+    last_seq: u64,
+}
+
 /// Frame loop. Reports the first frame (or the error before it) through `started`.
 fn run(
     src: &mut impl IrFrameSource,
     mode: &'static str,
     started: mpsc::SyncSender<Result<&'static str, CameraError>>,
-    slot: &LatestIrPair,
+    out: Output<'_>,
     stop: &AtomicBool,
     status: &Mutex<Status>,
     t0: Instant,
 ) {
     let mut started = Some(started);
-    let (mut seq, mut errors) = (0u64, 0u32);
+    let (mut seq, mut errors) = (out.last_seq, 0u32);
     while !stop.load(Ordering::Relaxed) {
         let frame = src.next_ir().and_then(|raw| {
             raw.map(|r| {
@@ -236,7 +306,7 @@ fn run(
                     s.health.on_frame(f.ts_ms, sampled_mean(&f.data));
                 }
                 drop(s);
-                slot.put(f);
+                out.slot.put(out.owner, f);
                 if let Some(tx) = started.take() {
                     let _ = tx.send(Ok(mode));
                 }
@@ -279,9 +349,12 @@ pub(crate) fn win_err(what: &str, e: &windows::core::Error) -> CameraError {
 
 #[cfg(windows)]
 mod win {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Capture::Frames::{
-        MediaFrameReader, MediaFrameReaderStartStatus, MediaFrameSourceGroup,
+        MediaFrameReader, MediaFrameReaderStartStatus, MediaFrameReference, MediaFrameSourceGroup,
     };
     use windows::Media::Capture::{
         MediaCapture, MediaCaptureInitializationSettings, MediaCaptureMemoryPreference,
@@ -291,6 +364,9 @@ mod win {
 
     use super::{IrFrameSource, RawIr, win_err};
     use crate::{CameraError, normalize_id};
+
+    /// Inside `STOP_TIMEOUT`, so `Close` runs before `IrCapture::stop` detaches the thread.
+    const READER_STOP_WAIT: Duration = Duration::from_secs(1);
 
     /// Open WinRT reader; stopped and closed on drop.
     pub(super) struct WinIr {
@@ -380,19 +456,24 @@ mod win {
             let Ok(frame) = self.reader.TryAcquireLatestFrame() else {
                 return Ok(None);
             };
-            let err = |what| move |e: windows::core::Error| win_err(what, &e);
-            let video = frame.VideoMediaFrame().map_err(err("video frame"))?;
-            // Unknown lighting counts as unlit: it can then never pass as a lit frame.
-            let illuminated = video
-                .InfraredMediaFrame()
-                .and_then(|i| i.IsIlluminated())
-                .unwrap_or(false);
-            let bmp = video.SoftwareBitmap().map_err(err("IR bitmap"))?;
-            let raw = gray8(&bmp, illuminated).map_err(err("IR pixels"));
-            let _ = bmp.Close();
-            let _ = frame.Close();
+            let raw = read(&frame);
+            let _ = frame.Close(); // on every path: the reader has a small frame pool
             raw.map(Some)
         }
+    }
+
+    fn read(frame: &MediaFrameReference) -> Result<RawIr, CameraError> {
+        let err = |what| move |e: windows::core::Error| win_err(what, &e);
+        let video = frame.VideoMediaFrame().map_err(err("video frame"))?;
+        // Unknown lighting counts as unlit: it can then never pass as a lit frame.
+        let illuminated = video
+            .InfraredMediaFrame()
+            .and_then(|i| i.IsIlluminated())
+            .unwrap_or(false);
+        let bmp = video.SoftwareBitmap().map_err(err("IR bitmap"))?;
+        let raw = gray8(&bmp, illuminated).map_err(err("IR pixels"));
+        let _ = bmp.Close();
+        raw
     }
 
     fn gray8(bmp: &SoftwareBitmap, illuminated: bool) -> windows::core::Result<RawIr> {
@@ -418,8 +499,19 @@ mod win {
 
     impl Drop for WinIr {
         fn drop(&mut self) {
-            if let Err(e) = self.reader.StopAsync().and_then(|op| op.join()) {
-                tracing::warn!(error = %e, "IR reader stop failed");
+            // Bounded: a hung StopAsync must not keep Close (and Windows Hello) from the camera.
+            let (tx, rx) = mpsc::channel();
+            let stopped = self.reader.StopAsync().and_then(|op| {
+                op.when(move |r| {
+                    let _ = tx.send(r);
+                })
+            });
+            match stopped.map(|()| rx.recv_timeout(READER_STOP_WAIT)) {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) | Err(e) => tracing::warn!(error = %e, "IR reader stop failed"),
+                Ok(Err(_)) => {
+                    tracing::warn!("IR reader stop still pending after {READER_STOP_WAIT:?}");
+                }
             }
             let _ = self.capture.Close(); // releases the camera for Windows Hello
         }
@@ -430,8 +522,18 @@ mod win {
 mod tests {
     use super::*;
 
+    /// Stores `f` as the slot's current owner would.
+    fn put(slot: &LatestIrPair, f: IrFrame) {
+        let owner = slot.lock().owner;
+        slot.put(owner, f);
+    }
+
     fn ir(seq: u64, lit: bool) -> IrFrame {
-        IrFrame::new(seq, seq, 1, 1, lit, vec![if lit { 90 } else { 0 }]).expect("1x1 frame")
+        ir_at(seq, seq, lit)
+    }
+
+    fn ir_at(seq: u64, ts_ms: u64, lit: bool) -> IrFrame {
+        IrFrame::new(seq, ts_ms, 1, 1, lit, vec![if lit { 90 } else { 0 }]).expect("1x1 frame")
     }
 
     fn seqs(p: Option<(IrFrame, Option<IrFrame>)>) -> Option<(u64, Option<u64>)> {
@@ -442,7 +544,7 @@ mod tests {
     fn newest_lit_comes_with_the_ambient_frame_just_before_it() {
         let slot = LatestIrPair::new();
         for (seq, lit) in [(1, false), (2, true), (3, false), (4, true), (5, false)] {
-            slot.put(ir(seq, lit));
+            put(&slot, ir(seq, lit));
         }
         // u5 is newer than l4 but is not the ambient frame before it.
         assert_eq!(seqs(slot.take_newer(0, Duration::ZERO)), Some((4, Some(3))));
@@ -451,33 +553,46 @@ mod tests {
     #[test]
     fn a_lit_frame_is_never_handed_out_twice() {
         let slot = LatestIrPair::new();
-        slot.put(ir(1, false));
-        slot.put(ir(2, true));
+        put(&slot, ir(1, false));
+        put(&slot, ir(2, true));
         assert_eq!(seqs(slot.take_newer(0, Duration::ZERO)), Some((2, Some(1))));
         assert_eq!(seqs(slot.take_newer(0, Duration::from_millis(20))), None);
-        slot.put(ir(3, false)); // ambient alone is not a pair
+        put(&slot, ir(3, false)); // ambient alone is not a pair
         assert_eq!(seqs(slot.take_newer(0, Duration::from_millis(20))), None);
-        slot.put(ir(4, true));
+        put(&slot, ir(4, true));
         assert_eq!(seqs(slot.take_newer(2, Duration::ZERO)), Some((4, Some(3))));
     }
 
     #[test]
-    fn ambient_survives_a_take_and_lit_without_ambient_pairs_with_none() {
+    fn ambient_survives_a_take_until_it_is_too_old() {
         let slot = LatestIrPair::new();
-        slot.put(ir(1, true));
+        put(&slot, ir(1, true));
         assert_eq!(seqs(slot.take_newer(0, Duration::ZERO)), Some((1, None)));
-        slot.put(ir(2, false));
-        slot.put(ir(3, true));
+        put(&slot, ir(2, false));
+        put(&slot, ir(3, true));
         assert_eq!(seqs(slot.take_newer(1, Duration::ZERO)), Some((3, Some(2))));
-        // Two lit frames in a row: the second still pairs with the last unlit one.
-        slot.put(ir(4, true));
+        // Two lit frames in a row: the second still pairs with the last unlit one...
+        put(&slot, ir_at(4, 150, true));
         assert_eq!(seqs(slot.take_newer(3, Duration::ZERO)), Some((4, Some(2))));
+        // ...but not once that one is more than 200 ms older.
+        put(&slot, ir_at(5, 300, true));
+        assert_eq!(seqs(slot.take_newer(4, Duration::ZERO)), Some((5, None)));
+    }
+
+    #[test]
+    fn ambient_pairs_only_within_200_ms_before_the_lit_frame() {
+        let slot = LatestIrPair::new();
+        put(&slot, ir_at(1, 1000, false));
+        put(&slot, ir_at(2, 1200, true));
+        assert_eq!(seqs(slot.take_newer(0, Duration::ZERO)), Some((2, Some(1))));
+        put(&slot, ir_at(3, 1201, true));
+        assert_eq!(seqs(slot.take_newer(2, Duration::ZERO)), Some((3, None)));
     }
 
     #[test]
     fn take_newer_keeps_a_lit_frame_that_is_not_newer() {
         let slot = LatestIrPair::new();
-        slot.put(ir(3, true));
+        put(&slot, ir(3, true));
         assert_eq!(seqs(slot.take_newer(3, Duration::ZERO)), None);
         assert_eq!(seqs(slot.take_newer(2, Duration::ZERO)), Some((3, None)));
     }
@@ -489,9 +604,9 @@ mod tests {
             let slot = Arc::clone(&slot);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(20));
-                slot.put(ir(1, false));
+                put(&slot, ir(1, false));
                 std::thread::sleep(Duration::from_millis(20));
-                slot.put(ir(2, true));
+                put(&slot, ir(2, true));
             })
         };
         assert_eq!(
@@ -501,36 +616,57 @@ mod tests {
         producer.join().expect("producer thread");
     }
 
-    /// Alternates lit and unlit 2x1 frames every 5 ms, like the ASUS IR camera.
-    struct Alternating(bool);
-    impl IrFrameSource for Alternating {
-        fn next_ir(&mut self) -> Result<Option<RawIr>, CameraError> {
-            std::thread::sleep(Duration::from_millis(5));
-            self.0 = !self.0;
-            Ok(Some(RawIr {
-                data: vec![if self.0 { 90 } else { 0 }; 2],
-                width: 2,
-                height: 1,
-                illuminated: self.0,
-            }))
+    fn raw(width: u32, illuminated: bool) -> RawIr {
+        RawIr {
+            data: vec![if illuminated { 90 } else { 0 }; width as usize],
+            width,
+            height: 1,
+            illuminated,
         }
     }
 
-    /// Delivers one lit frame, then blocks forever, like a stalled driver.
-    struct StallsAfterFirst(bool);
+    /// Alternates lit and unlit `width`x1 frames every 5 ms (lit first), like the ASUS IR
+    /// camera. The width tells two fake cameras apart.
+    struct Alternating {
+        lit: bool,
+        width: u32,
+    }
+    impl Alternating {
+        fn new(width: u32) -> Self {
+            Self { lit: false, width }
+        }
+    }
+    impl IrFrameSource for Alternating {
+        fn next_ir(&mut self) -> Result<Option<RawIr>, CameraError> {
+            std::thread::sleep(Duration::from_millis(5));
+            self.lit = !self.lit;
+            Ok(Some(raw(self.width, self.lit)))
+        }
+    }
+
+    /// Delivers one lit `width`x1 frame, then nothing.
+    struct OneLit(Option<u32>);
+    impl IrFrameSource for OneLit {
+        fn next_ir(&mut self) -> Result<Option<RawIr>, CameraError> {
+            match self.0.take() {
+                Some(width) => Ok(Some(raw(width, true))),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Delivers one lit frame, then blocks until `release` like a stalled driver, then
+    /// delivers another.
+    struct StallsAfterFirst {
+        first: bool,
+        release: mpsc::Receiver<()>,
+    }
     impl IrFrameSource for StallsAfterFirst {
         fn next_ir(&mut self) -> Result<Option<RawIr>, CameraError> {
-            if std::mem::replace(&mut self.0, true) {
-                loop {
-                    std::thread::park();
-                }
+            if !std::mem::replace(&mut self.first, false) {
+                let _ = self.release.recv();
             }
-            Ok(Some(RawIr {
-                data: vec![90],
-                width: 1,
-                height: 1,
-                illuminated: true,
-            }))
+            Ok(Some(raw(1, true)))
         }
     }
 
@@ -551,7 +687,7 @@ mod tests {
     #[test]
     fn capture_pairs_lit_frames_with_the_previous_ambient_and_stops_fast() {
         let slot = Arc::new(LatestIrPair::new());
-        let cap = IrCapture::spawn(|| Ok((Alternating(false), "Fake")), Arc::clone(&slot))
+        let cap = IrCapture::spawn(|| Ok((Alternating::new(2), "Fake")), Arc::clone(&slot))
             .expect("start");
         assert_eq!(cap.sharing_mode(), "Fake");
         let mut last = 0;
@@ -576,13 +712,21 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_bounded_when_the_source_stalls() {
+    fn stop_is_bounded_when_the_source_stalls_and_the_detached_thread_cannot_publish() {
+        let (release, rx) = mpsc::channel();
+        let slot = Arc::new(LatestIrPair::new());
         let cap = IrCapture::spawn(
-            || Ok((StallsAfterFirst(false), "Fake")),
-            Arc::new(LatestIrPair::new()),
+            move || {
+                let src = StallsAfterFirst {
+                    first: true,
+                    release: rx,
+                };
+                Ok((src, "Fake"))
+            },
+            Arc::clone(&slot),
         )
         .expect("start");
-        std::thread::sleep(Duration::from_millis(50)); // thread is now parked in next_ir
+        std::thread::sleep(Duration::from_millis(50)); // thread is now blocked in next_ir
         let t0 = Instant::now();
         cap.stop();
         let took = t0.elapsed();
@@ -590,6 +734,59 @@ mod tests {
             took >= STOP_TIMEOUT && took < Duration::from_millis(2500),
             "{took:?}"
         );
+        // The detached thread wakes up with a frame: neither it nor the first one is handed out.
+        release.send(()).expect("thread still waits");
+        assert!(slot.take_newer(0, Duration::from_millis(200)).is_none());
+    }
+
+    #[test]
+    fn a_restarted_capture_follows_the_old_seq_and_never_shows_old_frames() {
+        let slot = Arc::new(LatestIrPair::new());
+        let old = IrCapture::spawn(|| Ok((Alternating::new(1), "Fake")), Arc::clone(&slot))
+            .expect("start");
+        let (seen, _) = slot
+            .take_newer(0, Duration::from_secs(1))
+            .expect("lit frame");
+        std::thread::sleep(Duration::from_millis(30)); // leave unconsumed frames behind
+        old.stop();
+        assert!(
+            slot.take_newer(0, Duration::from_millis(50)).is_none(),
+            "frame of a stopped capture"
+        );
+        let new =
+            IrCapture::spawn(|| Ok((OneLit(Some(2)), "Fake")), Arc::clone(&slot)).expect("restart");
+        // The consumer still holds a seq from the old capture.
+        let (lit, ambient) = slot
+            .take_newer(seen.seq, Duration::from_secs(1))
+            .expect("the new capture's frame");
+        assert_eq!(lit.width, 2);
+        assert!(ambient.is_none(), "old ambient {ambient:?}");
+        new.stop();
+    }
+
+    #[test]
+    fn a_capture_started_on_a_busy_slot_takes_it_over() {
+        let slot = Arc::new(LatestIrPair::new());
+        let old = IrCapture::spawn(|| Ok((Alternating::new(1), "Fake")), Arc::clone(&slot))
+            .expect("start old");
+        let new = IrCapture::spawn(|| Ok((Alternating::new(2), "Fake")), Arc::clone(&slot))
+            .expect("start new");
+        let mut last = 0;
+        for _ in 0..5 {
+            let (lit, ambient) = slot
+                .take_newer(last, Duration::from_secs(1))
+                .expect("lit frame");
+            assert_eq!(lit.width, 2, "{lit:?}");
+            assert!(ambient.as_ref().is_none_or(|a| a.width == 2), "{ambient:?}");
+            last = lit.seq;
+        }
+        // `ir = IrCapture::start(..)?` drops the old capture after the new one started.
+        drop(old);
+        let (lit, _) = slot
+            .take_newer(last, Duration::from_secs(1))
+            .expect("the new capture still delivers");
+        assert_eq!(lit.width, 2);
+        new.stop();
     }
 
     #[test]
