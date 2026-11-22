@@ -789,8 +789,8 @@ mod tests {
         }
     }
 
-    /// Background 20, face 150, nose `nose`: face mean 152.4, ring mean 20, nose ÷ cheeks
-    /// `nose` ÷ 150.
+    /// Background 20, face 150, nose `nose`: face mean 150 + 0.04 · (nose − 150), ring mean 20,
+    /// nose ÷ cheeks `nose` ÷ 150.
     fn lit_face(seq: u64, nose: u8) -> IrFrame {
         let data = (0..W * W)
             .map(|i| match (i % W, i / W) {
@@ -814,7 +814,7 @@ mod tests {
         // steps 0–4 build trust, 5 has a usable ambient frame, 6 a blanked one, 7–9 a flat face
         for i in 0..10u64 {
             let seq = 2 * i + 1;
-            let lit = lit_face(seq, if i >= 7 { 150 } else { 210 });
+            let lit = lit_face(seq, if i >= 7 { 150 } else { 130 });
             let ambient = match i {
                 5 => Some(unlit(seq - 1, 10)),
                 6 => Some(unlit(seq - 1, 0)),
@@ -880,11 +880,11 @@ mod tests {
             (&true.into(), &0.into())
         );
         assert!(
-            close(&c["lit_face"], 152.4) && close(&c["lit_background"], 20.0),
+            close(&c["lit_face"], 149.2) && close(&c["lit_background"], 20.0),
             "{c}"
         );
         assert!(
-            close(&c["face_vs_background"], 7.62) && close(&c["relief"], 1.4),
+            close(&c["face_vs_background"], 7.46) && close(&c["relief"], 130.0 / 150.0),
             "{c}"
         );
         // no ambient frame: these are null, not numbers
@@ -892,7 +892,7 @@ mod tests {
 
         assert_eq!(lines[5]["ir"]["ambient"], "usable");
         let c = &track(5)["cues"];
-        assert!(close(&c["lit_minus_ambient"], 142.4), "{c}");
+        assert!(close(&c["lit_minus_ambient"], 139.2), "{c}");
         assert!(close(&c["ambient_background"], 10.0), "{c}");
         assert_eq!(lines[6]["ir"]["ambient"], "blank");
         assert!(track(6)["cues"]["lit_minus_ambient"].is_null());

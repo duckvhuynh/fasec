@@ -705,7 +705,10 @@ fn cue_rows(c: &IrCues, cfg: &IrLivenessConfig) -> [(&'static str, String, Strin
         (
             "relief",
             num(c.relief),
-            format!("below {}: FlatReflectance", cfg.min_relief),
+            format!(
+                "above {}: FlatReflectance; below {}: unknown",
+                cfg.max_relief, cfg.min_relief
+            ),
         ),
         (
             "lit_face",
@@ -985,6 +988,10 @@ mod tests {
         assert_eq!(value("lit_minus_ambient"), "n/a");
         assert_eq!(value("ambient_background"), "n/a");
         assert_eq!(value("glints"), "1");
-        assert!(rows[2].2.contains("1.15"), "{:?}", rows[2]);
+        assert!(
+            rows[2].2.contains("0.97") && rows[2].2.contains("0.7"),
+            "{:?}",
+            rows[2]
+        );
     }
 }

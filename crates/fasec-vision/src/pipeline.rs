@@ -517,32 +517,31 @@ impl Pipeline {
     }
 }
 
-/// The fusion table. IR only adds evidence: a spoof on either side beats a live on the other,
-/// and since fusion runs per RGB track, IR alone never makes anything `Live`.
+/// The fusion table. Fusion runs per RGB track, so IR alone never makes anything `Live`.
 ///
-/// | IR evidence | RGB            | result           |
-/// |-------------|----------------|------------------|
-/// | Spoof       | any            | Spoof, tier `Ir` |
-/// | Live        | Spoof          | the RGB Spoof    |
-/// | Live        | Live / Unknown | Live, tier `Ir`  |
-/// | Absent      | any            | the RGB verdict  |
+/// | IR evidence | RGB | result           |
+/// |-------------|-----|------------------|
+/// | Spoof       | any | Spoof, tier `Ir` |
+/// | Live        | any | Live, tier `Ir`  |
+/// | Absent      | any | the RGB verdict  |
 ///
-/// IR `Live` with RGB `Unknown` is accepted, the bar Windows Hello holds since CVE-2025-26644
-/// (an NIR face plus an RGB camera that sees the same face): MiniFASNet gives no verdict for a
-/// face as close as the owner at a laptop. Residual risk: a dual-spectrum (visible + NIR) screen
-/// held close enough that RGB is `Unknown`, on hardware without a usable ambient frame.
+/// IR `Live` overrides an RGB `Spoof` (owner decision, Task 7): MiniFASNet calls the owner
+/// `Spoof` on most frames at laptop distance (real-30cm 15 of 22, real-80cm 17 of 17), while
+/// Windows Hello's bar since CVE-2025-26644 is an NIR face plus an RGB camera that sees the same
+/// face. With IR absent (untrusted, stale or unhealthy) the RGB verdict, `Spoof` included, still
+/// decides. Residual risk: a screen that emits the owner's NIR image as well as a visible face,
+/// on hardware without a usable ambient frame (the self-emission cue needs one).
 fn fuse(rgb: &LivenessState, ir: IrEvidence) -> (LivenessState, LivenessTier) {
-    let rgb_tier = match rgb {
-        LivenessState::Live { tier, .. } | LivenessState::Spoof { tier, .. } => *tier,
-        LivenessState::Unknown => LivenessTier::Rgb,
-    };
     let tier = LivenessTier::Ir;
-    match (ir, rgb) {
-        (IrEvidence::Spoof { score, .. }, _) => (LivenessState::Spoof { score, tier }, tier),
-        (IrEvidence::Live { .. }, LivenessState::Spoof { .. }) | (IrEvidence::Absent, _) => {
-            (rgb.clone(), rgb_tier)
-        }
-        (IrEvidence::Live { score }, _) => (LivenessState::Live { score, tier }, tier),
+    match ir {
+        IrEvidence::Spoof { score, .. } => (LivenessState::Spoof { score, tier }, tier),
+        IrEvidence::Live { score } => (LivenessState::Live { score, tier }, tier),
+        IrEvidence::Absent => match rgb {
+            LivenessState::Live { tier, .. } | LivenessState::Spoof { tier, .. } => {
+                (rgb.clone(), *tier)
+            }
+            LivenessState::Unknown => (rgb.clone(), LivenessTier::Rgb),
+        },
     }
 }
 
@@ -1203,8 +1202,11 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum Scene {
-        /// A face near the emitter: bright on a dark background, the nose brighter still.
+        /// A face near the emitter: bright on a dark background, the nose a little darker (relief
+        /// 130 ÷ 150, as recorded on the owner).
         Face,
+        /// A face whose nose is darker than any recorded real face (relief 0.4): no IR verdict.
+        DarkNose,
         /// An evenly bright face-sized patch (printed photo).
         Flat,
         /// Dark background only (what IR sees of a phone replay).
@@ -1220,8 +1222,9 @@ mod tests {
             let face = (0.3..0.7).contains(&u) && (0.3..0.7).contains(&v);
             let nose = (0.46..0.54).contains(&u) && (0.51..0.59).contains(&v);
             match scene {
-                Scene::Face if nose => 210,
-                Scene::Face | Scene::Flat if face => 150,
+                Scene::Face if nose => 130,
+                Scene::DarkNose if nose => 60,
+                Scene::Face | Scene::DarkNose | Scene::Flat if face => 150,
                 Scene::Dim => 10,
                 _ => 20,
             }
@@ -1357,13 +1360,8 @@ mod tests {
         for rgb in &all {
             assert_eq!(fuse(rgb, ir_spoof), (IR_SPOOF, LivenessTier::Ir), "{rgb:?}");
         }
-        // IR live never overrides an RGB spoof
-        assert_eq!(
-            fuse(&rgb_spoof, ir_live),
-            (rgb_spoof.clone(), LivenessTier::Rgb)
-        );
-        // IR live with RGB live or no RGB verdict (too close) is live on the IR tier
-        for rgb in [&RGB_LIVE, &LivenessState::Unknown] {
+        // IR live overrides any RGB verdict: MiniFASNet calls the owner Spoof at a laptop
+        for rgb in &all {
             assert_eq!(fuse(rgb, ir_live), (IR_LIVE, LivenessTier::Ir), "{rgb:?}");
         }
         // no IR evidence: the RGB verdict as today
@@ -1408,19 +1406,33 @@ mod tests {
     }
 
     #[test]
-    fn rgb_live_and_ir_live_is_ir_tier_but_rgb_spoof_wins() {
+    fn ir_live_overrides_rgb_spoof_but_rgb_spoof_decides_without_ir() {
+        let rgb_spoof = LivenessState::Spoof {
+            score: 0.2,
+            tier: LivenessTier::Rgb,
+        };
         let mut r = IrRig::new();
-        assert_eq!(live0(&r.warm()), IR_LIVE);
         *r.live.lock().unwrap() = Ok(0.2);
+        // before trust the RGB spoof stands
+        for k in 0..4 {
+            assert_eq!(live0(&r.lit(Scene::Face)), rgb_spoof, "frame {k}");
+        }
         let out = r.lit(Scene::Face);
+        assert_eq!(live0(&out), IR_LIVE);
+        assert_eq!(out.ir[0].tier, LivenessTier::Ir);
+        // between lit frames the IR evidence still holds
+        assert_eq!(live0(&r.dark()), IR_LIVE);
+        // IR no verdict (a flat-dark nose): the RGB spoof decides again
+        let out = r.lit(Scene::DarkNose);
+        assert_eq!(out.ir[0].evidence, IrEvidence::Absent);
+        assert_eq!(live0(&out), rgb_spoof);
+        // IR unhealthy: the RGB spoof decides
+        r.seq += 1;
+        let out = r.call(Some((r.seq, Scene::Face)), CameraHealth::Lost);
         assert_eq!(
-            live0(&out),
-            LivenessState::Spoof {
-                score: 0.2,
-                tier: LivenessTier::Rgb
-            }
+            (live0(&out), out.ir[0].tier),
+            (rgb_spoof, LivenessTier::Rgb)
         );
-        assert_eq!(out.ir[0].tier, LivenessTier::Rgb);
     }
 
     #[test]

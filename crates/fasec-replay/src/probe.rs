@@ -175,8 +175,8 @@ mod tests {
         }
     }
 
-    /// A lit frame of a face near the emitter: background 20, face 150, nose 210, no glints.
-    /// Face mean 152.4, ring mean 20, nose ÷ cheeks 210 ÷ 150.
+    /// A lit frame of a face near the emitter: background 20, face 150, nose `nose`, no glints.
+    /// With nose 130: face mean 149.2, ring mean 20, nose ÷ cheeks 130 ÷ 150.
     fn lit_face(seq: u64, nose: u8) -> IrFrame {
         let data = (0..W * W)
             .map(|i| match (i % W, i / W) {
@@ -217,13 +217,13 @@ mod tests {
         let t = [track()];
         // the associator needs five consistent single-face pairs before it matches anything
         for seq in 1..5 {
-            let f = p.measure(&lit_face(seq, 210), None, &t).unwrap().unwrap();
+            let f = p.measure(&lit_face(seq, 130), None, &t).unwrap().unwrap();
             assert!(!f.trusted && f.faces.len() == 1);
             assert_eq!(f.tracks[0].cues, None);
             assert_eq!(f.tracks[0].verdict, IrVerdict::Unknown);
         }
         let f = p
-            .measure(&lit_face(5, 210), Some(&unlit(4, 10)), &t)
+            .measure(&lit_face(5, 130), Some(&unlit(4, 10)), &t)
             .unwrap()
             .unwrap();
         assert!(f.trusted);
@@ -235,13 +235,13 @@ mod tests {
         assert!(c.face_present && c.glints == 0, "{c:?}");
         let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
         assert!(
-            close(c.lit_face, 152.4) && close(c.lit_background, 20.0),
+            close(c.lit_face, 149.2) && close(c.lit_background, 20.0),
             "{c:?}"
         );
-        assert!(close(c.lit_minus_ambient, 142.4), "{c:?}");
+        assert!(close(c.lit_minus_ambient, 139.2), "{c:?}");
         assert!(close(c.ambient_background, 10.0), "{c:?}");
-        assert!(close(c.face_vs_background, 142.4 / 10.0), "{c:?}");
-        assert!(close(c.relief, 200.0 / 140.0), "{c:?}");
+        assert!(close(c.face_vs_background, 139.2 / 10.0), "{c:?}");
+        assert!(close(c.relief, 120.0 / 140.0), "{c:?}");
         assert_eq!(tc.verdict, IrVerdict::Live { score: 0.8 });
 
         // a flat face: the same numbers the pipeline would judge FlatReflectance on
@@ -258,7 +258,7 @@ mod tests {
             }
         ));
         let f = p
-            .measure(&lit_face(7, 210), Some(&unlit(6, 0)), &t)
+            .measure(&lit_face(7, 130), Some(&unlit(6, 0)), &t)
             .unwrap()
             .unwrap();
         assert_eq!(f.ambient, Ambient::Blank);
@@ -270,13 +270,13 @@ mod tests {
         let mut p = probe();
         let t = [track()];
         for seq in 1..=5 {
-            p.measure(&lit_face(seq, 210), None, &t).unwrap();
+            p.measure(&lit_face(seq, 130), None, &t).unwrap();
         }
         // not newer: the pipeline ignores it, so the probe does too
-        assert_eq!(p.measure(&lit_face(5, 210), None, &t).unwrap(), None);
-        assert_eq!(p.measure(&lit_face(3, 210), None, &t).unwrap(), None);
+        assert_eq!(p.measure(&lit_face(5, 130), None, &t).unwrap(), None);
+        assert_eq!(p.measure(&lit_face(3, 130), None, &t).unwrap(), None);
         assert!(
-            p.measure(&lit_face(6, 210), None, &t)
+            p.measure(&lit_face(6, 130), None, &t)
                 .unwrap()
                 .unwrap()
                 .trusted
@@ -286,7 +286,7 @@ mod tests {
         assert!(!p.measure(&small, None, &t).unwrap().unwrap().trusted);
         // so does an IR restart, and the seq may then start over
         p.reset();
-        let f = p.measure(&lit_face(1, 210), None, &t).unwrap().unwrap();
+        let f = p.measure(&lit_face(1, 130), None, &t).unwrap().unwrap();
         assert!(!f.trusted);
         // an unlit frame passed as lit is the detector's input error, not "no face"
         assert!(p.measure(&unlit(9, 10), None, &t).is_err());

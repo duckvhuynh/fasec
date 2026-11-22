@@ -1,8 +1,8 @@
 //! IR liveness cues and the per-frame IR verdict.
 //!
 //! Skin close to the Windows Hello emitter reflects its 850 nm light strongly, with 3-D shading
-//! (the nose tip is nearer the emitter than the cheeks) and corneal glints, and it is dark in the
-//! unlit frame. A phone or monitor reflects little of it (no IR face), paper reflects it evenly,
+//! (on the recorded ASUS camera the nose reads 0.81–0.91 of the cheeks, not brighter) and corneal
+//! glints, and it is dark in the unlit frame. A phone or monitor reflects little of it (no IR face), paper reflects it evenly,
 //! and an NIR-emitting screen is as bright unlit as lit. Every cue is a ratio, so absolute
 //! brightness (sunlight) never makes a face live.
 
@@ -58,7 +58,8 @@ pub struct IrCues {
 pub enum IrSpoofReason {
     /// An RGB face with no IR face where the mapping puts it (phone or monitor replay).
     NoIrFace,
-    /// An IR face without the shading of a face near the emitter (printed photo).
+    /// An IR face flatter than any recorded real face (meant for a printed photo; not verified
+    /// against one, as none was recorded).
     FlatReflectance,
     /// The face is about as bright unlit as lit (NIR-emitting screen).
     SelfEmitting,
@@ -81,8 +82,10 @@ pub struct IrLivenessConfig {
     /// Live needs `face_vs_background` at least this; below it the emitter contrast is too weak
     /// to judge (`Unknown`).
     pub min_face_vs_background: f32,
-    /// Live needs `relief` at least this; below it the face is flat (`FlatReflectance`).
+    /// Live needs `relief` in `min_relief..=max_relief`. Below it the nose is darker than on any
+    /// recorded real face (`Unknown`); above it the face is flatter than any (`FlatReflectance`).
     pub min_relief: f32,
+    pub max_relief: f32,
     /// A lit background ring brighter than this means the scene is flooded with ambient IR and
     /// the emitter contrast is lost (`Unknown`).
     pub max_background: f32,
@@ -99,19 +102,25 @@ pub struct IrLivenessConfig {
 
 impl Default for IrLivenessConfig {
     fn default() -> Self {
+        // Measured on the owner's recordings (Task 7, ASUS IR camera 640×360, trusted frames of
+        // a real face at 30, 50 and 80 cm and turning; docs/spikes/SP-7-ir.md). No printed photo
+        // or monitor was recorded, and the unlit frame was blank on every frame.
         IrLivenessConfig {
+            // 3 consecutive lit frames ≈ 1.4 s at the recorded ~2.2 lit frames/s
             spoof_frames: 3,
-            // placeholder until Task 7
+            // real min 1.72 (80 cm; median 2.35 at 30 cm): margin 0.22
             min_face_vs_background: 1.5,
-            // placeholder until Task 7
-            min_relief: 1.15,
-            // placeholder until Task 7
+            // real 0.81–0.91: on this camera the nose reads darker than the cheeks
+            min_relief: 0.70,
+            // real max 0.91; a flat print should read ≈ 1.0 (unverified: no printer)
+            max_relief: 0.97,
+            // real lit_background max 76 (80 cm): margin 24
             max_background: 100.0,
-            // placeholder until Task 7
+            // not measurable: no usable ambient frame was recorded; placeholder
             min_emitter_fraction: 0.5,
-            // placeholder until Task 7
+            // not measurable: no usable ambient frame was recorded; placeholder
             self_emit_contrast: 2.0,
-            // placeholder until Task 7
+            // real lit_face min 109 (30 cm): far above the noise floor
             min_lit_face: 20.0,
         }
     }
@@ -155,8 +164,11 @@ pub fn judge(cues: &IrCues, cfg: &IrLivenessConfig) -> IrVerdict {
     if cues.face_vs_background < cfg.min_face_vs_background {
         return IrVerdict::Unknown;
     }
-    if cues.relief < cfg.min_relief {
+    if cues.relief > cfg.max_relief {
         return spoof(IrSpoofReason::FlatReflectance);
+    }
+    if cues.relief < cfg.min_relief {
+        return IrVerdict::Unknown;
     }
     IrVerdict::Live {
         score: LIVE_SCORE + GLINT_BONUS * f32::from(cues.glints.min(2)),
@@ -474,26 +486,67 @@ mod tests {
 
     #[test]
     fn real_face_near_emitter_is_live() {
-        let lit = frame(true, real_face(20, 150, 210, true));
+        let lit = frame(true, real_face(20, 150, 130, true));
         for ambient in [None, Some(blank_ambient())] {
             let (c, v) = matched(&lit, ambient.as_ref());
             assert!(c.face_present && c.lit_minus_ambient.is_nan(), "{c:?}");
-            assert!(c.face_vs_background > 5.0 && (c.relief - 1.4).abs() < 1e-3);
+            assert!(c.face_vs_background > 5.0 && (c.relief - 130.0 / 150.0).abs() < 1e-3);
             assert_eq!(c.glints, 2);
             assert_eq!(v, IrVerdict::Live { score: 1.0 }, "{c:?}");
         }
         // a dim but real ambient frame: lit − ambient is evidence and the ratios use it
         let amb = frame(false, |_, _| 10);
         let (c, v) = matched(&lit, Some(&amb));
-        let face_mean = (1600.0 * 150.0 + 64.0 * 60.0 + 2.0 * 105.0) / 1600.0 - 10.0;
+        let face_mean = (1600.0 * 150.0 - 64.0 * 20.0 + 2.0 * 105.0) / 1600.0 - 10.0;
         assert!((c.lit_minus_ambient - face_mean).abs() < 1e-3, "{c:?}");
-        assert!((c.relief - 200.0 / 140.0).abs() < 1e-3, "{c:?}");
+        assert!((c.relief - 120.0 / 140.0).abs() < 1e-3, "{c:?}");
         assert!(matches!(v, IrVerdict::Live { .. }), "{c:?}");
+    }
+
+    /// The owner's recorded real faces (Task 7, trusted frames at 30, 50 and 80 cm and turning):
+    /// face_vs_background 1.72–2.61, relief 0.81–0.91, lit_face 109–137, lit_background 46–76.
+    #[test]
+    fn recorded_real_face_extremes_are_live() {
+        let cfg = IrLivenessConfig::default();
+        let (base, _) = matched(&frame(true, real_face(20, 150, 130, false)), None);
+        for (fvb, relief, lit_face, lit_bg) in [
+            (1.72, 0.81, 128.0, 76.0),
+            (2.61, 0.91, 109.0, 46.0),
+            (2.07, 0.83, 137.0, 62.0),
+        ] {
+            let c = IrCues {
+                face_vs_background: fvb,
+                relief,
+                lit_face,
+                lit_background: lit_bg,
+                ..base
+            };
+            assert_eq!(judge(&c, &cfg), IrVerdict::Live { score: 0.8 }, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn relief_outside_the_real_face_window() {
+        let cfg = IrLivenessConfig::default();
+        let (live, _) = matched(&frame(true, real_face(20, 150, 130, false)), None);
+        let at = |relief: f32| judge(&IrCues { relief, ..live }, &cfg);
+        // the window's edges are live
+        for r in [0.70, 0.97] {
+            assert_eq!(at(r), IrVerdict::Live { score: 0.8 }, "{r}");
+        }
+        // flatter than any recorded real face: a print or a screen (unverified against prints)
+        for r in [0.971, 1.0, 1.4] {
+            assert_eq!(reason(at(r)), Some(IrSpoofReason::FlatReflectance), "{r}");
+        }
+        // a darker nose than any recorded real face: no verdict
+        for r in [0.0, 0.69] {
+            assert_eq!(at(r), IrVerdict::Unknown, "{r}");
+        }
     }
 
     #[test]
     fn glints_are_a_bonus_only() {
-        let (c, v) = matched(&frame(true, real_face(20, 150, 210, false)), None);
+        let (c, v) = matched(&frame(true, real_face(20, 150, 130, false)), None);
         assert_eq!(c.glints, 0);
         assert_eq!(v, IrVerdict::Live { score: 0.8 });
         // glints do not rescue a flat patch
@@ -508,7 +561,7 @@ mod tests {
         let (c, _) = matched(&frame(true, real_face(20, 250, 250, false)), None);
         assert_eq!(c.glints, 0);
         // a spot just as bright unlit is not the emitter's reflection
-        let lit = frame(true, real_face(20, 150, 210, true));
+        let lit = frame(true, real_face(20, 150, 130, true));
         let amb = frame(false, |x, y| if is_eye(x, y) { 250 } else { 10 });
         assert_eq!(matched(&lit, Some(&amb)).0.glints, 0);
         let amb = frame(false, |_, _| 10);
@@ -550,13 +603,18 @@ mod tests {
     #[test]
     fn self_emitting_screen_is_spoof() {
         // as bright unlit as lit: the screen emits NIR itself
-        let lit = frame(true, real_face(20, 150, 210, true));
+        let lit = frame(true, real_face(20, 150, 130, true));
         let amb = frame(false, |x, y| {
-            (f32::from(real_face(20, 150, 210, true)(x, y)) * 0.9) as u8
+            (f32::from(real_face(20, 150, 130, true)(x, y)) * 0.9) as u8
         });
         let (c, v) = matched(&lit, Some(&amb));
+        let cfg = IrLivenessConfig::default();
         // the ratios on lit − ambient alone would look live
-        assert!(c.face_vs_background > 1.5 && c.relief > 1.15, "{c:?}");
+        assert!(
+            c.face_vs_background >= cfg.min_face_vs_background
+                && (cfg.min_relief..=cfg.max_relief).contains(&c.relief),
+            "{c:?}"
+        );
         assert_eq!(reason(v), Some(IrSpoofReason::SelfEmitting), "{c:?}");
     }
 
@@ -566,10 +624,11 @@ mod tests {
         // much brighter than the background, yet shaded like a face
         let cfg = IrLivenessConfig::default();
         for ambient in [None, Some(blank_ambient())] {
-            let lit = frame(true, real_face(130, 200, 250, true));
+            let lit = frame(true, real_face(130, 200, 170, true));
             let (c, v) = matched(&lit, ambient.as_ref());
             assert!(
-                c.face_vs_background >= cfg.min_face_vs_background && c.relief >= cfg.min_relief,
+                c.face_vs_background >= cfg.min_face_vs_background
+                    && (cfg.min_relief..=cfg.max_relief).contains(&c.relief),
                 "{c:?}"
             );
             assert_eq!(v, IrVerdict::Unknown, "{c:?}");
@@ -715,14 +774,15 @@ mod tests {
     #[test]
     fn near_black_noise_is_unknown() {
         // 0–4 grey levels: the ratios alone would read a shaded face
-        let lit = frame(true, |x, y| match real_face(9, 3, 4, false)(x, y) {
+        let lit = frame(true, |x, y| match real_face(9, 4, 3, false)(x, y) {
             9 => ((x * 7 + y * 3) % 2) as u8,
             v => v,
         });
         let (c, v) = matched(&lit, None);
         let cfg = IrLivenessConfig::default();
         assert!(
-            c.face_vs_background >= cfg.min_face_vs_background && c.relief >= cfg.min_relief,
+            c.face_vs_background >= cfg.min_face_vs_background
+                && (cfg.min_relief..=cfg.max_relief).contains(&c.relief),
             "{c:?}"
         );
         assert_eq!(v, IrVerdict::Unknown, "{c:?}");
@@ -754,7 +814,7 @@ mod tests {
 
     #[test]
     fn trusted_mapping_with_a_matched_ir_face_is_live() {
-        let lit = frame(true, real_face(20, 150, 210, true));
+        let lit = frame(true, real_face(20, 150, 130, true));
         let d = det(FACE);
         let c = ir_cues(&lit, None, &trusted_identity(), FACE, &[d], Some(&d)).unwrap();
         assert!(c.face_present, "{c:?}");
@@ -766,7 +826,7 @@ mod tests {
 
     #[test]
     fn non_finite_cues_are_unknown() {
-        let (live, v) = matched(&frame(true, real_face(20, 150, 210, true)), None);
+        let (live, v) = matched(&frame(true, real_face(20, 150, 130, true)), None);
         assert!(matches!(v, IrVerdict::Live { .. }));
         let cfg = IrLivenessConfig::default();
         for f in [
