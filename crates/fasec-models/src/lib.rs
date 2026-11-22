@@ -26,4 +26,6 @@ pub enum ModelError {
     },
     #[error("download failed: {0}")]
     Download(String),
+    #[error("model `{id}` has the wrong size: {reason}")]
+    Size { id: String, reason: String },
 }

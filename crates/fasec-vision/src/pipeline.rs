@@ -870,13 +870,24 @@ mod tests {
     #[test]
     fn from_models_hash_mismatch_names_model() {
         let dir = temp_models("mismatch");
+        let size = Manifest::embedded().get("yunet-2023mar").unwrap().size;
+        // The manifest size, so the hash (not the size check) rejects it.
+        let junk = vec![0u8; usize::try_from(size.unwrap()).unwrap()];
+        std::fs::write(dir.join("face_detection_yunet_2023mar.onnx"), junk).unwrap();
+        let e = from_models_err(&dir);
+        assert!(e.contains("yunet-2023mar") && e.contains("mismatch"), "{e}");
+    }
+
+    #[test]
+    fn from_models_wrong_size_names_model() {
+        let dir = temp_models("wrong_size");
         std::fs::write(
             dir.join("face_detection_yunet_2023mar.onnx"),
             b"not a model",
         )
         .unwrap();
         let e = from_models_err(&dir);
-        assert!(e.contains("yunet-2023mar") && e.contains("mismatch"), "{e}");
+        assert!(e.contains("yunet-2023mar") && e.contains("size"), "{e}");
     }
 
     #[test]
