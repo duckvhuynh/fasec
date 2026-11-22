@@ -1,4 +1,4 @@
-//! One frame in, one [`VisionReport`] out: detect + track every frame, attention every frame,
+//! One frame in, one [`ProcessOutput`] out: detect + track every frame, attention every frame,
 //! embedding and liveness on a per-track schedule (SRS §3.3).
 
 use std::collections::HashMap;
@@ -6,10 +6,11 @@ use std::path::Path;
 use std::time::Instant;
 
 use fasec_core::{
-    CameraHealth, Frame, IdentityState, LivenessState, PointF, RectF, StageTimings, TrackId,
-    TrackObs, VisionReport,
+    CameraHealth, Frame, IdentityState, LivenessState, PointF, RectF, StageTimings, TrackEmbedding,
+    TrackId, TrackObs, VisionReport,
 };
-use fasec_models::Manifest;
+use fasec_models::{Manifest, VerifiedModel};
+use zeroize::Zeroize;
 
 use crate::attention::{CoarsePose, face_width_px};
 use crate::liveness::MiniFasNet;
@@ -52,6 +53,15 @@ impl Default for PipelineConfig {
     }
 }
 
+/// One processed frame. Embeddings are biometric templates, so they travel beside the
+/// serialisable report, never inside it (NFR-PRIV-003).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessOutput {
+    pub report: VisionReport,
+    /// Only the embeddings computed on this frame (none carried over), so each is seen once.
+    pub embeddings: Vec<TrackEmbedding>,
+}
+
 /// Detector, tracker and per-track stages, plus each track's carried results.
 pub struct Pipeline {
     det: Box<dyn FaceDetector>,
@@ -68,7 +78,6 @@ pub struct Pipeline {
 /// What a track carries between scheduled runs.
 struct TrackState {
     last_seen_ms: u64,
-    embedding: Option<Vec<f32>>,
     /// `ts_ms` and box of the last successful embed.
     embedded_at: Option<(u64, RectF)>,
     liveness: LivenessState,
@@ -97,21 +106,19 @@ impl Pipeline {
     }
 
     /// YuNet (640 px long side) + SFace + MiniFASNet + CoarsePose from `models_dir`. Every
-    /// file is SHA-256 verified against `models_dir/manifest.toml` before any session is
-    /// created; a missing or mismatched file is an error naming the model id.
+    /// file is read once and SHA-256 verified against the manifest embedded in the binary
+    /// (`models_dir/manifest.toml` is ignored) before any session is created, and sessions are
+    /// built from those verified bytes; a missing or mismatched file is an error naming the id.
     pub fn from_models(
         rt: &Runtime,
         models_dir: &Path,
         cfg: PipelineConfig,
     ) -> Result<Pipeline, VisionError> {
-        let manifest = Manifest::load(models_dir.join("manifest.toml"))
-            .map_err(|e| VisionError::Model(format!("models manifest: {e}")))?;
+        let manifest = Manifest::embedded();
         let verified = |id: &str| {
             let bad = |e: &dyn std::fmt::Display| VisionError::Model(format!("{id}: {e}"));
             let entry = manifest.get(id).ok_or_else(|| bad(&"not in manifest"))?;
-            let path = fasec_models::model_path(models_dir, entry).map_err(|e| bad(&e))?;
-            fasec_models::verify_file(&path, &entry.sha256).map_err(|e| bad(&e))?;
-            Ok::<_, VisionError>(path)
+            VerifiedModel::load(models_dir, entry).map_err(|e| bad(&e))
         };
         // All four verified before the first session is created.
         let yunet = verified("yunet-2023mar")?;
@@ -134,7 +141,7 @@ impl Pipeline {
         &mut self,
         frame: &Frame,
         health: CameraHealth,
-    ) -> Result<VisionReport, VisionError> {
+    ) -> Result<ProcessOutput, VisionError> {
         crate::image_ops::check_frame(frame)?;
         let mut timings = StageTimings {
             detect_ms: 0.0,
@@ -142,17 +149,20 @@ impl Pipeline {
             liveness_ms: 0.0,
             pose_ms: 0.0,
         };
-        let mut report = VisionReport {
-            seq: frame.seq,
-            ts_ms: frame.ts_ms,
-            tracks: Vec::new(),
-            camera_health: health,
-            liveness_tier: self.live.tier(),
-            timings,
+        let mut out = ProcessOutput {
+            report: VisionReport {
+                seq: frame.seq,
+                ts_ms: frame.ts_ms,
+                tracks: Vec::new(),
+                camera_health: health,
+                liveness_tier: self.live.tier(),
+                timings,
+            },
+            embeddings: Vec::new(),
         };
-        if report.camera_health != CameraHealth::Ok {
+        if out.report.camera_health != CameraHealth::Ok {
             self.active = false;
-            return Ok(report);
+            return Ok(out);
         }
 
         let t0 = Instant::now();
@@ -184,7 +194,6 @@ impl Pipeline {
             let d = &t.det;
             let st = self.tracks.entry(t.id).or_insert_with(|| TrackState {
                 last_seen_ms: now,
-                embedding: None,
                 embedded_at: None,
                 liveness: LivenessState::Unknown,
                 scored_at: None,
@@ -202,21 +211,25 @@ impl Pipeline {
 
             if due(st.embedded_at, cfg.recog_interval_ms) {
                 let t0 = Instant::now();
-                let res = self.emb.embed(frame, d).and_then(|e| {
+                let res = self.emb.embed(frame, d).and_then(|mut e| {
                     if e.iter().all(|v| v.is_finite()) {
                         Ok(e)
                     } else {
+                        e.zeroize();
                         Err(VisionError::Model("non-finite embedding".into()))
                     }
                 });
                 match res {
                     Ok(e) => {
-                        st.embedding = Some(e);
+                        out.embeddings.push(TrackEmbedding {
+                            track: t.id,
+                            ts_ms: now,
+                            embedding: e.into(),
+                        });
                         st.embedded_at = Some((now, d.bbox));
                     }
                     Err(e) => {
                         tracing::warn!(track = t.id.0, error = %e, "embedding failed");
-                        st.embedding = None;
                         st.embedded_at = None;
                     }
                 }
@@ -262,7 +275,7 @@ impl Pipeline {
                 .ok();
             timings.pose_ms += ms(t0);
 
-            report.tracks.push(TrackObs {
+            out.report.tracks.push(TrackObs {
                 id: t.id,
                 bbox: d.bbox.clamp_unit(),
                 landmarks5: d.landmarks5.map(|p| PointF {
@@ -275,13 +288,12 @@ impl Pipeline {
                 head_pose,
                 face_width_px: face_width_px(d, frame),
                 age_ms: t.age_ms,
-                embedding: st.embedding.clone(),
             });
         }
 
-        report.timings = timings;
-        self.active = !report.tracks.is_empty();
-        Ok(report)
+        out.report.timings = timings;
+        self.active = !out.report.tracks.is_empty();
+        Ok(out)
     }
 
     /// Frame interval to ask the camera for: the idle rate while the last report had no tracks.
@@ -412,6 +424,10 @@ mod tests {
         }
 
         fn run(&mut self, ts_ms: u64) -> VisionReport {
+            self.run_out(ts_ms).report
+        }
+
+        fn run_out(&mut self, ts_ms: u64) -> ProcessOutput {
             self.p.process(&frame(ts_ms), CameraHealth::Ok).unwrap()
         }
     }
@@ -444,7 +460,6 @@ mod tests {
         assert_eq!(r.tracks.len(), 1);
         let t = &r.tracks[0];
         assert_eq!(t.identity, IdentityState::Pending);
-        assert_eq!(t.embedding.as_deref(), Some(&[0.3f32; 4][..]));
         assert_eq!(
             t.liveness,
             LivenessState::Live {
@@ -461,9 +476,33 @@ mod tests {
         assert_eq!(h.calls.get(), [2, 1, 1, 2]);
         let t2 = &r2.tracks[0];
         assert_eq!(t2.id, t.id);
-        assert_eq!(t2.embedding, t.embedding);
         assert_eq!(t2.liveness, t.liveness);
         assert_eq!(t2.age_ms, 33);
+    }
+
+    #[test]
+    fn process_returns_embeddings_only_when_computed() {
+        let mut h = Harness::new();
+        h.set(Some(vec![face()]));
+        let out = h.run_out(0);
+        let id = out.report.tracks[0].id;
+        assert_eq!(
+            out.embeddings,
+            [TrackEmbedding {
+                track: id,
+                ts_ms: 0,
+                embedding: vec![0.3f32; 4].into(),
+            }]
+        );
+        // Within the interval: nothing computed, nothing carried over.
+        assert!(h.run_out(33).embeddings.is_empty());
+        assert!(h.run_out(999).embeddings.is_empty());
+        let out = h.run_out(1000);
+        assert_eq!(out.embeddings.len(), 1);
+        assert_eq!(
+            (out.embeddings[0].track, out.embeddings[0].ts_ms),
+            (id, 1000)
+        );
     }
 
     #[test]
@@ -488,10 +527,10 @@ mod tests {
         assert_eq!(h.calls.get()[1..3], [1, 1]);
         // jump: IoU 0.43 vs the recognised box (< 0.5), still the same track (>= 0.3)
         h.set(Some(vec![det(0.38, 0.3, 0.2, 0.9)]));
-        let r = h.run(66);
-        assert_eq!(r.tracks[0].id, id);
+        let out = h.run_out(66);
+        assert_eq!(out.report.tracks[0].id, id);
         assert_eq!(h.calls.get()[1..3], [2, 2]);
-        assert_eq!(r.tracks[0].embedding.as_deref(), Some(&[0.38f32; 4][..]));
+        assert_eq!(out.embeddings[0].embedding.as_slice(), &[0.38f32; 4][..]);
     }
 
     #[test]
@@ -499,7 +538,9 @@ mod tests {
         let mut h = Harness::new();
         h.set(Some(vec![face()]));
         h.run(0);
-        let r = h.p.process(&frame(33), CameraHealth::Covered).unwrap();
+        let out = h.p.process(&frame(33), CameraHealth::Covered).unwrap();
+        assert!(out.embeddings.is_empty());
+        let r = out.report;
         assert!(r.tracks.is_empty());
         assert_eq!(r.camera_health, CameraHealth::Covered);
         assert_eq!(r.ts_ms, 33);
@@ -514,11 +555,11 @@ mod tests {
         }
         assert_eq!(h.p.desired_interval_ms(), 200);
         h.set(Some(vec![face()]));
-        let r = h.run(4000);
+        let out = h.run_out(4000);
         assert_eq!(h.p.desired_interval_ms(), 66);
-        assert_eq!(r.tracks.len(), 1);
-        assert!(r.tracks[0].embedding.is_some());
-        assert_ne!(r.tracks[0].liveness, LivenessState::Unknown);
+        assert_eq!(out.report.tracks.len(), 1);
+        assert_eq!(out.embeddings.len(), 1);
+        assert_ne!(out.report.tracks[0].liveness, LivenessState::Unknown);
         assert_eq!(h.calls.get(), [21, 1, 1, 1]);
         // face gone again: back to idle
         h.set(Some(Vec::new()));
@@ -552,7 +593,8 @@ mod tests {
                 &Frame::new(7, 1234, 64, 48, vec![0; 64 * 48 * 3]).unwrap(),
                 CameraHealth::Ok,
             )
-            .unwrap();
+            .unwrap()
+            .report;
         assert_eq!((r.seq, r.ts_ms), (7, 1234));
         assert_eq!(r.camera_health, CameraHealth::Ok);
     }
@@ -582,10 +624,11 @@ mod tests {
         let mut h = Harness::new();
         // second face is too narrow for the mock embedder
         h.set(Some(vec![face(), det(0.7, 0.1, 0.04, 0.9)]));
-        let r = h.run(0);
+        let out = h.run_out(0);
+        let r = &out.report;
         assert_eq!(r.tracks.len(), 2);
-        assert!(r.tracks[0].embedding.is_some());
-        assert_eq!(r.tracks[1].embedding, None);
+        let embedded: Vec<_> = out.embeddings.iter().map(|e| e.track).collect();
+        assert_eq!(embedded, [r.tracks[0].id]);
         assert_ne!(r.tracks[1].liveness, LivenessState::Unknown);
         // the failed embed is retried on the next frame
         h.run(33);
@@ -629,11 +672,11 @@ mod tests {
         let mut d = det(-0.2, 0.3, 0.3, 0.9);
         d.landmarks5[0] = PointF { x: -0.1, y: 1.2 };
         h.set(Some(vec![d]));
-        let r = h.run(0);
-        let t = &r.tracks[0];
+        let out = h.run_out(0);
+        let t = &out.report.tracks[0];
         assert_eq!(t.liveness, LivenessState::Unknown);
         assert_eq!(h.calls.get()[2], 0);
-        assert!(t.embedding.is_some());
+        assert_eq!(out.embeddings.len(), 1);
         let b = t.bbox;
         assert!(b.x == 0.0 && (b.w - 0.1).abs() < 1e-6, "{b:?}");
         assert_eq!(t.landmarks5[0], PointF { x: 0.0, y: 1.0 });
@@ -693,8 +736,19 @@ mod tests {
     fn step(p: &mut Pipeline, ts: u64) -> TrackObs {
         p.process(&frame(ts), CameraHealth::Ok)
             .unwrap()
+            .report
             .tracks
             .remove(0)
+    }
+
+    /// The embeddings computed on the frame at `ts`.
+    fn step_embeddings(p: &mut Pipeline, ts: u64) -> Vec<Vec<f32>> {
+        p.process(&frame(ts), CameraHealth::Ok)
+            .unwrap()
+            .embeddings
+            .iter()
+            .map(|e| e.embedding.as_slice().to_vec())
+            .collect()
     }
 
     #[test]
@@ -749,11 +803,13 @@ mod tests {
     }
 
     #[test]
-    fn embed_error_drops_previous_embedding() {
+    fn embed_error_yields_no_embedding_and_retries() {
         let (mut p, _, ctl) = ctl_harness();
-        assert!(step(&mut p, 0).embedding.is_some());
+        assert_eq!(step_embeddings(&mut p, 0).len(), 1);
         *ctl.emb.lock().unwrap() = Err(());
-        assert_eq!(step(&mut p, 1000).embedding, None);
+        assert!(step_embeddings(&mut p, 1000).is_empty());
+        *ctl.emb.lock().unwrap() = Ok(vec![2.0; 4]);
+        assert_eq!(step_embeddings(&mut p, 1033), [vec![2.0; 4]]);
     }
 
     #[test]
@@ -777,15 +833,13 @@ mod tests {
     }
 
     #[test]
-    fn backwards_timestamp_does_not_keep_stale_embedding() {
+    fn backwards_timestamp_reembeds_immediately() {
         let (mut p, _, ctl) = ctl_harness();
-        assert_eq!(step(&mut p, 10_000).embedding, Some(vec![1.0; 4]));
+        assert_eq!(step_embeddings(&mut p, 10_000), [vec![1.0; 4]]);
         *ctl.emb.lock().unwrap() = Ok(vec![2.0; 4]);
-        let mut last = step(&mut p, 0);
-        for ts in (100..=1100).step_by(100) {
-            last = step(&mut p, ts);
-        }
-        assert_eq!(last.embedding, Some(vec![2.0; 4]));
+        // Camera restarts at ts 0: the old timeline's schedule does not suppress the embed.
+        assert_eq!(step_embeddings(&mut p, 0), [vec![2.0; 4]]);
+        assert!(step_embeddings(&mut p, 100).is_empty());
     }
 
     #[test]
@@ -799,7 +853,7 @@ mod tests {
     fn non_finite_embedding_is_dropped() {
         let (mut p, _, ctl) = ctl_harness();
         *ctl.emb.lock().unwrap() = Ok(vec![1.0, f32::NAN, 0.0, 0.0]);
-        assert_eq!(step(&mut p, 0).embedding, None);
+        assert!(step_embeddings(&mut p, 0).is_empty());
     }
 
     #[test]
@@ -852,11 +906,6 @@ mod tests {
             std::env::temp_dir().join(format!("fasec-pipeline-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(
-            models_dir().join("manifest.toml"),
-            dir.join("manifest.toml"),
-        )
-        .unwrap();
         dir
     }
 
@@ -877,13 +926,69 @@ mod tests {
     #[test]
     fn from_models_hash_mismatch_names_model() {
         let dir = temp_models("mismatch");
+        let size = Manifest::embedded().get("yunet-2023mar").unwrap().size;
+        // The manifest size, so the hash (not the size check) rejects it.
+        let junk = vec![0u8; usize::try_from(size.unwrap()).unwrap()];
+        std::fs::write(dir.join("face_detection_yunet_2023mar.onnx"), junk).unwrap();
+        let e = from_models_err(&dir);
+        assert!(e.contains("yunet-2023mar") && e.contains("mismatch"), "{e}");
+    }
+
+    #[test]
+    fn from_models_wrong_size_names_model() {
+        let dir = temp_models("wrong_size");
         std::fs::write(
             dir.join("face_detection_yunet_2023mar.onnx"),
             b"not a model",
         )
         .unwrap();
         let e = from_models_err(&dir);
-        assert!(e.contains("yunet-2023mar") && e.contains("mismatch"), "{e}");
+        assert!(e.contains("yunet-2023mar") && e.contains("size"), "{e}");
+    }
+
+    #[test]
+    #[ignore = "needs models: run `cargo run -p fasec-models --example fetch`"]
+    fn pipeline_ignores_on_disk_manifest() {
+        let dir = temp_models("tampered_manifest");
+        let ids = [
+            "yunet-2023mar",
+            "sface-2021dec",
+            "minifasnet-v2",
+            "minifasnet-v1se",
+        ];
+        for id in ids {
+            let entry = Manifest::embedded().get(id).unwrap();
+            let name = fasec_models::model_path(Path::new(""), entry).unwrap();
+            std::fs::copy(models_dir().join(&name), dir.join(&name)).unwrap();
+        }
+        // An on-disk manifest that would reject every real file (and could bless swapped ones).
+        let tampered = std::fs::read_to_string(models_dir().join("manifest.toml"))
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.starts_with("sha256 = \"") && l.len() > 12 {
+                    format!("sha256 = \"{}\"", "0".repeat(64))
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("manifest.toml"), tampered).unwrap();
+        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
+        Pipeline::from_models(&rt, &dir, PipelineConfig::default()).unwrap();
+
+        // A tampered model file is still rejected, naming its id.
+        let v1se = Manifest::embedded().get("minifasnet-v1se").unwrap();
+        let path = fasec_models::model_path(&dir, v1se).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let e = from_models_err(&dir);
+        assert!(
+            e.contains("minifasnet-v1se") && e.contains("mismatch"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -895,12 +1000,15 @@ mod tests {
         let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
         let mut pipe =
             Pipeline::from_models(&rt, &models_dir(), PipelineConfig::default()).unwrap();
-        let r = pipe.process(&frame, CameraHealth::Ok).unwrap();
+        let out = pipe.process(&frame, CameraHealth::Ok).unwrap();
+        let r = &out.report;
         println!("{:?}", r.timings);
         assert_eq!(r.tracks.len(), 1, "{:?}", r.tracks);
         let t = &r.tracks[0];
         println!("liveness {:?}, pose {:?}", t.liveness, t.head_pose);
-        assert_eq!(t.embedding.as_ref().map(Vec::len), Some(128));
+        assert_eq!(out.embeddings.len(), 1);
+        let e = &out.embeddings[0];
+        assert_eq!((e.track, e.embedding.dim()), (t.id, 128));
         assert_ne!(t.liveness, LivenessState::Unknown);
         assert!(t.head_pose.is_some());
         assert!(t.face_width_px > 0.0);

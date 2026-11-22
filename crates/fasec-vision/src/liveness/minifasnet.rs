@@ -5,9 +5,8 @@
 //! bilinear resize to 80×80, BGR float 0..255 NCHW (the repo's own `ToTensor` does not divide by
 //! 255), softmax; the two softmaxes are summed and `live = sum[1] / 2`.
 
-use std::path::Path;
-
 use fasec_core::{Frame, LivenessTier};
+use fasec_models::VerifiedModel;
 use ort::session::Session;
 use ort::value::TensorRef;
 
@@ -29,10 +28,10 @@ struct Stage {
 }
 
 impl Stage {
-    fn new(rt: &Runtime, model: &Path, scale: f32) -> Result<Stage, VisionError> {
+    fn new(rt: &Runtime, model: &VerifiedModel, scale: f32) -> Result<Stage, VisionError> {
         let session = rt.stage_session(model)?;
         let s: &Session = session.session();
-        let bad = |why: &str| VisionError::Model(format!("{}: {why}", model.display()));
+        let bad = |why: &str| VisionError::Model(format!("{}: {why}", model.id()));
         let ([input], [output]) = (s.inputs(), s.outputs()) else {
             return Err(bad("expected one input and one output"));
         };
@@ -41,7 +40,7 @@ impl Stage {
             Some(&[b, 3, 80, 80]) if b == 1 || b == -1 => {}
             other => return Err(bad(&format!("unsupported input shape {other:?}"))),
         }
-        tracing::info!(ep = session.ep(), model = %model.display(), "MiniFASNet loaded");
+        tracing::info!(ep = session.ep(), model = model.id(), "MiniFASNet loaded");
         Ok(Stage {
             input: input.name().to_string(),
             output: output.name().to_string(),
@@ -75,9 +74,12 @@ pub struct MiniFasNet {
 }
 
 impl MiniFasNet {
-    /// `v2` = `minifasnet-v2` (crop scale 2.7), `v1se` = `minifasnet-v1se` (crop scale 4.0); both
-    /// must be SHA-256 verified by the caller (`fasec_models::verify_file`).
-    pub fn new(rt: &Runtime, v2: &Path, v1se: &Path) -> Result<MiniFasNet, VisionError> {
+    /// `v2` = `minifasnet-v2` (crop scale 2.7), `v1se` = `minifasnet-v1se` (crop scale 4.0).
+    pub fn new(
+        rt: &Runtime,
+        v2: &VerifiedModel,
+        v1se: &VerifiedModel,
+    ) -> Result<MiniFasNet, VisionError> {
         Ok(MiniFasNet {
             v2: Stage::new(rt, v2, 2.7)?,
             v1se: Stage::new(rt, v1se, 4.0)?,
@@ -198,7 +200,7 @@ fn crop_upstream(frame: &Frame, bbox_px: [f32; 4], scale: f32, out: u32) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::Path;
     use std::time::Instant;
 
     use fasec_config::ExecutionProvider;
@@ -206,7 +208,7 @@ mod tests {
     use image::RgbImage;
 
     use super::*;
-    use crate::runtime::tests::verified_yunet;
+    use crate::runtime::tests::{verified, verified_yunet};
     use crate::{FaceDetector, YuNet, YuNetConfig};
 
     fn frame(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Frame {
@@ -254,12 +256,6 @@ mod tests {
                 .chunks(3)
                 .all(|p| p == [5, 6, 7])
         );
-    }
-
-    fn verified(id: &str) -> PathBuf {
-        let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-        let manifest = fasec_models::Manifest::load(models.join("manifest.toml")).unwrap();
-        fasec_models::ensure(&models, manifest.get(id).unwrap()).unwrap()
     }
 
     fn minifasnet(ep: ExecutionProvider) -> MiniFasNet {

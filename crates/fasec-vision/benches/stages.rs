@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use criterion::{Criterion, criterion_group, criterion_main};
 use fasec_config::ExecutionProvider;
 use fasec_core::Frame;
+use fasec_models::VerifiedModel;
 use fasec_vision::attention::CoarsePose;
 use fasec_vision::liveness::MiniFasNet;
 use fasec_vision::recognize::SFace;
@@ -19,11 +20,10 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Verified paths of yunet, sface, minifasnet-v2, minifasnet-v1se.
-fn models() -> Result<[PathBuf; 4], String> {
+/// Verified yunet, sface, minifasnet-v2, minifasnet-v1se.
+fn models() -> Result<[VerifiedModel; 4], String> {
     let dir = root().join("models");
-    let manifest =
-        fasec_models::Manifest::load(dir.join("manifest.toml")).map_err(|e| e.to_string())?;
+    let manifest = fasec_models::Manifest::embedded();
     let ids = [
         "yunet-2023mar",
         "sface-2021dec",
@@ -33,12 +33,9 @@ fn models() -> Result<[PathBuf; 4], String> {
     let mut out = Vec::new();
     for id in ids {
         let entry = manifest.get(id).ok_or(format!("{id} not in manifest"))?;
-        let path = fasec_models::model_path(&dir, entry).map_err(|e| format!("{id}: {e}"))?;
-        fasec_models::verify_file(&path, &entry.sha256).map_err(|e| format!("{id}: {e}"))?;
-        out.push(path);
+        out.push(VerifiedModel::load(&dir, entry).map_err(|e| format!("{id}: {e}"))?);
     }
-    out.try_into()
-        .map_err(|_| "expected four model paths".into())
+    out.try_into().map_err(|_| "expected four models".into())
 }
 
 /// face-a-1 at full size and at 720 px high.

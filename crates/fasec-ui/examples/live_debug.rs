@@ -387,7 +387,8 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
         };
         seq = frame.seq;
         let health = c.health();
-        let result = pipeline.process(&frame, health.clone());
+        // The debug view shows no identity, so embeddings are dropped (and zeroised) here.
+        let result = pipeline.process(&frame, health.clone()).map(|o| o.report);
         if let Ok(r) = &result {
             let t = &r.timings;
             window.add([t.detect_ms, t.recognize_ms, t.liveness_ms, t.pose_ms]);
