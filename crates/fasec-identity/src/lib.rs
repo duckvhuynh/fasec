@@ -1,6 +1,7 @@
 //! Enrolment flows, face gallery and encrypted template store.
 
 pub mod error;
+mod pin;
 pub mod protect;
 pub mod store;
 

@@ -101,6 +101,11 @@ pub struct StoredTemplate {
 }
 
 /// The face gallery. Template blobs go through `protector` on every write/read.
+///
+/// Security limit: a ciphertext is not bound to its row, person or model id. Under
+/// DPAPI current-user scope any process running as the same user can produce valid
+/// template blobs (or move them between rows). The gallery protects templates at rest
+/// from other users and offline copies of `gallery.db`, not from a same-user attacker.
 pub struct Gallery {
     conn: Connection,
     protector: Arc<dyn SecretProtector>,
@@ -256,8 +261,8 @@ impl Gallery {
         .collect()
     }
 
-    /// Decrypts every template enrolled with `model_id`. Any undecryptable or
-    /// wrong-length row fails the whole call (fail safe: never match on a partial gallery).
+    /// Decrypts every template enrolled with `model_id`. Any undecryptable, wrong-length
+    /// or non-finite row fails the whole call (fail safe: never match on a partial gallery).
     pub fn templates_for_model(&self, model_id: &str) -> Result<Vec<DecryptedTemplate>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.person_id, p.role, t.blob FROM template t
@@ -290,9 +295,50 @@ impl Gallery {
                     .iter()
                     .map(|c| f32::from_le_bytes(*c)),
             );
+            if !emb.iter().all(|v| v.is_finite()) {
+                return Err(corrupt());
+            }
             out.push((person, role, emb));
         }
         Ok(out)
+    }
+
+    /// Sets or replaces the owner PIN (4–12 ASCII digits), stored as an Argon2id PHC string.
+    pub fn set_pin(&mut self, pin: &str) -> Result<()> {
+        let phc = Zeroizing::new(crate::pin::hash(pin)?);
+        self.conn.execute(
+            "INSERT INTO secret (kind, hash) VALUES ('pin', ?1)
+             ON CONFLICT (kind) DO UPDATE SET hash = excluded.hash",
+            [phc.as_str()],
+        )?;
+        tracing::info!("owner PIN set");
+        Ok(())
+    }
+
+    /// `Ok(false)` on a wrong or malformed PIN, or when no PIN is set. Errors only on
+    /// storage problems or an unparsable stored hash.
+    pub fn verify_pin(&self, pin: &str) -> Result<bool> {
+        match self.stored_pin_hash()? {
+            Some(phc) => crate::pin::verify(pin, &phc),
+            None => Ok(false),
+        }
+    }
+
+    pub fn has_pin(&self) -> Result<bool> {
+        Ok(self.stored_pin_hash()?.is_some())
+    }
+
+    fn stored_pin_hash(&self) -> Result<Option<Zeroizing<String>>> {
+        let res = self
+            .conn
+            .query_row("SELECT hash FROM secret WHERE kind = 'pin'", [], |r| {
+                r.get::<_, String>(0)
+            });
+        match res {
+            Ok(h) => Ok(Some(Zeroizing::new(h))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn model_ids_in_use(&self) -> Result<Vec<String>> {
@@ -549,5 +595,183 @@ mod tests {
         assert!(persons[0].created_at > 0);
         let got = g.templates_for_model(MODEL).unwrap();
         assert_eq!(&got[0].2[..], &e[..]);
+    }
+
+    fn stored_pin(g: &Gallery) -> String {
+        g.conn
+            .query_row("SELECT hash FROM secret WHERE kind = 'pin'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn pin_roundtrip() {
+        let mut g = gallery();
+        assert!(!g.has_pin().unwrap());
+        assert!(!g.verify_pin("1234").unwrap(), "no PIN set must not verify");
+        g.set_pin("1234").unwrap();
+        assert!(g.has_pin().unwrap());
+        assert!(g.verify_pin("1234").unwrap());
+    }
+
+    #[test]
+    fn wrong_pin_is_false() {
+        let mut g = gallery();
+        g.set_pin("246813").unwrap();
+        assert!(!g.verify_pin("246814").unwrap());
+        // Malformed input is simply not the PIN.
+        assert!(!g.verify_pin("").unwrap());
+        assert!(!g.verify_pin("abcd").unwrap());
+    }
+
+    #[test]
+    fn pin_rules_rejected() {
+        let mut g = gallery();
+        for bad in ["", "123", "1234567890123", "12a4", "١٢٣٤", " 1234", "12 34"] {
+            assert!(
+                matches!(g.set_pin(bad), Err(IdentityError::Pin(_))),
+                "{bad:?} accepted"
+            );
+        }
+        assert!(!g.has_pin().unwrap());
+    }
+
+    #[test]
+    fn pin_hash_uses_argon2id_params() {
+        let mut g = gallery();
+        g.set_pin("123456789012").unwrap();
+        let phc = stored_pin(&g);
+        assert!(phc.starts_with("$argon2id$v=19$"), "not argon2id v19");
+        let parsed = argon2::PasswordHash::new(&phc).unwrap();
+        let params = argon2::Params::try_from(&parsed).unwrap();
+        assert!(params.m_cost() >= 19456);
+        assert!(params.t_cost() >= 2);
+        assert_eq!(params.p_cost(), 1);
+        assert_eq!(parsed.salt.unwrap().as_ref().len(), 16);
+        assert!(!phc.contains("123456789012"));
+    }
+
+    #[test]
+    fn pin_rehash_replaces_old() {
+        let mut g = gallery();
+        g.set_pin("1111").unwrap();
+        let first = stored_pin(&g);
+        g.set_pin("2222").unwrap();
+        assert_eq!(count(&g, "secret"), 1);
+        assert_ne!(stored_pin(&g), first);
+        assert!(g.verify_pin("2222").unwrap());
+        assert!(!g.verify_pin("1111").unwrap());
+    }
+
+    #[test]
+    fn corrupt_pin_hash_is_error_not_false_or_true() {
+        let g = gallery();
+        g.conn
+            .execute("INSERT INTO secret VALUES ('pin', 'not a phc string')", [])
+            .unwrap();
+        assert!(matches!(g.verify_pin("1234"), Err(IdentityError::Pin(_))));
+    }
+
+    /// Two good templates around `bad`; returns (gallery, id of the middle row).
+    fn gallery_with_three_templates() -> (Gallery, i64) {
+        let mut g = gallery();
+        let alice = g.add_person("Alice", Role::Owner).unwrap();
+        let bob = g.add_person("Bob", Role::Authorised).unwrap();
+        g.add_template(&alice, MODEL, Pose::Front, 0.9, &embedding(0.1))
+            .unwrap();
+        let mid = g
+            .add_template(&alice, MODEL, Pose::Left, 0.9, &embedding(0.2))
+            .unwrap();
+        g.add_template(&bob, MODEL, Pose::Front, 0.9, &embedding(0.3))
+            .unwrap();
+        assert_eq!(g.templates_for_model(MODEL).unwrap().len(), 3);
+        (g, mid)
+    }
+
+    fn blob(g: &Gallery, id: i64) -> Vec<u8> {
+        g.conn
+            .query_row("SELECT blob FROM template WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn set_blob(g: &Gallery, id: i64, blob: &[u8]) {
+        g.conn
+            .execute(
+                "UPDATE template SET blob = ?1 WHERE id = ?2",
+                params![blob, id],
+            )
+            .unwrap();
+    }
+
+    fn assert_corrupt(g: &Gallery, id: i64) {
+        let res = g.templates_for_model(MODEL);
+        assert!(
+            matches!(res, Err(IdentityError::CorruptTemplate { template_id }) if template_id == id),
+            "{:?}",
+            res.map(|v| v.len())
+        );
+    }
+
+    #[test]
+    fn tampered_template_blob_fails_load() {
+        let (g, id) = gallery_with_three_templates();
+        let mut b = blob(&g, id);
+        b[17] ^= 0x01;
+        set_blob(&g, id, &b);
+        assert_corrupt(&g, id);
+    }
+
+    #[test]
+    fn truncated_template_blob_fails_load() {
+        let (g, id) = gallery_with_three_templates();
+        let b = blob(&g, id);
+        set_blob(&g, id, &b[..b.len() - 1]);
+        assert_corrupt(&g, id);
+        set_blob(&g, id, &[]);
+        assert_corrupt(&g, id);
+        // Authentic ciphertext of a too-short plaintext is still rejected.
+        let short = XorProtector::default().protect(&[0u8; 4 * 127]).unwrap();
+        set_blob(&g, id, &short);
+        assert_corrupt(&g, id);
+    }
+
+    #[test]
+    fn blob_from_other_protector_fails_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gallery.db");
+        let id = {
+            let mut g = Gallery::open(&path, Arc::new(XorProtector(1))).unwrap();
+            let alice = g.add_person("Alice", Role::Owner).unwrap();
+            g.add_template(&alice, MODEL, Pose::Front, 0.9, &embedding(0.1))
+                .unwrap()
+        };
+        let g = Gallery::open(&path, Arc::new(XorProtector(2))).unwrap();
+        assert_corrupt(&g, id);
+    }
+
+    #[test]
+    fn one_bad_row_fails_whole_load() {
+        // One row holds a blob from another key: the two good rows must not be returned alone.
+        let (g, id) = gallery_with_three_templates();
+        let foreign = XorProtector(0x33)
+            .protect(&[0u8; 4 * EMBEDDING_DIM])
+            .unwrap();
+        set_blob(&g, id, &foreign);
+        assert_corrupt(&g, id);
+    }
+
+    #[test]
+    fn non_finite_template_value_fails_load() {
+        let (g, id) = gallery_with_three_templates();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut e = embedding(0.2);
+            e[64] = bad;
+            let plain: Vec<u8> = e.iter().flat_map(|x| x.to_le_bytes()).collect();
+            set_blob(&g, id, &XorProtector::default().protect(&plain).unwrap());
+            assert_corrupt(&g, id);
+        }
     }
 }
