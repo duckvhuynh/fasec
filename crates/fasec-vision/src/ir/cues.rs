@@ -16,6 +16,9 @@ use crate::ir::assoc::IOU_MATCH;
 const RING_MARGIN: f32 = 0.25;
 /// Below this visible fraction of the face box (the rest outside the IR frame), no cues.
 const MIN_VISIBLE: f32 = 0.5;
+/// Landmarks may lie this fraction of the box size outside the IR face box (a turned head puts
+/// an eye at the edge); further out the detection is inconsistent and gives no cues.
+const LANDMARK_SLACK: f32 = 0.1;
 /// Half side of the nose and cheek squares, as a fraction of the face box width.
 const REGION_HALF: f32 = 0.07;
 /// A glint is a pixel brighter than this in the lit frame (and not in the ambient one).
@@ -42,10 +45,13 @@ pub struct IrCues {
     pub relief: f32,
     /// Eyes (0–2) with a small saturated spot in the lit frame that the ambient frame lacks.
     pub glints: u8,
-    /// Lit-frame means over the face box and over the ring, for the self-emission and flooding
-    /// checks only.
+    /// Lit-frame means over the face box and over the ring, for the signal floor, self-emission
+    /// and flooding checks only.
     pub lit_face: f32,
     pub lit_background: f32,
+    /// Ambient-frame mean over the ring; NaN when the ambient frame is missing or blank. The
+    /// ambient face mean is `lit_face - lit_minus_ambient`.
+    pub ambient_background: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -81,8 +87,14 @@ pub struct IrLivenessConfig {
     /// the emitter contrast is lost (`Unknown`).
     pub max_background: f32,
     /// With a usable ambient frame, a face whose lit − ambient is below this fraction of its lit
-    /// brightness emits its own NIR (`SelfEmitting`).
+    /// brightness gets too little of its light from the emitter: `SelfEmitting` if it also glows
+    /// in the ambient frame (see `self_emit_contrast`), else `Unknown` (sun or window NIR).
     pub min_emitter_fraction: f32,
+    /// A face is self-lit when its ambient mean is at least this multiple of the ambient ring
+    /// mean; a face lit by the room is about as bright as its surroundings.
+    pub self_emit_contrast: f32,
+    /// Below this lit face mean (grey levels) the frame is noise, not a measurement (`Unknown`).
+    pub min_lit_face: f32,
 }
 
 impl Default for IrLivenessConfig {
@@ -97,6 +109,10 @@ impl Default for IrLivenessConfig {
             max_background: 100.0,
             // placeholder until Task 7
             min_emitter_fraction: 0.5,
+            // placeholder until Task 7
+            self_emit_contrast: 2.0,
+            // placeholder until Task 7
+            min_lit_face: 20.0,
         }
     }
 }
@@ -108,6 +124,10 @@ const GLINT_BONUS: f32 = 0.1;
 /// The IR verdict for one frame. Glints only raise a `Live` score; `Live` rests on the ratios.
 pub fn judge(cues: &IrCues, cfg: &IrLivenessConfig) -> IrVerdict {
     let spoof = |reason| IrVerdict::Spoof { score: 0.0, reason };
+    // before NoIrFace: in a flooded scene the IR detector may miss a real face
+    if cues.lit_background > cfg.max_background {
+        return IrVerdict::Unknown;
+    }
     if !cues.face_present {
         return spoof(IrSpoofReason::NoIrFace);
     }
@@ -119,12 +139,18 @@ pub fn judge(cues: &IrCues, cfg: &IrLivenessConfig) -> IrVerdict {
     ]
     .iter()
     .all(|v| v.is_finite());
-    if !finite || cues.lit_background > cfg.max_background {
+    if !finite || cues.lit_face < cfg.min_lit_face {
         return IrVerdict::Unknown;
     }
     // false for a NaN (unavailable) lit − ambient
     if cues.lit_minus_ambient < cfg.min_emitter_fraction * cues.lit_face {
-        return spoof(IrSpoofReason::SelfEmitting);
+        let ambient_face = cues.lit_face - cues.lit_minus_ambient;
+        // false for a NaN ambient ring
+        return if ambient_face >= cfg.self_emit_contrast * cues.ambient_background {
+            spoof(IrSpoofReason::SelfEmitting)
+        } else {
+            IrVerdict::Unknown
+        };
     }
     if cues.face_vs_background < cfg.min_face_vs_background {
         return IrVerdict::Unknown;
@@ -142,7 +168,8 @@ pub fn judge(cues: &IrCues, cfg: &IrLivenessConfig) -> IrVerdict {
 /// faces in `lit`).
 ///
 /// `None` (no evidence, `Unknown`) when the frames are inconsistent, the face box or its ring is
-/// degenerate or mostly outside the frame, or the track has no IR face and that cannot be told
+/// degenerate or mostly outside the frame, a landmark of `matched` is non-finite or outside its
+/// box (beyond `LANDMARK_SLACK`), or the track has no IR face and that cannot be told
 /// apart from a missed match: the mapping is untrusted, or an IR face overlaps the mapped box
 /// enough to match but went elsewhere (ambiguous or contested).
 pub fn ir_cues(
@@ -164,7 +191,18 @@ pub fn ir_cues(
         return None;
     }
     let (bbox, landmarks) = match matched {
-        Some(d) => (d.bbox, Some(d.landmarks5)),
+        Some(d) => {
+            let b = d.bbox;
+            let (tx, ty) = (LANDMARK_SLACK * b.w, LANDMARK_SLACK * b.h);
+            let on_face = |p: &PointF| {
+                (b.x - tx..=b.x + b.w + tx).contains(&p.x)
+                    && (b.y - ty..=b.y + b.h + ty).contains(&p.y)
+            };
+            if !d.landmarks5.iter().all(on_face) {
+                return None;
+            }
+            (b, Some(d.landmarks5))
+        }
         None => {
             let mapped = assoc.map(rgb_box);
             if !assoc.is_trusted() || ir_faces.iter().any(|d| mapped.iou(&d.bbox) >= IOU_MATCH) {
@@ -246,6 +284,7 @@ pub fn ir_cues(
         glints,
         lit_face: mean(face, width, &lit_px) as f32,
         lit_background: ring_mean(&lit_px) as f32,
+        ambient_background: amb.map_or(f32::NAN, |a| ring_mean(&|i: usize| f64::from(a[i])) as f32),
     })
 }
 
@@ -562,7 +601,11 @@ mod tests {
             // no room for a background ring
             rect(0.0, 0.0, 1.0, 1.0),
         ] {
-            let d = det(bad);
+            // landmarks inside the box, so the box itself is what is rejected
+            let d = Detection {
+                landmarks5: [bad.center(); 5],
+                ..det(bad)
+            };
             assert_eq!(
                 ir_cues(&lit, None, &none, bad, &[d], Some(&d)),
                 None,
@@ -581,14 +624,144 @@ mod tests {
         let mut broken = lit.clone();
         broken.data = vec![0; 10].into();
         assert_eq!(cues(&broken, None), None);
-        // a NaN nose or mouth corner: relief cannot be measured
-        for k in [2, 3, 4] {
+        // a NaN landmark cannot be placed on the face
+        for k in 0..5 {
             let mut d = det(FACE);
             d.landmarks5[k].x = f32::NAN;
-            let c = ir_cues(&lit, None, &none, FACE, &[d], Some(&d)).unwrap();
-            assert!(c.relief.is_nan(), "landmark {k}: {c:?}");
-            assert_eq!(judge(&c, &IrLivenessConfig::default()), IrVerdict::Unknown);
+            assert_eq!(
+                ir_cues(&lit, None, &none, FACE, &[d], Some(&d)),
+                None,
+                "{k}"
+            );
         }
+    }
+
+    #[test]
+    fn a_cheek_off_the_frame_is_unknown() {
+        // a face at the left edge: box x −0.15..0.25, the right cheek square entirely off-frame
+        let lit = frame(true, |x, y| match (x, y) {
+            (3..8, 52..58) => 210,
+            (0..25, 30..70) => 150,
+            _ => 20,
+        });
+        let p = |x, y| PointF { x, y };
+        let d = Detection {
+            bbox: rect(-0.15, 0.3, 0.4, 0.4),
+            landmarks5: [
+                p(-0.05, 0.45),
+                p(0.12, 0.45),
+                p(0.05, 0.55),
+                p(-0.03, 0.65),
+                p(0.1, 0.65),
+            ],
+            score: 0.9,
+        };
+        let c = ir_cues(&lit, None, &IrAssociator::new(), d.bbox, &[d], Some(&d)).unwrap();
+        assert!(c.relief.is_nan(), "{c:?}");
+        assert_eq!(judge(&c, &IrLivenessConfig::default()), IrVerdict::Unknown);
+    }
+
+    #[test]
+    fn landmarks_outside_the_face_box_give_no_cues() {
+        let lit = frame(true, real_face(20, 150, 210, true));
+        let none = IrAssociator::new();
+        let cues = |k: usize, p: PointF| {
+            let mut d = det(FACE);
+            d.landmarks5[k] = p;
+            ir_cues(&lit, None, &none, FACE, &[d], Some(&d))
+        };
+        // the nose on the background ring would measure relief off the face
+        assert_eq!(cues(2, PointF { x: 0.9, y: 0.55 }), None);
+        assert_eq!(cues(0, PointF { x: 0.42, y: 0.2 }), None);
+        // just past the box edge, within the tolerance for a turned head
+        assert!(cues(0, PointF { x: 0.29, y: 0.45 }).is_some());
+    }
+
+    #[test]
+    fn owner_by_a_window_is_never_self_emitting() {
+        // sun or window NIR lights face and room alike: small lit − ambient, but the face does
+        // not glow against its surroundings in the ambient frame
+        let lit = frame(true, real_face(95, 120, 160, false));
+        let amb = frame(false, |_, _| 90);
+        let (c, v) = matched(&lit, Some(&amb));
+        let cfg = IrLivenessConfig::default();
+        assert!(
+            c.lit_minus_ambient < cfg.min_emitter_fraction * c.lit_face
+                && c.lit_background <= cfg.max_background
+                && (c.ambient_background - 90.0).abs() < 1e-3,
+            "{c:?}"
+        );
+        assert_eq!(v, IrVerdict::Unknown, "{c:?}");
+    }
+
+    #[test]
+    fn screen_in_a_dark_room_is_self_emitting() {
+        let lit = frame(true, real_face(10, 110, 140, false));
+        let amb = frame(false, |x, y| if in_face(x, y) { 100 } else { 5 });
+        let (c, v) = matched(&lit, Some(&amb));
+        assert!((c.ambient_background - 5.0).abs() < 1e-3, "{c:?}");
+        assert_eq!(reason(v), Some(IrSpoofReason::SelfEmitting), "{c:?}");
+    }
+
+    #[test]
+    fn flood_is_checked_before_no_ir_face() {
+        // a real face in sunlight that the IR detector missed
+        let lit = frame(true, real_face(150, 200, 250, false));
+        let c = ir_cues(&lit, None, &trusted_identity(), FACE, &[], None).unwrap();
+        assert!(!c.face_present, "{c:?}");
+        assert_eq!(judge(&c, &IrLivenessConfig::default()), IrVerdict::Unknown);
+    }
+
+    #[test]
+    fn near_black_noise_is_unknown() {
+        // 0–4 grey levels: the ratios alone would read a shaded face
+        let lit = frame(true, |x, y| match real_face(9, 3, 4, false)(x, y) {
+            9 => ((x * 7 + y * 3) % 2) as u8,
+            v => v,
+        });
+        let (c, v) = matched(&lit, None);
+        let cfg = IrLivenessConfig::default();
+        assert!(
+            c.face_vs_background >= cfg.min_face_vs_background && c.relief >= cfg.min_relief,
+            "{c:?}"
+        );
+        assert_eq!(v, IrVerdict::Unknown, "{c:?}");
+    }
+
+    #[test]
+    fn decision_order_is_flood_then_self_emission_then_contrast() {
+        let cfg = IrLivenessConfig::default();
+        let self_lit = |c: &IrCues| {
+            c.lit_minus_ambient < cfg.min_emitter_fraction * c.lit_face
+                && c.lit_face - c.lit_minus_ambient >= cfg.self_emit_contrast * c.ambient_background
+        };
+        let amb = frame(false, |x, y| if in_face(x, y) { 140 } else { 60 });
+        // flooded and self-lit: flooding wins
+        let (c, v) = matched(&frame(true, real_face(110, 170, 200, false)), Some(&amb));
+        assert!(
+            self_lit(&c) && c.lit_background > cfg.max_background,
+            "{c:?}"
+        );
+        assert_eq!(v, IrVerdict::Unknown, "{c:?}");
+        // self-lit with weak emitter contrast: self-emission wins
+        let (c, v) = matched(&frame(true, real_face(70, 152, 182, false)), Some(&amb));
+        assert!(
+            self_lit(&c) && c.face_vs_background < cfg.min_face_vs_background,
+            "{c:?}"
+        );
+        assert_eq!(reason(v), Some(IrSpoofReason::SelfEmitting), "{c:?}");
+    }
+
+    #[test]
+    fn trusted_mapping_with_a_matched_ir_face_is_live() {
+        let lit = frame(true, real_face(20, 150, 210, true));
+        let d = det(FACE);
+        let c = ir_cues(&lit, None, &trusted_identity(), FACE, &[d], Some(&d)).unwrap();
+        assert!(c.face_present, "{c:?}");
+        assert_eq!(
+            judge(&c, &IrLivenessConfig::default()),
+            IrVerdict::Live { score: 1.0 }
+        );
     }
 
     #[test]
