@@ -153,10 +153,17 @@ fn write_outputs(
         let mut w = std::io::stdout().lock();
         return run(frames, p, args.fps, opts, &mut w, None);
     };
+    let side = output::embeddings_path(path);
     let mut emb = if args.with_embeddings {
-        Some(create(&output::embeddings_path(path))?)
+        Some(create(&side)?)
     } else {
-        None
+        // A sidecar from an earlier run would leave plaintext templates beside this report.
+        match std::fs::remove_file(&side) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing stale {}", side.display()));
+            }
+            _ => None,
+        }
     };
     let emb = emb.as_mut().map(|w| w as &mut dyn Write);
     run(frames, p, args.fps, opts, &mut create(path)?, emb)
@@ -346,6 +353,26 @@ mod tests {
         let want = [0, 1]
             .map(|seq| serde_json::json!({"seq": seq, "track": 1, "embedding": [0.25, -0.5]}));
         assert_eq!(lines, want);
+    }
+
+    #[test]
+    fn run_without_embeddings_removes_stale_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("r.jsonl");
+        let side = output::embeddings_path(&out);
+        std::fs::write(&side, "{\"seq\":0,\"track\":1,\"embedding\":[0.1]}\n").unwrap();
+        let frames = vec![raw(2, 2, 0)].into_iter();
+        write_outputs(
+            &args(Some(out.clone()), false),
+            frames,
+            &mut Mock::default(),
+        )
+        .unwrap();
+        assert!(
+            !side.exists(),
+            "stale plaintext embeddings left beside a fresh report"
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 1);
     }
 
     #[test]

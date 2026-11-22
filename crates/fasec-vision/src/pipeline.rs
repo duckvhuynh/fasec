@@ -10,6 +10,7 @@ use fasec_core::{
     TrackId, TrackObs, VisionReport,
 };
 use fasec_models::{Manifest, VerifiedModel};
+use zeroize::Zeroize;
 
 use crate::attention::{CoarsePose, face_width_px};
 use crate::liveness::MiniFasNet;
@@ -210,10 +211,11 @@ impl Pipeline {
 
             if due(st.embedded_at, cfg.recog_interval_ms) {
                 let t0 = Instant::now();
-                let res = self.emb.embed(frame, d).and_then(|e| {
+                let res = self.emb.embed(frame, d).and_then(|mut e| {
                     if e.iter().all(|v| v.is_finite()) {
                         Ok(e)
                     } else {
+                        e.zeroize();
                         Err(VisionError::Model("non-finite embedding".into()))
                     }
                 });

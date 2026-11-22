@@ -1471,6 +1471,7 @@ dependencies = [
  "pathfinding",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
