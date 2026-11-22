@@ -4,9 +4,11 @@
 //! +pitch = looking down. No frame or crop is kept: only accepted embeddings (FR-ID-005).
 
 use fasec_core::{
-    CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, VisionReport,
+    CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, TrackId, VisionReport,
 };
+use zeroize::Zeroizing;
 
+use crate::matcher::{DEFAULT_THRESHOLD, normalised};
 use crate::store::Pose;
 
 /// Default Laplacian-variance floor (grey 0..255). Measured on the `.assets` portraits scaled
@@ -73,6 +75,9 @@ pub enum RejectReason {
     CameraUnhealthy,
     /// `frame` is not the frame `report` describes, so its gates cannot vouch for it.
     FrameMismatch,
+    /// Another track than the first accepted sample's, or an embedding unlike the accepted
+    /// ones: one enrolment never mixes two people.
+    DifferentPerson,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +107,10 @@ pub struct Enrolment {
     samples: Vec<EnrolledSample>,
     /// `ts_ms` of the last accepted embedding, so one frame is never stored twice.
     last_ts: Option<u64>,
+    /// Track of the first accepted sample; later samples must come from it.
+    track: Option<TrackId>,
+    /// Sum of the accepted embeddings, each L2-normalised; its direction is their mean.
+    sum: Zeroizing<Vec<f32>>,
 }
 
 impl Enrolment {
@@ -112,6 +121,8 @@ impl Enrolment {
             cfg,
             samples: Vec::new(),
             last_ts: None,
+            track: None,
+            sum: Zeroizing::new(Vec::new()),
         }
     }
 
@@ -139,8 +150,17 @@ impl Enrolment {
             return SampleVerdict::Complete;
         };
         match self.judge(frame, report, embedding, want) {
-            Ok((quality, te)) => {
+            Ok((quality, te, unit)) => {
                 self.last_ts = Some(te.ts_ms);
+                self.track = Some(te.track);
+                if self.sum.is_empty() {
+                    self.sum = unit;
+                } else {
+                    self.sum
+                        .iter_mut()
+                        .zip(unit.iter())
+                        .for_each(|(s, u)| *s += u);
+                }
                 self.samples.push(EnrolledSample {
                     pose: want,
                     quality,
@@ -158,7 +178,7 @@ impl Enrolment {
         report: &VisionReport,
         embedding: Option<&'a TrackEmbedding>,
         want: Pose,
-    ) -> Result<(f32, &'a TrackEmbedding), RejectReason> {
+    ) -> Result<(f32, &'a TrackEmbedding, Zeroizing<Vec<f32>>), RejectReason> {
         use RejectReason::*;
         if frame.ts_ms != report.ts_ms {
             return Err(FrameMismatch);
@@ -171,6 +191,9 @@ impl Enrolment {
             [t] => t,
             _ => return Err(MultipleFaces),
         };
+        if self.track.is_some_and(|id| id != t.id) {
+            return Err(DifferentPerson);
+        }
         // `RangeFrom::contains` is false for NaN, so a NaN measurement fails the gate
         if !(self.cfg.min_face_px..).contains(&t.face_width_px) {
             return Err(TooSmall);
@@ -191,16 +214,33 @@ impl Enrolment {
         if !in_pose {
             return Err(WrongPose { want });
         }
-        match embedding {
+        let te = match embedding {
             Some(te)
                 if te.track == t.id
                     && te.ts_ms == report.ts_ms
                     && Some(te.ts_ms) > self.last_ts =>
             {
-                Ok((t.det_score, te))
+                te
             }
-            _ => Err(NoEmbeddingYet),
+            _ => return Err(NoEmbeddingYet),
+        };
+        // empty, zero or non-finite: nothing usable to store
+        let unit = normalised(te.embedding.as_slice()).ok_or(NoEmbeddingYet)?;
+        if !self.sum.is_empty() && !self.like_accepted(&unit) {
+            return Err(DifferentPerson);
         }
+        Ok((t.det_score, te, unit))
+    }
+
+    /// Cosine of `unit` against the mean of the accepted samples is at least the matcher's
+    /// acceptance threshold.
+    fn like_accepted(&self, unit: &[f32]) -> bool {
+        let Some(mean) = normalised(&self.sum) else {
+            return false;
+        };
+        let cos: f32 = mean.iter().zip(unit).map(|(a, b)| a * b).sum();
+        // `>=` is false for NaN
+        mean.len() == unit.len() && cos >= DEFAULT_THRESHOLD
     }
 
     /// All samples, in target order; an error unless every pose has its samples.
@@ -813,5 +853,105 @@ mod tests {
             SampleVerdict::Accepted { pose: Pose::Front }
         ));
         assert_eq!(e.progress(), (2, 10));
+    }
+
+    /// Accepts one front sample from track 1 with `emb(1, 1)`.
+    fn started() -> Enrolment {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let v = e.offer(
+            &frame(1, true),
+            &report(1, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, 1)),
+        );
+        assert_eq!(v, SampleVerdict::Accepted { pose: Pose::Front });
+        e
+    }
+
+    #[test]
+    fn rejects_a_second_track_after_the_first_sample() {
+        let mut e = started();
+        // a different track, even with an identical embedding, is someone else
+        let v = e.offer(
+            &frame(2, true),
+            &report(2, vec![track(2, 0.0, 0.0)]),
+            Some(&emb(2, 2)),
+        );
+        assert_eq!(v, SampleVerdict::Rejected(RejectReason::DifferentPerson));
+        assert_eq!(e.progress(), (1, 10));
+        // the first track still continues
+        let v = e.offer(
+            &frame(3, true),
+            &report(3, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, 3)),
+        );
+        assert_eq!(v, SampleVerdict::Accepted { pose: Pose::Front });
+    }
+
+    #[test]
+    fn rejects_an_unlike_embedding_on_the_same_track() {
+        let mut e = started();
+        // e_0 against the accepted all-equal direction: cosine 1/sqrt(128) ≈ 0.088 < 0.363
+        let mut v = vec![0.0f32; 128];
+        v[0] = 1.0;
+        let te = TrackEmbedding {
+            track: TrackId(1),
+            ts_ms: 2,
+            embedding: Embedding::from(v),
+        };
+        let v = e.offer(
+            &frame(2, true),
+            &report(2, vec![track(1, 0.0, 0.0)]),
+            Some(&te),
+        );
+        assert_eq!(v, SampleVerdict::Rejected(RejectReason::DifferentPerson));
+        assert_eq!(e.progress(), (1, 10));
+        assert_eq!(e.current_target(), Some(Pose::Front));
+        // a similar embedding is still accepted afterwards
+        let v = e.offer(
+            &frame(3, true),
+            &report(3, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, 3)),
+        );
+        assert_eq!(v, SampleVerdict::Accepted { pose: Pose::Front });
+        assert_eq!(
+            e.finish().unwrap_err(),
+            EnrolError::Incomplete { have: 2, need: 10 }
+        );
+    }
+
+    #[test]
+    fn similarity_threshold_is_the_matchers() {
+        // a unit embedding at cosine `cos` against the accepted direction
+        let at = |ts: u64, cos: f32| {
+            let mean = 1.0 / (128f32).sqrt();
+            // unit vector u = cos·m + sin·w, with w ⟂ m (m = all-equal unit vector)
+            let sin = (1.0 - cos * cos).sqrt();
+            let mut w = vec![0.0f32; 128];
+            w[0] = 1.0;
+            w[1] = -1.0;
+            let wn = 2f32.sqrt();
+            let v: Vec<f32> = (0..128).map(|i| cos * mean + sin * w[i] / wn).collect();
+            TrackEmbedding {
+                track: TrackId(1),
+                ts_ms: ts,
+                embedding: Embedding::from(v),
+            }
+        };
+        let mut e = started();
+        let offer = |e: &mut Enrolment, te: &TrackEmbedding| {
+            e.offer(
+                &frame(te.ts_ms, true),
+                &report(te.ts_ms, vec![track(1, 0.0, 0.0)]),
+                Some(te),
+            )
+        };
+        assert_eq!(
+            offer(&mut e, &at(2, DEFAULT_THRESHOLD - 0.01)),
+            SampleVerdict::Rejected(RejectReason::DifferentPerson)
+        );
+        assert_eq!(
+            offer(&mut e, &at(3, DEFAULT_THRESHOLD + 0.01)),
+            SampleVerdict::Accepted { pose: Pose::Front }
+        );
     }
 }

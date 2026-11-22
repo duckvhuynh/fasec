@@ -10,10 +10,13 @@ pub struct MatcherConfig {
     pub margin: f32,
 }
 
+/// SFace cosine acceptance threshold (FR-ID-009).
+pub const DEFAULT_THRESHOLD: f32 = 0.363;
+
 impl Default for MatcherConfig {
     fn default() -> Self {
         Self {
-            threshold: 0.363,
+            threshold: DEFAULT_THRESHOLD,
             margin: 0.05,
         }
     }
@@ -153,7 +156,7 @@ impl Matcher {
 }
 
 /// L2-normalised copy (zeroised on drop), or `None` if empty, non-finite or zero.
-fn normalised(v: &[f32]) -> Option<Zeroizing<Vec<f32>>> {
+pub(crate) fn normalised(v: &[f32]) -> Option<Zeroizing<Vec<f32>>> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     (norm.is_finite() && norm > 0.0).then(|| Zeroizing::new(v.iter().map(|x| x / norm).collect()))
 }

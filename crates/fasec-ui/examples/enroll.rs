@@ -144,6 +144,7 @@ fn reject_message(r: RejectReason) -> &'static str {
             "Camera problem: check the camera is connected and uncovered"
         }
         RejectReason::FrameMismatch => "Processing: hold still",
+        RejectReason::DifferentPerson => "Only the person who started enrolling, please",
     }
 }
 
@@ -782,6 +783,7 @@ mod tests {
             NoEmbeddingYet,
             CameraUnhealthy,
             FrameMismatch,
+            DifferentPerson,
         ];
         for r in all {
             let m = reject_message(r);
