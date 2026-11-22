@@ -12,7 +12,7 @@ use fasec_core::{RectF, TrackId, TrackObs};
 use crate::Detection;
 
 /// Same match threshold as the RGB tracker.
-const IOU_MATCH: f32 = 0.3;
+pub(crate) const IOU_MATCH: f32 = 0.3;
 /// A track or IR face whose two best IoUs are closer than this is ambiguous and left unmatched.
 const AMBIGUITY_MARGIN: f32 = 0.1;
 /// A 1↔1 pair agrees with the mapping when the mapped RGB box overlaps the IR face this well.
@@ -55,7 +55,9 @@ impl IrAssociator {
         Self::default()
     }
 
-    fn trusted(&self) -> bool {
+    /// Whether the mapping has been learned (consecutive consistent pairs). Until then a track
+    /// without an IR face says nothing about liveness.
+    pub fn is_trusted(&self) -> bool {
         self.streak >= TRUST_STREAK
     }
 
@@ -85,7 +87,7 @@ impl IrAssociator {
             self.learn(t, d);
         }
         let mut out: Vec<(TrackId, Option<Detection>)> = rgb.iter().map(|t| (t.id, None)).collect();
-        if !self.trusted() {
+        if !self.is_trusted() {
             return out;
         }
         let iou: Vec<Vec<f32>> = rgb
@@ -141,7 +143,7 @@ impl IrAssociator {
         // `>=` is false for a NaN score
         let confident = t.det_score >= MIN_LEARN_SCORE && d.score >= MIN_LEARN_SCORE;
         if !(confident && usable(&r) && usable(&i)) {
-            if !self.trusted() {
+            if !self.is_trusted() {
                 self.streak = 0;
             }
             return;
@@ -154,7 +156,7 @@ impl IrAssociator {
                 && [ci.x - cr.x, ci.y - cr.y].iter().all(|o| o.abs() <= max)
         };
         let consistent = self.map(r).iou(&i) >= IOU_CONSISTENT;
-        if self.trusted() {
+        if self.is_trusted() {
             if !(consistent && within(&SCALE_RANGE, MAX_SHIFT)) {
                 return;
             }
@@ -452,7 +454,7 @@ mod tests {
                     let mut weak = det(true_map(r));
                     weak.score = score;
                     let out = a.associate(&[track(1, r)], &[weak]);
-                    assert_eq!(out[0].1.is_some(), a.trusted());
+                    assert_eq!(out[0].1.is_some(), a.is_trusted());
                     let mut t = track(1, r);
                     t.det_score = score;
                     a.associate(&[t], &[det(true_map(r))]);
