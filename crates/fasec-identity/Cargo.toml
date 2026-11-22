@@ -25,4 +25,5 @@ uuid = { version = "1.29.3", features = ["v4"] }
 zeroize = "1.9.2"
 
 [dev-dependencies]
+image = { version = "0.25.9", default-features = false, features = ["jpeg"] }
 tempfile = "3.27.0"

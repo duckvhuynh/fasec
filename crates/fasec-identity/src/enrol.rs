@@ -1,0 +1,716 @@
+//! Guided 5-pose enrolment (FR-ID-002): only good samples are accepted, 2 per pose.
+//!
+//! Pose sign convention follows M1 `CoarsePose`: +yaw = nose towards image right,
+//! +pitch = looking down. No frame or crop is kept: only accepted embeddings (FR-ID-005).
+
+use fasec_core::{
+    CameraHealth, Embedding, Frame, LivenessState, RectF, TrackEmbedding, VisionReport,
+};
+
+use crate::store::Pose;
+
+/// Default Laplacian-variance floor (grey 0..255). Measured on the `.assets` portraits scaled
+/// to a 160..320 px face: sharp faces scored 48.7..608, the same crops box-blurred (radius 3)
+/// 2.2..9.7; the log-space midpoint of 48.7 and 9.7 is 21.7, rounded down to 20.
+pub const DEFAULT_MIN_SHARPNESS: f32 = 20.0;
+
+/// Accepted head-pose range in degrees, inclusive on both ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoseWindow {
+    pub yaw: (f32, f32),
+    pub pitch: (f32, f32),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnrolConfig {
+    pub samples_per_pose: usize,
+    pub min_face_px: f32,
+    pub min_sharpness: f32,
+    /// Targets in the order they are asked for.
+    pub pose_windows: [(Pose, PoseWindow); 5],
+}
+
+impl PoseWindow {
+    fn contains(&self, yaw: f32, pitch: f32) -> bool {
+        // NaN angles fall outside every window
+        (self.yaw.0..=self.yaw.1).contains(&yaw) && (self.pitch.0..=self.pitch.1).contains(&pitch)
+    }
+}
+
+impl Default for EnrolConfig {
+    fn default() -> Self {
+        let w = |yaw, pitch| PoseWindow { yaw, pitch };
+        // The brief bounds one axis per turned pose; the other is held to ±20° so a diagonal
+        // head turn is not accepted as a clean left/right/up/down sample.
+        let free = (-20.0, 20.0);
+        EnrolConfig {
+            samples_per_pose: 2,
+            min_face_px: 112.0,
+            min_sharpness: DEFAULT_MIN_SHARPNESS,
+            pose_windows: [
+                (Pose::Front, w((-10.0, 10.0), (-10.0, 10.0))),
+                (Pose::Left, w((-35.0, -15.0), free)),
+                (Pose::Right, w((15.0, 35.0), free)),
+                (Pose::Up, w(free, (-30.0, -12.0))),
+                (Pose::Down, w(free, (12.0, 30.0))),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectReason {
+    NoFace,
+    MultipleFaces,
+    TooSmall,
+    Blurry,
+    NotLive,
+    SpoofDetected,
+    WrongPose { want: Pose },
+    NoEmbeddingYet,
+    CameraUnhealthy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleVerdict {
+    Accepted { pose: Pose },
+    Rejected(RejectReason),
+    Complete,
+}
+
+/// One accepted sample. `Debug` stays redacted because `Embedding`'s is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnrolledSample {
+    pub pose: Pose,
+    /// Detector score of the accepted face, 0..1.
+    pub quality: f32,
+    pub embedding: Embedding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EnrolError {
+    #[error("enrolment incomplete: {have} of {need} samples")]
+    Incomplete { have: usize, need: usize },
+}
+
+pub struct Enrolment {
+    cfg: EnrolConfig,
+    samples: Vec<EnrolledSample>,
+    /// `ts_ms` of the last accepted embedding, so one frame is never stored twice.
+    last_ts: Option<u64>,
+}
+
+impl Enrolment {
+    pub fn new(cfg: EnrolConfig) -> Self {
+        Enrolment {
+            cfg,
+            samples: Vec::new(),
+            last_ts: None,
+        }
+    }
+
+    /// The pose being collected now; `None` once every pose has its samples.
+    pub fn current_target(&self) -> Option<Pose> {
+        let i = self.samples.len().checked_div(self.cfg.samples_per_pose)?;
+        self.cfg.pose_windows.get(i).map(|(p, _)| *p)
+    }
+
+    /// `(accepted, needed)`.
+    pub fn progress(&self) -> (usize, usize) {
+        let need = self.cfg.samples_per_pose * self.cfg.pose_windows.len();
+        (self.samples.len(), need)
+    }
+
+    /// Judges one frame. `embedding` is the one computed on this frame for its single track
+    /// (from `ProcessOutput::embeddings`), if any. Only `Accepted` stores anything.
+    pub fn offer(
+        &mut self,
+        frame: &Frame,
+        report: &VisionReport,
+        embedding: Option<&TrackEmbedding>,
+    ) -> SampleVerdict {
+        let Some(want) = self.current_target() else {
+            return SampleVerdict::Complete;
+        };
+        match self.judge(frame, report, embedding, want) {
+            Ok((quality, te)) => {
+                self.last_ts = Some(te.ts_ms);
+                self.samples.push(EnrolledSample {
+                    pose: want,
+                    quality,
+                    embedding: te.embedding.clone(),
+                });
+                SampleVerdict::Accepted { pose: want }
+            }
+            Err(r) => SampleVerdict::Rejected(r),
+        }
+    }
+
+    fn judge<'a>(
+        &self,
+        frame: &Frame,
+        report: &VisionReport,
+        embedding: Option<&'a TrackEmbedding>,
+        want: Pose,
+    ) -> Result<(f32, &'a TrackEmbedding), RejectReason> {
+        use RejectReason::*;
+        if report.camera_health != CameraHealth::Ok {
+            return Err(CameraUnhealthy);
+        }
+        let t = match report.tracks.as_slice() {
+            [] => return Err(NoFace),
+            [t] => t,
+            _ => return Err(MultipleFaces),
+        };
+        // `RangeFrom::contains` is false for NaN, so a NaN measurement fails the gate
+        if !(self.cfg.min_face_px..).contains(&t.face_width_px) {
+            return Err(TooSmall);
+        }
+        if !(self.cfg.min_sharpness..).contains(&sharpness(frame, t.bbox)) {
+            return Err(Blurry);
+        }
+        match t.liveness {
+            LivenessState::Live { .. } => {}
+            LivenessState::Spoof { .. } => return Err(SpoofDetected),
+            LivenessState::Unknown => return Err(NotLive),
+        }
+        let window = self.cfg.pose_windows.iter().find(|(p, _)| *p == want);
+        let in_pose = match (t.head_pose, window) {
+            (Some(hp), Some((_, w))) => w.contains(hp.yaw, hp.pitch),
+            _ => false,
+        };
+        if !in_pose {
+            return Err(WrongPose { want });
+        }
+        match embedding {
+            Some(te)
+                if te.track == t.id
+                    && te.ts_ms == report.ts_ms
+                    && Some(te.ts_ms) > self.last_ts =>
+            {
+                Ok((t.det_score, te))
+            }
+            _ => Err(NoEmbeddingYet),
+        }
+    }
+
+    /// All samples, in target order; an error unless every pose has its samples.
+    pub fn finish(self) -> Result<Vec<EnrolledSample>, EnrolError> {
+        let (have, need) = self.progress();
+        if have < need {
+            return Err(EnrolError::Incomplete { have, need });
+        }
+        Ok(self.samples)
+    }
+}
+
+/// Variance of the 3×3 Laplacian over the grey (Rec.601) crop of `bbox` (normalised), clamped
+/// to the frame; 0.0 when the crop is smaller than 3×3.
+pub fn sharpness(frame: &Frame, bbox: RectF) -> f32 {
+    let b = bbox.clamp_unit();
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    // `as usize` saturates and maps NaN to 0, so a NaN box gives an empty crop
+    let x0 = (b.x * w as f32).floor() as usize;
+    let y0 = (b.y * h as f32).floor() as usize;
+    let x1 = (((b.x + b.w) * w as f32).ceil() as usize).min(w);
+    let y1 = (((b.y + b.h) * h as f32).ceil() as usize).min(h);
+    if x1 < x0 + 3 || y1 < y0 + 3 {
+        return 0.0;
+    }
+    let cw = x1 - x0;
+    let grey: Vec<f32> = (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| (y * w + x) * 3))
+        .map(|i| {
+            let p = &frame.data[i..i + 3];
+            0.299 * f32::from(p[0]) + 0.587 * f32::from(p[1]) + 0.114 * f32::from(p[2])
+        })
+        .collect();
+    let (mut n, mut sum, mut sq) = (0.0f64, 0.0f64, 0.0f64);
+    for y in 1..(y1 - y0 - 1) {
+        for x in 1..(cw - 1) {
+            let g = |dx: usize, dy: usize| grey[(y + dy - 1) * cw + x + dx - 1];
+            let lap = f64::from(g(1, 0) + g(0, 1) + g(2, 1) + g(1, 2) - 4.0 * g(1, 1));
+            n += 1.0;
+            sum += lap;
+            sq += lap * lap;
+        }
+    }
+    let mean = sum / n;
+    (sq / n - mean * mean).max(0.0) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use fasec_core::{
+        HeadPose, IdentityState, LivenessTier, PointF, StageTimings, TrackId, TrackObs,
+    };
+
+    use super::*;
+
+    const FACE: RectF = RectF {
+        x: 0.25,
+        y: 0.25,
+        w: 0.5,
+        h: 0.5,
+    };
+
+    /// 64×64 frame: 1-px black/white checkerboard (sharp) or flat grey (blurry).
+    fn frame(ts_ms: u64, sharp: bool) -> Frame {
+        let mut data = Vec::with_capacity(64 * 64 * 3);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let v = match sharp {
+                    true if (x + y) % 2 == 0 => 255,
+                    true => 0,
+                    false => 128,
+                };
+                data.extend([v; 3]);
+            }
+        }
+        Frame::new(ts_ms, ts_ms, 64, 64, data).unwrap()
+    }
+
+    fn track(id: u64, yaw: f32, pitch: f32) -> TrackObs {
+        TrackObs {
+            id: TrackId(id),
+            bbox: FACE,
+            landmarks5: [PointF { x: 0.5, y: 0.5 }; 5],
+            det_score: 0.9,
+            identity: IdentityState::Pending,
+            liveness: LivenessState::Live {
+                score: 0.95,
+                tier: LivenessTier::Rgb,
+            },
+            head_pose: Some(HeadPose {
+                yaw,
+                pitch,
+                roll: 0.0,
+                confidence: 0.8,
+            }),
+            face_width_px: 150.0,
+            age_ms: 1000,
+        }
+    }
+
+    fn report(ts_ms: u64, tracks: Vec<TrackObs>) -> VisionReport {
+        VisionReport {
+            seq: ts_ms,
+            ts_ms,
+            tracks,
+            camera_health: CameraHealth::Ok,
+            liveness_tier: LivenessTier::Rgb,
+            timings: StageTimings {
+                detect_ms: 0.0,
+                recognize_ms: 0.0,
+                liveness_ms: 0.0,
+                pose_ms: 0.0,
+            },
+        }
+    }
+
+    fn emb(id: u64, ts_ms: u64) -> TrackEmbedding {
+        TrackEmbedding {
+            track: TrackId(id),
+            ts_ms,
+            embedding: Embedding::from(vec![ts_ms as f32; 128]),
+        }
+    }
+
+    /// (yaw, pitch) in the middle of each default target window.
+    fn angles(p: Pose) -> (f32, f32) {
+        match p {
+            Pose::Front => (0.0, 0.0),
+            Pose::Left => (-25.0, 0.0),
+            Pose::Right => (25.0, 0.0),
+            Pose::Up => (0.0, -20.0),
+            Pose::Down => (0.0, 20.0),
+        }
+    }
+
+    /// Offers a good front sample at `ts_ms` after `edit` spoils it; asserts `want` and that
+    /// nothing was stored (Review Focus 4).
+    fn assert_rejected(
+        edit: impl FnOnce(&mut Frame, &mut VisionReport, &mut Option<TrackEmbedding>),
+        want: RejectReason,
+    ) {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let (mut f, mut r, mut te) = (
+            frame(10, true),
+            report(10, vec![track(1, 0.0, 0.0)]),
+            Some(emb(1, 10)),
+        );
+        edit(&mut f, &mut r, &mut te);
+        assert_eq!(e.offer(&f, &r, te.as_ref()), SampleVerdict::Rejected(want));
+        assert_eq!(e.progress(), (0, 10));
+        assert_eq!(e.current_target(), Some(Pose::Front));
+        assert_eq!(
+            e.finish(),
+            Err(EnrolError::Incomplete { have: 0, need: 10 })
+        );
+    }
+
+    #[test]
+    fn default_config_matches_fr_id_002() {
+        let c = EnrolConfig::default();
+        assert_eq!((c.samples_per_pose, c.min_face_px), (2, 112.0));
+        let order: Vec<Pose> = c.pose_windows.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            order,
+            [Pose::Front, Pose::Left, Pose::Right, Pose::Up, Pose::Down]
+        );
+        assert_eq!(c.pose_windows[1].1.yaw, (-35.0, -15.0));
+        assert_eq!(c.pose_windows[4].1.pitch, (12.0, 30.0));
+        assert!(c.min_sharpness > 0.0);
+    }
+
+    #[test]
+    fn rejects_two_faces() {
+        assert_rejected(
+            |_, r, _| r.tracks.push(track(2, 0.0, 0.0)),
+            RejectReason::MultipleFaces,
+        );
+        assert_rejected(|_, r, _| r.tracks.clear(), RejectReason::NoFace);
+    }
+
+    #[test]
+    fn rejects_small_face() {
+        assert_rejected(
+            |_, r, _| r.tracks[0].face_width_px = 111.0,
+            RejectReason::TooSmall,
+        );
+        assert_rejected(
+            |_, r, _| r.tracks[0].face_width_px = f32::NAN,
+            RejectReason::TooSmall,
+        );
+    }
+
+    #[test]
+    fn rejects_blurred_frame() {
+        assert_rejected(|f, _, _| *f = frame(10, false), RejectReason::Blurry);
+    }
+
+    #[test]
+    fn rejects_spoof_and_unknown_liveness() {
+        assert_rejected(
+            |_, r, _| {
+                r.tracks[0].liveness = LivenessState::Spoof {
+                    score: 0.1,
+                    tier: LivenessTier::RgbTemporal,
+                }
+            },
+            RejectReason::SpoofDetected,
+        );
+        assert_rejected(
+            |_, r, _| r.tracks[0].liveness = LivenessState::Unknown,
+            RejectReason::NotLive,
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_pose_with_target() {
+        let want = RejectReason::WrongPose { want: Pose::Front };
+        assert_rejected(|_, r, _| r.tracks[0] = track(1, -25.0, 0.0), want);
+        assert_rejected(|_, r, _| r.tracks[0] = track(1, 0.0, 10.5), want);
+        assert_rejected(|_, r, _| r.tracks[0] = track(1, f32::NAN, 0.0), want);
+        assert_rejected(|_, r, _| r.tracks[0].head_pose = None, want);
+    }
+
+    #[test]
+    fn rejects_without_fresh_embedding() {
+        let want = RejectReason::NoEmbeddingYet;
+        assert_rejected(|_, _, te| *te = None, want);
+        assert_rejected(|_, _, te| *te = Some(emb(2, 10)), want);
+        assert_rejected(|_, _, te| *te = Some(emb(1, 9)), want);
+
+        // the same frame offered twice is stored once
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let (f, r, te) = (
+            frame(10, true),
+            report(10, vec![track(1, 0.0, 0.0)]),
+            emb(1, 10),
+        );
+        assert_eq!(
+            e.offer(&f, &r, Some(&te)),
+            SampleVerdict::Accepted { pose: Pose::Front }
+        );
+        assert_eq!(e.offer(&f, &r, Some(&te)), SampleVerdict::Rejected(want));
+        assert_eq!(e.progress(), (1, 10));
+    }
+
+    #[test]
+    fn rejects_when_camera_unhealthy() {
+        assert_rejected(
+            |_, r, _| r.camera_health = CameraHealth::Covered,
+            RejectReason::CameraUnhealthy,
+        );
+        assert_rejected(
+            |_, r, _| r.camera_health = CameraHealth::Error("gone".into()),
+            RejectReason::CameraUnhealthy,
+        );
+    }
+
+    #[test]
+    fn accepts_and_advances_in_order() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        let order = [Pose::Front, Pose::Left, Pose::Right, Pose::Up, Pose::Down];
+        let mut ts = 0;
+        for (i, pose) in order.into_iter().enumerate() {
+            // the next pose early is refused with the current target
+            if let Some(next) = order.get(i + 1) {
+                ts += 1;
+                let (y, p) = angles(*next);
+                let v = e.offer(
+                    &frame(ts, true),
+                    &report(ts, vec![track(1, y, p)]),
+                    Some(&emb(1, ts)),
+                );
+                assert_eq!(
+                    v,
+                    SampleVerdict::Rejected(RejectReason::WrongPose { want: pose })
+                );
+            }
+            for k in 0..2 {
+                assert_eq!(e.current_target(), Some(pose));
+                assert_eq!(e.progress(), (i * 2 + k, 10));
+                ts += 1;
+                let (y, p) = angles(pose);
+                let v = e.offer(
+                    &frame(ts, true),
+                    &report(ts, vec![track(1, y, p)]),
+                    Some(&emb(1, ts)),
+                );
+                assert_eq!(v, SampleVerdict::Accepted { pose });
+            }
+        }
+        assert_eq!((e.current_target(), e.progress()), (None, (10, 10)));
+        ts += 1;
+        let v = e.offer(
+            &frame(ts, true),
+            &report(ts, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, ts)),
+        );
+        assert_eq!(v, SampleVerdict::Complete);
+
+        let samples = e.finish().unwrap();
+        let poses: Vec<Pose> = samples.iter().map(|s| s.pose).collect();
+        let want: Vec<Pose> = order.iter().flat_map(|p| [*p, *p]).collect();
+        assert_eq!(poses, want);
+        assert!(
+            samples
+                .iter()
+                .all(|s| s.embedding.dim() == 128 && s.quality == 0.9)
+        );
+        // each sample keeps the embedding of the frame that was accepted
+        assert_ne!(samples[0].embedding, samples[1].embedding);
+    }
+
+    #[test]
+    fn finish_requires_all_poses() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        for ts in 1..=9 {
+            let pose =
+                [Pose::Front, Pose::Left, Pose::Right, Pose::Up, Pose::Down][(ts as usize - 1) / 2];
+            let (y, p) = angles(pose);
+            let v = e.offer(
+                &frame(ts, true),
+                &report(ts, vec![track(1, y, p)]),
+                Some(&emb(1, ts)),
+            );
+            assert_eq!(v, SampleVerdict::Accepted { pose });
+        }
+        assert_eq!(e.current_target(), Some(Pose::Down));
+        assert_eq!(
+            e.finish(),
+            Err(EnrolError::Incomplete { have: 9, need: 10 })
+        );
+    }
+
+    #[test]
+    fn sharpness_orders_sharp_above_blurred() {
+        let all = RectF {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+        let sharp = sharpness(&frame(0, true), all);
+        // 1-px checkerboard: every interior Laplacian is ±4·255
+        assert!((sharp - (4.0f32 * 255.0).powi(2)).abs() < 1.0, "{sharp}");
+        assert_eq!(sharpness(&frame(0, false), all), 0.0);
+
+        // a blurred step edge is less sharp than the crisp one
+        let edge = |soft: bool| {
+            let mut d = Vec::new();
+            for _y in 0..16 {
+                for x in 0..16u32 {
+                    let v = match (x, soft) {
+                        (0..7, _) => 0u8,
+                        (7, true) => 64,
+                        (8, true) => 192,
+                        _ => 255,
+                    };
+                    d.extend([v; 3]);
+                }
+            }
+            Frame::new(0, 0, 16, 16, d).unwrap()
+        };
+        assert!(sharpness(&edge(false), all) > sharpness(&edge(true), all));
+    }
+
+    #[test]
+    fn sharpness_of_empty_or_outside_crop_is_zero() {
+        let f = frame(0, true);
+        assert_eq!(
+            sharpness(
+                &f,
+                RectF {
+                    x: 2.0,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 0.5
+                }
+            ),
+            0.0
+        );
+        assert_eq!(
+            sharpness(
+                &f,
+                RectF {
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.0,
+                    h: 0.5
+                }
+            ),
+            0.0
+        );
+        assert_eq!(
+            sharpness(
+                &f,
+                RectF {
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.02,
+                    h: 0.5
+                }
+            ),
+            0.0
+        ); // 2 px wide
+        assert_eq!(
+            sharpness(
+                &f,
+                RectF {
+                    x: f32::NAN,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 0.5
+                }
+            ),
+            0.0
+        );
+        // a box hanging off the frame is clamped, not rejected
+        assert!(
+            sharpness(
+                &f,
+                RectF {
+                    x: 0.9,
+                    y: -0.5,
+                    w: 0.5,
+                    h: 1.0
+                }
+            ) > 0.0
+        );
+        let empty = Frame::new(0, 0, 0, 0, vec![]).unwrap();
+        assert_eq!(sharpness(&empty, FACE), 0.0);
+    }
+
+    /// RGB box blur of radius `r` (separable, edges clamped).
+    fn box_blur(f: &Frame, r: i64) -> Frame {
+        let (w, h) = (i64::from(f.width), i64::from(f.height));
+        let pass = |src: &[u8], horizontal: bool| -> Vec<u8> {
+            let mut out = vec![0u8; src.len()];
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let mut sum = 0u32;
+                        for d in -r..=r {
+                            let (sx, sy) = match horizontal {
+                                true => ((x + d).clamp(0, w - 1), y),
+                                false => (x, (y + d).clamp(0, h - 1)),
+                            };
+                            sum += u32::from(src[((sy * w + sx) * 3 + c) as usize]);
+                        }
+                        out[((y * w + x) * 3 + c) as usize] = (sum / (2 * r as u32 + 1)) as u8;
+                    }
+                }
+            }
+            out
+        };
+        let data = pass(&pass(&f.data, true), false);
+        Frame::new(0, 0, f.width, f.height, data).unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs .assets portraits (gitignored)"]
+    fn sharpness_threshold_separates_assets() {
+        use image::imageops::{FilterType, resize};
+        // hand-picked face boxes, normalised to each portrait
+        let faces = [
+            (
+                "face-a-1",
+                RectF {
+                    x: 0.38,
+                    y: 0.18,
+                    w: 0.24,
+                    h: 0.25,
+                },
+            ),
+            (
+                "face-a-2",
+                RectF {
+                    x: 0.38,
+                    y: 0.20,
+                    w: 0.20,
+                    h: 0.22,
+                },
+            ),
+            (
+                "face-b-1",
+                RectF {
+                    x: 0.35,
+                    y: 0.18,
+                    w: 0.31,
+                    h: 0.27,
+                },
+            ),
+        ];
+        let (mut sharp, mut blurred) = (Vec::new(), Vec::new());
+        for (name, bbox) in faces {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../.assets/{name}.jpg"));
+            let img = image::open(p).unwrap().to_rgb8();
+            // webcam-like scale: face box FACE_PX wide, as a 1080p enrolment frame would hold it
+            for face_px in [160.0f32, 240.0, 320.0] {
+                let k = face_px / (bbox.w * img.width() as f32);
+                let (w, h) = (
+                    (img.width() as f32 * k) as u32,
+                    (img.height() as f32 * k) as u32,
+                );
+                let small = resize(&img, w, h, FilterType::Triangle);
+                let f = Frame::new(0, 0, w, h, small.into_raw()).unwrap();
+                let (s, b) = (sharpness(&f, bbox), sharpness(&box_blur(&f, 3), bbox));
+                println!("{name} face {face_px}px: sharp {s:.1} blurred(r=3) {b:.2}");
+                sharp.push(s);
+                blurred.push(b);
+            }
+        }
+        let min_sharp = sharp.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_blur = blurred.iter().copied().fold(0.0, f32::max);
+        println!(
+            "min sharp {min_sharp:.1}, max blurred {max_blur:.2}, log midpoint {:.1}, default {}",
+            (min_sharp * max_blur).sqrt(),
+            DEFAULT_MIN_SHARPNESS
+        );
+        assert!(min_sharp > DEFAULT_MIN_SHARPNESS && DEFAULT_MIN_SHARPNESS > max_blur);
+    }
+}
