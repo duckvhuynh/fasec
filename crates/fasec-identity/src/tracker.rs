@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use fasec_core::{IdentityState, TrackEmbedding, TrackId, VisionReport};
+use fasec_core::{IdentityState, LivenessState, TrackEmbedding, TrackId, VisionReport};
 
 use crate::error::IdentityError;
 use crate::matcher::{Matcher, MatcherConfig};
@@ -76,6 +76,10 @@ impl IdentityTracker {
     /// A track missing from a report keeps its vote until it has been unseen for more than
     /// `VoterConfig::ttl_ms` (the vision tracker keeps its id that long). A report older than
     /// the previous one (camera restart) clears every vote first.
+    ///
+    /// Known requires a live face (SRS §5.1): a `Known` vote is reported as `Pending` while
+    /// the track's liveness is `Unknown` and as `Stranger` when it is `Spoof`. The vote itself
+    /// is kept, so a later `Live` verdict shows `Known` again.
     pub fn apply(&mut self, report: &mut VisionReport, embeddings: &[TrackEmbedding]) {
         let now = report.ts_ms;
         if self.last_ts.is_some_and(|last| now < last) {
@@ -99,11 +103,16 @@ impl IdentityTracker {
             self.states.insert(te.track, state);
         }
         for t in &mut report.tracks {
-            t.identity = self
-                .states
-                .get(&t.id)
-                .cloned()
-                .unwrap_or(IdentityState::Pending);
+            t.identity = match (self.states.get(&t.id), &t.liveness) {
+                (None, _) => IdentityState::Pending,
+                (Some(IdentityState::Known { score, .. }), LivenessState::Spoof { .. }) => {
+                    IdentityState::Stranger { best: *score }
+                }
+                (Some(IdentityState::Known { .. }), LivenessState::Unknown) => {
+                    IdentityState::Pending
+                }
+                (Some(s), _) => s.clone(),
+            };
         }
     }
 }
@@ -404,5 +413,34 @@ mod tests {
         let mut r = report(20, &[1]);
         t.apply(&mut r, &[emb(1, 20, unit(1))]);
         assert_eq!(ids(&r), [IdentityState::Pending]);
+    }
+
+    #[test]
+    fn known_needs_a_live_verdict() {
+        let g = gallery(MODEL);
+        let mut t = tracker(&g);
+        let with = |ts, liveness| {
+            let mut r = report(ts, &[1]);
+            r.tracks[0].liveness = liveness;
+            r
+        };
+        let spoof = LivenessState::Spoof {
+            score: 0.9,
+            tier: LivenessTier::Rgb,
+        };
+        let mut r = with(0, spoof);
+        t.apply(&mut r, &[emb(1, 0, unit(0))]);
+        assert!(
+            matches!(ids(&r)[0], IdentityState::Stranger { best } if (best - 1.0).abs() < 1e-5),
+            "{:?}",
+            ids(&r)
+        );
+        let mut r = with(100, LivenessState::Unknown);
+        t.apply(&mut r, &[]);
+        assert_eq!(ids(&r), [IdentityState::Pending]);
+        // the vote was kept: a live verdict reveals Known without a new embedding
+        let mut r = with(200, LIVE);
+        t.apply(&mut r, &[]);
+        assert!(is_known_owner(&ids(&r)[0]), "{:?}", ids(&r));
     }
 }
