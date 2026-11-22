@@ -21,6 +21,7 @@ clap = { version = "4.6.9", features = ["derive"] }
 fasec-config = { version = "0.0.1", path = "../fasec-config" }
 fasec-core = { version = "0.0.1", path = "../fasec-core" }
 fasec-identity = { version = "0.0.1", path = "../fasec-identity" }
+fasec-models = { version = "0.0.1", path = "../fasec-models" }
 fasec-vision = { version = "0.0.1", path = "../fasec-vision" }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1.0.229", features = ["derive"] }

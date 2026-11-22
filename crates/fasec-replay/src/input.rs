@@ -6,12 +6,28 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use fasec_replay::recording::{self, Recorded};
 
 /// One decoded RGB8 frame, row-major, `data.len() == width * height * 3`.
 pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    /// From an `ir_debug` recording: the step's RGB time and lit IR pair.
+    pub recorded: Option<Recorded>,
+}
+
+/// The steps of an `ir_debug` recording in `dir`, each RGB frame with its lit IR pair.
+pub fn open_recording(dir: &Path) -> Result<Box<dyn Iterator<Item = Result<RawFrame>>>> {
+    let steps = recording::read(dir)?;
+    Ok(Box::new(steps.map(|s| {
+        s.map(|(data, r)| RawFrame {
+            width: r.step.rgb_w,
+            height: r.step.rgb_h,
+            data,
+            recorded: Some(r),
+        })
+    })))
 }
 
 /// Programs used to decode video; tests point these at missing binaries.
@@ -46,6 +62,7 @@ pub fn open(input: &Path, ff: &Ffmpeg) -> Result<Box<dyn Iterator<Item = Result<
                 width: img.width(),
                 height: img.height(),
                 data: img.into_raw(),
+                recorded: None,
             })
         })));
     }
@@ -179,6 +196,7 @@ impl VideoFrames {
                 width: self.width,
                 height: self.height,
                 data,
+                recorded: None,
             }));
         }
         let status = self.child.wait().context("waiting for ffmpeg")?;

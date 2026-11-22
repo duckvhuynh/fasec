@@ -2,6 +2,10 @@
 //! clock and write one `VisionReport` per line (JSONL). Embeddings, when asked for, go to a
 //! separate `<out>.embeddings.jsonl` file, never into the report lines. With `--gallery`, each
 //! track's identity is matched against an encrypted face gallery (DPAPI, Windows only).
+//!
+//! `--ir-input <dir>` replays a recording made by the `ir_debug` example instead: each RGB frame
+//! at its recorded time with its lit IR pair, and each line gains an `ir` object holding every
+//! IR cue per track (for tuning the IR thresholds, Task 7).
 
 mod input;
 mod output;
@@ -14,12 +18,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fasec_config::ExecutionProvider;
-use fasec_core::{CameraHealth, Frame};
+use fasec_core::{CameraHealth, Frame, IrFrame};
 use fasec_identity::{Gallery, IdentityTracker, MatcherConfig, SecretProtector, VoterConfig};
+use fasec_replay::probe::IrProbe;
 use fasec_vision::{Pipeline, PipelineConfig, ProcessOutput, RECOGNISER_MODEL_ID, Runtime};
 
 use crate::input::{Ffmpeg, RawFrame};
-use crate::output::OutputOptions;
+use crate::output::{IrLine, OutputOptions};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -37,8 +42,12 @@ enum Cmd {
 #[derive(clap::Args)]
 struct RunArgs {
     /// Directory of `*.png`/`*.jpg` frames (sorted by file name) or a video file (needs ffmpeg).
-    #[arg(long)]
-    input: PathBuf,
+    #[arg(long, required_unless_present = "ir_input")]
+    input: Option<PathBuf>,
+    /// A recording session directory made by the `ir_debug` example (under
+    /// `%LOCALAPPDATA%\fasec\recordings`), replayed instead of `--input` at its recorded times.
+    #[arg(long, conflicts_with_all = ["input", "fps"])]
+    ir_input: Option<PathBuf>,
     /// Simulated frame rate: frame `i` gets `ts_ms = i * 1000 / fps`.
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..))]
     fps: u32,
@@ -82,13 +91,28 @@ impl From<Ep> for ExecutionProvider {
 
 /// The pipeline as `run` sees it; tests substitute a mock.
 trait Process {
-    fn process(&mut self, frame: &Frame) -> Result<ProcessOutput>;
+    /// `ir`: the lit IR frame recorded with `frame` and its ambient partner, if any.
+    fn process(
+        &mut self,
+        frame: &Frame,
+        ir: Option<(&IrFrame, Option<&IrFrame>)>,
+    ) -> Result<ProcessOutput>;
     fn desired_interval_ms(&self) -> u64;
 }
 
 impl Process for Pipeline {
-    fn process(&mut self, frame: &Frame) -> Result<ProcessOutput> {
-        Ok(Pipeline::process(self, frame, CameraHealth::Ok)?)
+    fn process(
+        &mut self,
+        frame: &Frame,
+        ir: Option<(&IrFrame, Option<&IrFrame>)>,
+    ) -> Result<ProcessOutput> {
+        // every recorded step has a lit pair; without one IR is `Lost`, as in `Pipeline::process`
+        let ir_health = if ir.is_some() {
+            CameraHealth::Ok
+        } else {
+            CameraHealth::Lost
+        };
+        Ok(self.process_with_ir(frame, ir, CameraHealth::Ok, ir_health)?)
     }
     fn desired_interval_ms(&self) -> u64 {
         Pipeline::desired_interval_ms(self)
@@ -102,8 +126,12 @@ struct WithIdentity<'a> {
 }
 
 impl Process for WithIdentity<'_> {
-    fn process(&mut self, frame: &Frame) -> Result<ProcessOutput> {
-        let mut out = self.inner.process(frame)?;
+    fn process(
+        &mut self,
+        frame: &Frame,
+        ir: Option<(&IrFrame, Option<&IrFrame>)>,
+    ) -> Result<ProcessOutput> {
+        let mut out = self.inner.process(frame, ir)?;
         self.tracker.apply(&mut out.report, &out.embeddings);
         Ok(out)
     }
@@ -138,10 +166,12 @@ fn open_identity(path: &Path) -> Result<IdentityTracker> {
 }
 
 /// Feeds every frame to `p` (no skipping) and writes one line each to `w`, plus each embedding
-/// computed on it to `emb` if given; returns the frame count.
+/// computed on it to `emb` if given; returns the frame count. A recorded frame keeps its RGB
+/// time and goes in with its lit IR pair, which `probe` (if given) measures for the line.
 fn run(
     frames: impl Iterator<Item = Result<RawFrame>>,
     p: &mut dyn Process,
+    mut probe: Option<&mut IrProbe>,
     fps: u32,
     opts: OutputOptions,
     w: &mut dyn Write,
@@ -151,13 +181,24 @@ fn run(
     let mut n = 0;
     for (seq, raw) in (0u64..).zip(frames) {
         let raw = raw.with_context(|| format!("frame {seq}"))?;
-        let ts_ms = seq * 1000 / u64::from(fps);
+        let rec = raw.recorded.as_ref();
+        let ts_ms = rec.map_or(seq * 1000 / u64::from(fps), |r| r.step.rgb_ts_ms);
         let frame = Frame::new(seq, ts_ms, raw.width, raw.height, raw.data)?;
-        let out = p.process(&frame).with_context(|| format!("frame {seq}"))?;
+        let ir = rec.map(|r| (&r.lit, r.ambient.as_ref()));
+        let out = p
+            .process(&frame, ir)
+            .with_context(|| format!("frame {seq}"))?;
+        let ir_line = match (rec, probe.as_deref_mut()) {
+            (Some(r), Some(probe)) => probe
+                .measure(&r.lit, r.ambient.as_ref(), &out.report.tracks)
+                .with_context(|| format!("IR of frame {seq}"))?
+                .map(|f| IrLine::new(&r.step, &f, &out.ir)),
+            _ => None,
+        };
         if let Some(e) = emb.as_deref_mut() {
             output::write_embeddings(e, out.report.seq, &out.embeddings)?;
         }
-        output::write_line(w, out.report, p.desired_interval_ms(), opts)?;
+        output::write_line(w, out.report, ir_line, p.desired_interval_ms(), opts)?;
         n += 1;
     }
     w.flush()?;
@@ -177,19 +218,28 @@ fn replay(args: &RunArgs) -> Result<u64> {
     );
     // Gallery and input opened first so either fails before the models load.
     let tracker = args.gallery.as_deref().map(open_identity).transpose()?;
-    let frames = input::open(&args.input, &Ffmpeg::default())?;
+    let frames = match (&args.ir_input, &args.input) {
+        (Some(dir), _) => input::open_recording(dir)?,
+        (None, Some(input)) => input::open(input, &Ffmpeg::default())?,
+        (None, None) => anyhow::bail!("--input or --ir-input is required"),
+    };
     let rt = Runtime::new(args.ep.into())?;
-    let mut p = Pipeline::from_models(&rt, &args.models, PipelineConfig::default())
-        .with_context(|| format!("loading models from {}", args.models.display()))?;
+    let cfg = PipelineConfig::default();
+    let loading = || format!("loading models from {}", args.models.display());
+    let mut p = Pipeline::from_models(&rt, &args.models, cfg).with_context(loading)?;
+    let mut probe = match &args.ir_input {
+        Some(_) => Some(IrProbe::from_models(&rt, &args.models, cfg.ir).with_context(loading)?),
+        None => None,
+    };
     match tracker {
         Some(tracker) => {
             let mut p = WithIdentity {
                 inner: &mut p,
                 tracker,
             };
-            write_outputs(args, frames, &mut p)
+            write_outputs(args, frames, &mut p, probe.as_mut())
         }
-        None => write_outputs(args, frames, &mut p),
+        None => write_outputs(args, frames, &mut p, probe.as_mut()),
     }
 }
 
@@ -198,6 +248,7 @@ fn write_outputs(
     args: &RunArgs,
     frames: impl Iterator<Item = Result<RawFrame>>,
     p: &mut dyn Process,
+    probe: Option<&mut IrProbe>,
 ) -> Result<u64> {
     let opts = OutputOptions {
         with_timings: args.with_timings,
@@ -210,7 +261,7 @@ fn write_outputs(
     let Some(path) = &args.out else {
         anyhow::ensure!(!args.with_embeddings, EMBEDDINGS_NEED_OUT);
         let mut w = std::io::stdout().lock();
-        return run(frames, p, args.fps, opts, &mut w, None);
+        return run(frames, p, probe, args.fps, opts, &mut w, None);
     };
     let side = output::embeddings_path(path);
     let mut emb = if args.with_embeddings {
@@ -225,7 +276,7 @@ fn write_outputs(
         }
     };
     let emb = emb.as_mut().map(|w| w as &mut dyn Write);
-    run(frames, p, args.fps, opts, &mut create(path)?, emb)
+    run(frames, p, probe, args.fps, opts, &mut create(path)?, emb)
 }
 
 fn main() -> Result<()> {
@@ -239,8 +290,12 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use fasec_core::{
-        IdentityState, LivenessState, LivenessTier, PointF, RectF, StageTimings, TrackEmbedding,
-        TrackId, TrackObs, VisionReport,
+        HeadPose, IdentityState, LivenessState, LivenessTier, PointF, RectF, StageTimings,
+        TrackEmbedding, TrackId, TrackObs, VisionReport,
+    };
+    use fasec_replay::recording::Recorder;
+    use fasec_vision::{
+        Detection, FaceDetector, FaceEmbedder, LivenessModel, PoseEstimator, VisionError,
     };
 
     use super::*;
@@ -252,7 +307,11 @@ mod tests {
     }
 
     impl Process for Mock {
-        fn process(&mut self, f: &Frame) -> Result<ProcessOutput> {
+        fn process(
+            &mut self,
+            f: &Frame,
+            _: Option<(&IrFrame, Option<&IrFrame>)>,
+        ) -> Result<ProcessOutput> {
             self.seen
                 .push((f.seq, f.ts_ms, f.width, f.height, f.data[0]));
             let p = PointF { x: 0.5, y: 0.5 };
@@ -304,6 +363,7 @@ mod tests {
             width,
             height,
             data: vec![v; (width * height * 3) as usize],
+            recorded: None,
         })
     }
 
@@ -326,7 +386,7 @@ mod tests {
         let mut mock = Mock::default();
         let mut out = Vec::new();
         let opts = OutputOptions::default();
-        let n = run(frames, &mut mock, 4, opts, &mut out, None).unwrap();
+        let n = run(frames, &mut mock, None, 4, opts, &mut out, None).unwrap();
         assert_eq!(n, 3);
         let seen: Vec<_> = mock.seen.iter().map(|s| (s.0, s.1, s.2, s.3)).collect();
         assert_eq!(seen, [(0, 0, 2, 2), (1, 250, 3, 2), (2, 500, 4, 2)]);
@@ -341,7 +401,16 @@ mod tests {
         let frames = || vec![raw(2, 2, 0), raw(2, 2, 1), raw(2, 2, 2)].into_iter();
         let mut out = Vec::new();
         let opts = OutputOptions::default();
-        run(frames(), &mut Mock::default(), 10, opts, &mut out, None).unwrap();
+        run(
+            frames(),
+            &mut Mock::default(),
+            None,
+            10,
+            opts,
+            &mut out,
+            None,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.ends_with('\n'));
         let lines: Vec<serde_json::Value> = text
@@ -363,7 +432,16 @@ mod tests {
 
         let mut out = Vec::new();
         let opts = OutputOptions { with_timings: true };
-        run(frames(), &mut Mock::default(), 10, opts, &mut out, None).unwrap();
+        run(
+            frames(),
+            &mut Mock::default(),
+            None,
+            10,
+            opts,
+            &mut out,
+            None,
+        )
+        .unwrap();
         let first: serde_json::Value =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(first["timings"]["detect_ms"], 1.5);
@@ -371,7 +449,8 @@ mod tests {
 
     fn args(out: Option<PathBuf>, with_embeddings: bool) -> RunArgs {
         RunArgs {
-            input: PathBuf::from("does-not-exist"),
+            input: Some(PathBuf::from("does-not-exist")),
+            ir_input: None,
             fps: 10,
             models: PathBuf::from("does-not-exist"),
             ep: Ep::Cpu,
@@ -393,6 +472,7 @@ mod tests {
             &args(Some(out.clone()), false),
             frames(),
             &mut Mock::default(),
+            None,
         )
         .unwrap();
         assert!(!side.exists(), "sidecar written without --with-embeddings");
@@ -401,6 +481,7 @@ mod tests {
             &args(Some(out.clone()), true),
             frames(),
             &mut Mock::default(),
+            None,
         )
         .unwrap();
         let report = std::fs::read_to_string(&out).unwrap();
@@ -427,6 +508,7 @@ mod tests {
             &args(Some(out.clone()), false),
             frames,
             &mut Mock::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -441,7 +523,12 @@ mod tests {
         // Refused before the input is opened or any model loads.
         let e = replay(&args(None, true)).unwrap_err();
         assert!(format!("{e:#}").contains("--out"), "{e:#}");
-        let e = write_outputs(&args(None, true), std::iter::empty(), &mut Mock::default());
+        let e = write_outputs(
+            &args(None, true),
+            std::iter::empty(),
+            &mut Mock::default(),
+            None,
+        );
         assert!(format!("{:#}", e.unwrap_err()).contains("--out"));
     }
 
@@ -452,6 +539,7 @@ mod tests {
         let err = run(
             frames,
             &mut Mock::default(),
+            None,
             10,
             OutputOptions::default(),
             &mut out,
@@ -469,7 +557,8 @@ mod tests {
         let go = |name: &str| {
             let out = tmp.path().join(name);
             let args = RunArgs {
-                input: root.join(".assets"),
+                input: Some(root.join(".assets")),
+                ir_input: None,
                 fps: 15,
                 models: root.join("models"),
                 ep: Ep::Cpu,
@@ -521,7 +610,16 @@ mod tests {
         };
         let frames = (0..5).map(|i| raw(2, 2, i));
         let mut out = Vec::new();
-        run(frames, &mut p, 10, OutputOptions::default(), &mut out, None).unwrap();
+        run(
+            frames,
+            &mut p,
+            None,
+            10,
+            OutputOptions::default(),
+            &mut out,
+            None,
+        )
+        .unwrap();
         let ids = identities(&String::from_utf8(out).unwrap());
         assert_eq!(ids[..4], vec![vec![IdentityState::Pending]; 4][..]);
         assert!(
@@ -582,7 +680,8 @@ mod tests {
             }
             let out = tmp.path().join(format!("{face}.jsonl"));
             let args = RunArgs {
-                input: dir,
+                input: Some(dir),
+                ir_input: None,
                 fps: 2,
                 models: root.join("models"),
                 ep: Ep::Cpu,
@@ -613,5 +712,196 @@ mod tests {
             matches!(b[11][..], [IdentityState::Stranger { .. }]),
             "{b:?}"
         );
+    }
+
+    #[test]
+    fn ir_input_replaces_input_and_fps() {
+        let parse = |s: &str| Cli::try_parse_from(s.split_whitespace());
+        let Cmd::Run(a) = parse("fasec-replay run --ir-input rec").unwrap().cmd;
+        assert_eq!((a.ir_input, a.input), (Some(PathBuf::from("rec")), None));
+        for bad in [
+            "fasec-replay run",
+            "fasec-replay run --ir-input rec --input d",
+            "fasec-replay run --ir-input rec --fps 5",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The IR fixtures: both cameras report one face at `FACE`, so the IR↔RGB mapping is the
+    /// identity, and a lit IR frame shows that face near the emitter.
+    const W: u32 = 100;
+    const FACE: RectF = RectF {
+        x: 0.3,
+        y: 0.3,
+        w: 0.4,
+        h: 0.4,
+    };
+
+    fn face() -> Detection {
+        let p = |x, y| PointF { x, y };
+        Detection {
+            bbox: FACE,
+            landmarks5: [
+                p(0.42, 0.45),
+                p(0.58, 0.45),
+                p(0.5, 0.55),
+                p(0.44, 0.65),
+                p(0.56, 0.65),
+            ],
+            score: 0.9,
+        }
+    }
+
+    struct OneFace;
+    impl FaceDetector for OneFace {
+        fn detect(&mut self, _: &Frame) -> Result<Vec<Detection>, VisionError> {
+            Ok(vec![face()])
+        }
+    }
+    struct StubEmb;
+    impl FaceEmbedder for StubEmb {
+        fn embed(&mut self, _: &Frame, _: &Detection) -> Result<Vec<f32>, VisionError> {
+            Ok(vec![1.0; 4])
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+    }
+    struct StubLive;
+    impl LivenessModel for StubLive {
+        fn score(&mut self, _: &Frame, _: &Detection) -> Result<f32, VisionError> {
+            Ok(0.9)
+        }
+        fn tier(&self) -> LivenessTier {
+            LivenessTier::Rgb
+        }
+    }
+    struct StubPose;
+    impl PoseEstimator for StubPose {
+        fn estimate(&mut self, _: &Frame, _: &Detection) -> Result<HeadPose, VisionError> {
+            Ok(HeadPose {
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                confidence: 1.0,
+            })
+        }
+    }
+
+    /// Background 20, face 150, nose `nose`: face mean 152.4, ring mean 20, nose ÷ cheeks
+    /// `nose` ÷ 150.
+    fn lit_face(seq: u64, nose: u8) -> IrFrame {
+        let data = (0..W * W)
+            .map(|i| match (i % W, i / W) {
+                (46..54, 51..59) => nose,
+                (30..70, 30..70) => 150,
+                _ => 20,
+            })
+            .collect();
+        IrFrame::new(seq, 40_000 + seq * 64, W, W, true, data).unwrap()
+    }
+
+    fn unlit(seq: u64, level: u8) -> IrFrame {
+        let data = vec![level; (W * W) as usize];
+        IrFrame::new(seq, 40_000 + seq * 64, W, W, false, data).unwrap()
+    }
+
+    #[test]
+    fn ir_input_writes_every_cue_per_track() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rec = Recorder::create(root.path(), "real-30cm", std::time::UNIX_EPOCH).unwrap();
+        // steps 0–4 build trust, 5 has a usable ambient frame, 6 a blanked one, 7–9 a flat face
+        for i in 0..10u64 {
+            let seq = 2 * i + 1;
+            let lit = lit_face(seq, if i >= 7 { 150 } else { 210 });
+            let ambient = match i {
+                5 => Some(unlit(seq - 1, 10)),
+                6 => Some(unlit(seq - 1, 0)),
+                _ => None,
+            };
+            let rgb = Frame::new(100 + i, 5000 + i * 130, W, W, vec![0; 30_000]).unwrap();
+            assert!(rec.write(&rgb, &lit, ambient.as_ref()).unwrap());
+        }
+        let frames = input::open_recording(rec.dir()).unwrap();
+        let (det, emb, live, pose) = (OneFace, StubEmb, StubLive, StubPose);
+        let cfg = PipelineConfig::default();
+        let mut p = Pipeline::new(
+            Box::new(det),
+            Box::new(emb),
+            Box::new(live),
+            Box::new(pose),
+            cfg,
+        );
+        let mut probe = IrProbe::new(Box::new(OneFace), cfg.ir);
+        let mut out = Vec::new();
+        let opts = OutputOptions::default();
+        let n = run(frames, &mut p, Some(&mut probe), 15, opts, &mut out, None).unwrap();
+        assert_eq!(n, 10);
+        let lines: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for (i, l) in (0u64..).zip(&lines) {
+            // the recorded RGB time, not one simulated from --fps
+            assert_eq!(l["ts_ms"], 5000 + i * 130);
+            let ir = &l["ir"];
+            assert_eq!((&ir["n"], &ir["ir_seq"]), (&i.into(), &(2 * i + 1).into()));
+            assert_eq!((&ir["ir_w"], &ir["ir_faces"]), (&W.into(), &1.into()));
+            assert_eq!(ir["trusted"], i >= 4, "{i}");
+        }
+        let track = |i: usize| &lines[i]["ir"]["tracks"][0];
+        let num = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN);
+        let close = |v: &serde_json::Value, want: f64| (num(v) - want).abs() < 1e-3;
+
+        // before trust nothing is measured
+        assert_eq!(track(0)["verdict"]["kind"], "Unknown");
+        assert_eq!(track(0)["evidence"]["kind"], "Absent");
+        assert!(track(0)["cues"].is_null() && track(0)["ir_face"].is_null());
+        // trusted: every cue, the per-frame verdict and the pipeline's evidence
+        let t = track(4);
+        assert_eq!(lines[4]["ir"]["ambient"], "missing");
+        assert_eq!(
+            t["verdict"],
+            serde_json::json!({"kind": "Live", "score": 0.8, "reason": null})
+        );
+        assert_eq!(
+            (&t["evidence"]["kind"], &t["tier"]),
+            (&"Live".into(), &"Ir".into())
+        );
+        assert_eq!(
+            t["ir_face"],
+            serde_json::json!({"x": 0.3, "y": 0.3, "w": 0.4, "h": 0.4})
+        );
+        let c = &t["cues"];
+        assert_eq!(
+            (&c["face_present"], &c["glints"]),
+            (&true.into(), &0.into())
+        );
+        assert!(
+            close(&c["lit_face"], 152.4) && close(&c["lit_background"], 20.0),
+            "{c}"
+        );
+        assert!(
+            close(&c["face_vs_background"], 7.62) && close(&c["relief"], 1.4),
+            "{c}"
+        );
+        // no ambient frame: these are null, not numbers
+        assert!(c["lit_minus_ambient"].is_null() && c["ambient_background"].is_null());
+
+        assert_eq!(lines[5]["ir"]["ambient"], "usable");
+        let c = &track(5)["cues"];
+        assert!(close(&c["lit_minus_ambient"], 142.4), "{c}");
+        assert!(close(&c["ambient_background"], 10.0), "{c}");
+        assert_eq!(lines[6]["ir"]["ambient"], "blank");
+        assert!(track(6)["cues"]["lit_minus_ambient"].is_null());
+        // a flat face: a spoof on every lit frame, the pipeline's evidence after three in a row
+        for (i, evidence) in [(7, "Absent"), (8, "Absent"), (9, "Spoof")] {
+            assert_eq!(track(i)["verdict"]["reason"], "FlatReflectance", "{i}");
+            assert!(close(&track(i)["cues"]["relief"], 1.0), "{i}");
+            assert_eq!(track(i)["evidence"]["kind"], evidence, "{i}");
+        }
+        assert_eq!(track(9)["evidence"]["reason"], "FlatReflectance");
     }
 }

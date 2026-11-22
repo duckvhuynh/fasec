@@ -290,7 +290,7 @@ pub fn ir_cues(
 
 /// A near-black unlit frame (mean < 1 and 99th percentile ≤ 8): the driver blanked it, so it
 /// carries no ambient level. Not `IrFrame::is_blank`, which needs every pixel at 0.
-fn ambient_is_blank(f: &IrFrame) -> bool {
+pub fn ambient_is_blank(f: &IrFrame) -> bool {
     let n = f.data.len();
     let total: u64 = f.data.iter().map(|&p| u64::from(p)).sum();
     let above = f.data.iter().filter(|&&p| p > 8).count();
