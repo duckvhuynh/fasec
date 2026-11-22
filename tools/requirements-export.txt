@@ -1,0 +1,9 @@
+# Pinned environment for tools/export_minifasnet.py (Python 3.12.10, CPU-only torch).
+# The SHA-256 values in models/manifest.toml are of an export made with exactly these versions.
+#   python -m venv .venv && .venv/Scripts/python -m pip install -r tools/requirements-export.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+onnx==1.23.2
+onnxscript==0.7.2
+onnxruntime==1.32.0
+numpy==2.5.5
