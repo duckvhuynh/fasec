@@ -1,5 +1,6 @@
 //! Margin-gated cosine matcher over the enrolled gallery (FR-ID-009).
 
+use crate::error::IdentityError;
 use crate::store::{PersonId, Role};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,11 +55,30 @@ impl std::fmt::Debug for Matcher {
 impl Matcher {
     /// One entry per template. Any unusable template disables matching entirely:
     /// silently dropping it could widen another person's margin.
-    pub fn new(templates: Vec<(PersonId, Role, Vec<f32>)>, cfg: MatcherConfig) -> Self {
+    ///
+    /// Errors (fail safe, never a matcher that could say `Known` wrongly): a non-finite
+    /// threshold or margin, threshold outside (0, 1], margin outside [0, 1)
+    /// (`InvalidConfig`), or one person listed with two roles (`InconsistentGallery`).
+    pub fn new(
+        templates: Vec<(PersonId, Role, Vec<f32>)>,
+        cfg: MatcherConfig,
+    ) -> Result<Self, IdentityError> {
+        // `contains` is false for NaN
+        if !(cfg.threshold > 0.0 && cfg.threshold <= 1.0) || !(0.0..1.0).contains(&cfg.margin) {
+            return Err(IdentityError::InvalidConfig(format!(
+                "matcher threshold must be in (0, 1] and margin in [0, 1), got {cfg:?}"
+            )));
+        }
         let dim = templates.first().map(|t| t.2.len());
         let mut valid = true;
         let mut persons: Vec<(PersonId, Role, Vec<Vec<f32>>)> = Vec::new();
         for (person, role, t) in templates {
+            if persons.iter().any(|p| p.0 == person && p.1 != role) {
+                return Err(IdentityError::InconsistentGallery(format!(
+                    "person {} is listed with two roles",
+                    person.0
+                )));
+            }
             let Some(t) = normalised(&t).filter(|t| Some(t.len()) == dim) else {
                 tracing::warn!(?person, "unusable template; matching disabled");
                 valid = false;
@@ -69,11 +89,11 @@ impl Matcher {
                 None => persons.push((person, role, vec![t])),
             }
         }
-        Self {
+        Ok(Self {
             persons,
             cfg,
             valid,
-        }
+        })
     }
 
     pub fn best(&self, embedding: &[f32]) -> MatchResult {
@@ -161,7 +181,8 @@ mod tests {
         let m = Matcher::new(
             vec![(pid("a"), Role::Owner, at(1.0, 1))],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         match m.best(&query()) {
             MatchResult::Known {
                 person,
@@ -180,7 +201,7 @@ mod tests {
     fn unnormalised_template_and_query_still_match() {
         let t: Vec<f32> = at(0.9, 1).iter().map(|x| x * 7.0).collect();
         let q: Vec<f32> = query().iter().map(|x| x * 0.01).collect();
-        let m = Matcher::new(vec![(pid("a"), Role::Owner, t)], MatcherConfig::default());
+        let m = Matcher::new(vec![(pid("a"), Role::Owner, t)], MatcherConfig::default()).unwrap();
         match m.best(&q) {
             MatchResult::Known { score, .. } => assert!((score - 0.9).abs() < 1e-5),
             other => panic!("expected Known, got {other:?}"),
@@ -192,7 +213,8 @@ mod tests {
         let m = Matcher::new(
             vec![(pid("a"), Role::Owner, at(0.30, 1))],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         match m.best(&query()) {
             MatchResult::Stranger { best } => assert!((best - 0.30).abs() < 1e-5),
             other => panic!("expected Stranger, got {other:?}"),
@@ -207,7 +229,8 @@ mod tests {
                 (pid("b"), Role::Authorised, at(0.47, 2)),
             ],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         match m.best(&query()) {
             MatchResult::Ambiguous { best, second } => {
                 assert!((best - 0.50).abs() < 1e-5);
@@ -225,7 +248,8 @@ mod tests {
                 (pid("b"), Role::Authorised, at(0.40, 2)),
             ],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         assert!(
             matches!(m.best(&query()), MatchResult::Known { person, .. } if person == pid("a"))
         );
@@ -243,7 +267,8 @@ mod tests {
                 (pid("a"), Role::Owner, at(0.88, 4)),
             ],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         match m.best(&query()) {
             MatchResult::Known { person, score, .. } => {
                 assert_eq!(person, pid("a"));
@@ -255,7 +280,7 @@ mod tests {
 
     #[test]
     fn empty_gallery_is_stranger() {
-        let m = Matcher::new(vec![], MatcherConfig::default());
+        let m = Matcher::new(vec![], MatcherConfig::default()).unwrap();
         assert_eq!(m.best(&query()), MatchResult::Stranger { best: 0.0 });
     }
 
@@ -264,7 +289,8 @@ mod tests {
         let m = Matcher::new(
             vec![(pid("a"), Role::Owner, at(1.0, 1))],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         let mut q = query();
         q[5] = f32::NAN;
         assert_eq!(m.best(&q), MatchResult::Stranger { best: 0.0 });
@@ -279,7 +305,8 @@ mod tests {
         let m = Matcher::new(
             vec![(pid("a"), Role::Owner, at(1.0, 1))],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(m.best(&query()[..64]), MatchResult::Stranger { best: 0.0 });
     }
 
@@ -295,7 +322,8 @@ mod tests {
                     (pid("b"), Role::Authorised, b),
                 ],
                 MatcherConfig::default(),
-            );
+            )
+            .unwrap();
             assert_eq!(m.best(&query()), MatchResult::Stranger { best: 0.0 });
         }
     }
@@ -305,7 +333,8 @@ mod tests {
         let m = Matcher::new(
             vec![(pid("a"), Role::Owner, at(0.123_456, 1))],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         assert!(!format!("{m:?}").contains("0.123"));
     }
 
@@ -316,10 +345,11 @@ mod tests {
         let m = Matcher::new(
             vec![(pid("a"), Role::Owner, at(cos, 1))],
             MatcherConfig {
-                threshold: -1.0,
+                threshold: f32::MIN_POSITIVE, // lowest valid threshold
                 margin: 0.0,
             },
-        );
+        )
+        .unwrap();
         match m.best(&query()) {
             MatchResult::Known { score, .. } => score,
             other => panic!("{other:?}"),
@@ -342,6 +372,7 @@ mod tests {
                     margin: 0.05,
                 },
             )
+            .unwrap()
             .best(&query())
         };
         assert!(matches!(at_t(s), MatchResult::Known { .. }));
@@ -349,12 +380,12 @@ mod tests {
         // default threshold 0.363 itself
         let d = MatcherConfig::default();
         assert_eq!((d.threshold, d.margin), (0.363, 0.05));
-        let just_below = Matcher::new(vec![(pid("a"), Role::Owner, at(0.362, 1))], d);
+        let just_below = Matcher::new(vec![(pid("a"), Role::Owner, at(0.362, 1))], d).unwrap();
         assert!(matches!(
             just_below.best(&query()),
             MatchResult::Stranger { .. }
         ));
-        let above = Matcher::new(vec![(pid("a"), Role::Owner, at(0.364, 1))], d);
+        let above = Matcher::new(vec![(pid("a"), Role::Owner, at(0.364, 1))], d).unwrap();
         assert!(matches!(above.best(&query()), MatchResult::Known { .. }));
     }
 
@@ -371,9 +402,10 @@ mod tests {
             pair(),
             MatcherConfig {
                 threshold: 0.363,
-                margin: 1.0,
+                margin: 0.5, // > the 0.1 gap, so Ambiguous
             },
         )
+        .unwrap()
         .best(&query())
         {
             MatchResult::Ambiguous { best, second } => (best, second),
@@ -388,6 +420,7 @@ mod tests {
                     margin,
                 },
             )
+            .unwrap()
             .best(&query())
         };
         assert!(matches!(run(gap), MatchResult::Known { .. }));
@@ -402,15 +435,23 @@ mod tests {
                 (pid("b"), Role::Authorised, at(0.9, 1)),
             ],
             MatcherConfig::default(),
-        );
+        )
+        .unwrap();
         assert!(matches!(m.best(&query()), MatchResult::Ambiguous { .. }));
     }
 
     /// A NaN threshold or margin must never turn a stranger into `Known`.
     #[test]
-    #[ignore = "BUG: NaN threshold/margin in MatcherConfig makes every comparison false, so best() returns Known (matcher.rs:112,116)"]
     fn nan_config_does_not_fail_open() {
-        let one = |cfg| Matcher::new(vec![(pid("a"), Role::Owner, at(0.0, 1))], cfg).best(&query());
+        // A refused config means no matcher; the caller treats that as no match (fail safe).
+        let best = |m: Result<Matcher, IdentityError>| match m {
+            Ok(m) => m.best(&query()),
+            Err(e) => {
+                assert!(matches!(e, IdentityError::InvalidConfig(_)), "{e:?}");
+                MatchResult::Stranger { best: 0.0 }
+            }
+        };
+        let one = |cfg| best(Matcher::new(vec![(pid("a"), Role::Owner, at(0.0, 1))], cfg));
         // query is orthogonal to the template: a real stranger
         let r = one(MatcherConfig {
             threshold: f32::NAN,
@@ -430,13 +471,40 @@ mod tests {
                 margin: f32::NAN,
             },
         );
-        let r = two.best(&query());
+        let r = best(two);
         assert!(!matches!(r, MatchResult::Known { .. }), "NaN margin: {r:?}");
+    }
+
+    #[test]
+    fn config_outside_bounds_is_refused() {
+        let new = |threshold, margin| {
+            Matcher::new(
+                vec![(pid("a"), Role::Owner, at(0.9, 1))],
+                MatcherConfig { threshold, margin },
+            )
+        };
+        for (t, m) in [(f32::MIN_POSITIVE, 0.0), (1.0, 0.999), (0.363, 0.05)] {
+            assert!(new(t, m).is_ok(), "({t}, {m})");
+        }
+        for (t, m) in [
+            (0.0, 0.05),
+            (-0.1, 0.05),
+            (1.0001, 0.05),
+            (f32::INFINITY, 0.05),
+            (0.363, -0.01),
+            (0.363, 1.0),
+            (0.363, f32::INFINITY),
+            (0.363, f32::NAN),
+        ] {
+            assert!(
+                matches!(new(t, m), Err(IdentityError::InvalidConfig(_))),
+                "({t}, {m})"
+            );
+        }
     }
 
     /// The same person id with conflicting roles must not yield an order-dependent role.
     #[test]
-    #[ignore = "BUG: Matcher::new keeps the first-seen role for a duplicated PersonId, so the granted role depends on row order (matcher.rs:70-73)"]
     fn conflicting_roles_for_one_person_are_order_independent() {
         let role_of = |first: Role, second: Role| {
             let m = Matcher::new(
@@ -446,7 +514,9 @@ mod tests {
                 ],
                 MatcherConfig::default(),
             );
-            match m.best(&query()) {
+            // conflicting roles are refused outright, in either order
+            assert!(matches!(m, Err(IdentityError::InconsistentGallery(_))));
+            match m.ok()?.best(&query()) {
                 MatchResult::Known { role, .. } => Some(role),
                 _ => None,
             }

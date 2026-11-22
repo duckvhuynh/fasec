@@ -207,6 +207,12 @@ impl Gallery {
         if embedding.len() != EMBEDDING_DIM || !embedding.iter().all(|v| v.is_finite()) {
             return Err(IdentityError::InvalidEmbedding);
         }
+        // `contains` is false for NaN, which would otherwise bind as SQL NULL
+        if !(0.0..=1.0).contains(&quality) {
+            return Err(IdentityError::InvalidTemplate(
+                "quality must be a finite value in [0, 1]".into(),
+            ));
+        }
         let mut plain = Zeroizing::new(Vec::with_capacity(EMBEDDING_DIM * 4));
         for v in embedding {
             plain.extend_from_slice(&v.to_le_bytes());
@@ -225,8 +231,8 @@ impl Gallery {
             ],
         );
         match res {
-            // Only the FK on person_id can be violated here.
-            Err(e) if is_constraint(&e) => Err(IdentityError::NotFound),
+            // The FK on person_id means the person does not exist; any other failure is `Db`.
+            Err(e) if is_foreign_key(&e) => Err(IdentityError::NotFound),
             Err(e) => Err(e.into()),
             Ok(_) => Ok(self.conn.last_insert_rowid()),
         }
@@ -365,6 +371,11 @@ impl Gallery {
 
 fn is_constraint(e: &rusqlite::Error) -> bool {
     e.sqlite_error_code() == Some(ErrorCode::ConstraintViolation)
+}
+
+fn is_foreign_key(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _)
+        if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
 }
 
 fn now() -> i64 {
@@ -778,7 +789,6 @@ mod tests {
     // ---- audit additions ----
 
     #[test]
-    #[ignore = "BUG: non-finite quality binds as SQL NULL, violates NOT NULL and is reported as NotFound for an existing person (store.rs:222-224)"]
     fn nan_quality_is_not_reported_as_missing_person() {
         let mut g = gallery();
         let alice = g.add_person("Alice", Role::Owner).unwrap();
@@ -788,6 +798,35 @@ mod tests {
             "misleading error: {res:?}"
         );
         assert!(res.is_err() || count(&g, "template") == 1);
+        for q in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+            assert!(matches!(
+                g.add_template(&alice, MODEL, Pose::Front, q, &embedding(0.1)),
+                Err(IdentityError::InvalidTemplate(_))
+            ));
+        }
+        for q in [0.0, 1.0] {
+            g.add_template(&alice, MODEL, Pose::Front, q, &embedding(0.1))
+                .unwrap();
+        }
+        assert_eq!(count(&g, "template"), 2);
+    }
+
+    #[test]
+    fn only_a_foreign_key_failure_is_not_found() {
+        let g = gallery();
+        let insert = |person: &str, pose: &str| {
+            g.conn
+                .execute(
+                    "INSERT INTO template (person_id, model_id, blob, pose, quality, created_at)
+                     VALUES (?1, 'm', x'00', ?2, 0.5, 0)",
+                    [person, pose],
+                )
+                .unwrap_err()
+        };
+        assert!(is_foreign_key(&insert("ghost", "front")));
+        // a CHECK violation is a constraint error too, but not the person FK
+        let check = insert("ghost", "sideways");
+        assert!(is_constraint(&check) && !is_foreign_key(&check));
     }
 
     #[test]

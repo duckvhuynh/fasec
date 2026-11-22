@@ -66,9 +66,13 @@ pub enum RejectReason {
     Blurry,
     NotLive,
     SpoofDetected,
-    WrongPose { want: Pose },
+    WrongPose {
+        want: Pose,
+    },
     NoEmbeddingYet,
     CameraUnhealthy,
+    /// `frame` is not the frame `report` describes, so its gates cannot vouch for it.
+    FrameMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +105,9 @@ pub struct Enrolment {
 }
 
 impl Enrolment {
-    pub fn new(cfg: EnrolConfig) -> Self {
+    /// `samples_per_pose` below 1 is raised to 1: an enrolment can never complete empty.
+    pub fn new(mut cfg: EnrolConfig) -> Self {
+        cfg.samples_per_pose = cfg.samples_per_pose.max(1);
         Enrolment {
             cfg,
             samples: Vec::new(),
@@ -154,6 +160,9 @@ impl Enrolment {
         want: Pose,
     ) -> Result<(f32, &'a TrackEmbedding), RejectReason> {
         use RejectReason::*;
+        if frame.ts_ms != report.ts_ms {
+            return Err(FrameMismatch);
+        }
         if report.camera_health != CameraHealth::Ok {
             return Err(CameraUnhealthy);
         }
@@ -717,7 +726,6 @@ mod tests {
     // ---- audit additions ----
 
     #[test]
-    #[ignore = "BUG: samples_per_pose = 0 makes finish() return Ok(empty) - an enrolment with no templates succeeds (enrol.rs:118-123,213-219)"]
     fn zero_samples_per_pose_is_never_a_complete_enrolment() {
         let mut e = Enrolment::new(EnrolConfig {
             samples_per_pose: 0,
@@ -728,6 +736,7 @@ mod tests {
             &report(10, vec![track(1, 0.0, 0.0)]),
             Some(&emb(1, 10)),
         );
+        assert_eq!(e.progress(), (1, 5));
         assert!(
             !matches!(e.finish(), Ok(s) if s.is_empty()),
             "empty enrolment reported success"
@@ -737,7 +746,6 @@ mod tests {
     /// Sharpness is measured on `frame`, the embedding on the frame at `report.ts_ms`;
     /// a sharp unrelated frame must not vouch for a blurry embedding frame.
     #[test]
-    #[ignore = "BUG: frame.ts_ms is never compared with report.ts_ms / embedding ts, so the blur gate can run on a different frame (enrol.rs:163-169,187-195)"]
     fn frame_from_another_timestamp_is_rejected() {
         let mut e = Enrolment::new(EnrolConfig::default());
         let v = e.offer(
@@ -747,6 +755,13 @@ mod tests {
         );
         assert!(matches!(v, SampleVerdict::Rejected(_)), "{v:?}");
         assert_eq!(e.progress().0, 0);
+        // checked before any gate: a mismatched frame reports the mismatch, not blur
+        let v = e.offer(
+            &frame(5, false),
+            &report(10, vec![track(1, 0.0, 0.0)]),
+            Some(&emb(1, 10)),
+        );
+        assert_eq!(v, SampleVerdict::Rejected(RejectReason::FrameMismatch));
     }
 
     #[test]

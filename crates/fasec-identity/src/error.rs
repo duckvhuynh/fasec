@@ -26,6 +26,14 @@ pub enum IdentityError {
     /// Embedding is not `EMBEDDING_DIM` finite values.
     #[error("embedding must be {} finite values", crate::store::EMBEDDING_DIM)]
     InvalidEmbedding,
+    /// Template metadata (e.g. quality) is out of range.
+    #[error("invalid template: {0}")]
+    InvalidTemplate(String),
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    /// Gallery rows contradict each other (e.g. one person with two roles).
+    #[error("inconsistent gallery: {0}")]
+    InconsistentGallery(String),
 }
 
 impl From<rusqlite::Error> for IdentityError {
