@@ -13,19 +13,56 @@ pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
-    /// From an `ir_debug` recording: the step's RGB time and lit IR pair.
-    pub recorded: Option<Recorded>,
+    /// From an `ir_debug` recording: its index among the recordings replayed, and the step's
+    /// RGB time and lit IR pair.
+    pub recorded: Option<(usize, Recorded)>,
 }
 
-/// The steps of an `ir_debug` recording in `dir`, each RGB frame with its lit IR pair.
-pub fn open_recording(dir: &Path) -> Result<Box<dyn Iterator<Item = Result<RawFrame>>>> {
-    let steps = recording::read(dir)?;
-    Ok(Box::new(steps.map(|s| {
-        s.map(|(data, r)| RawFrame {
+/// RGB time from one recording's last step to the next one's first: about one recorded step.
+const JOIN_GAP_MS: u64 = 500;
+/// IR seqs from one recording's last lit frame to the next one's: one unlit frame between.
+const JOIN_GAP_SEQ: u64 = 2;
+
+/// The steps of the `ir_debug` recordings in `dirs`, one after another, each RGB frame with its
+/// lit IR pair. Each recording is a separate capture whose RGB time and IR seqs start over, so
+/// every one after the first is shifted to continue right after the one before, as one capture
+/// would: the pipeline then keeps its IR trust and never sees time or seqs go back.
+pub fn open_recordings(dirs: &[PathBuf]) -> Result<Box<dyn Iterator<Item = Result<RawFrame>>>> {
+    let sessions = dirs
+        .iter()
+        .map(|d| recording::read(d))
+        .collect::<Result<Vec<_>>>()?;
+    let steps = (0..)
+        .zip(sessions)
+        .flat_map(|(k, s)| s.map(move |r| (k, r)));
+    // (RGB time, IR seq): the current recording's first, where it now starts, the last given
+    let (mut current, mut first, mut start, mut last) = (None, (0, 0), (0, 0), (0, 0));
+    Ok(Box::new(steps.map(move |(k, r)| {
+        let (data, mut r) = r?;
+        if current != Some(k) {
+            first = (r.step.rgb_ts_ms, r.step.ir_seq);
+            start = match current {
+                None => first,
+                Some(_) => (last.0 + JOIN_GAP_MS, last.1 + JOIN_GAP_SEQ),
+            };
+            current = Some(k);
+        }
+        let seq = |s: u64| (s + start.1).saturating_sub(first.1);
+        r.step.rgb_ts_ms = (r.step.rgb_ts_ms + start.0).saturating_sub(first.0);
+        r.step.ir_seq = seq(r.step.ir_seq);
+        r.lit.seq = seq(r.lit.seq);
+        if let Some(a) = &mut r.ambient {
+            a.seq = seq(a.seq);
+        }
+        if let Some(a) = &mut r.step.ambient {
+            a.seq = seq(a.seq);
+        }
+        last = (r.step.rgb_ts_ms, r.step.ir_seq);
+        Ok(RawFrame {
             width: r.step.rgb_w,
             height: r.step.rgb_h,
             data,
-            recorded: Some(r),
+            recorded: Some((k, r)),
         })
     })))
 }

@@ -3,9 +3,9 @@
 //! separate `<out>.embeddings.jsonl` file, never into the report lines. With `--gallery`, each
 //! track's identity is matched against an encrypted face gallery (DPAPI, Windows only).
 //!
-//! `--ir-input <dir>` replays a recording made by the `ir_debug` example instead: each RGB frame
-//! at its recorded time with its lit IR pair, and each line gains an `ir` object holding every
-//! IR cue per track (for tuning the IR thresholds, Task 7).
+//! `--ir-input <dir>...` replays recordings made by the `ir_debug` example instead: each RGB
+//! frame at its recorded time with its lit IR pair, and each line gains an `ir` object holding
+//! every IR cue per track (for tuning the IR thresholds, Task 7).
 
 mod input;
 mod output;
@@ -44,10 +44,12 @@ struct RunArgs {
     /// Directory of `*.png`/`*.jpg` frames (sorted by file name) or a video file (needs ffmpeg).
     #[arg(long, required_unless_present = "ir_input")]
     input: Option<PathBuf>,
-    /// A recording session directory made by the `ir_debug` example (under
-    /// `%LOCALAPPDATA%\fasec\recordings`), replayed instead of `--input` at its recorded times.
-    #[arg(long, conflicts_with_all = ["input", "fps"])]
-    ir_input: Option<PathBuf>,
+    /// Recording session directories made by the `ir_debug` example (under
+    /// `%LOCALAPPDATA%\fasec\recordings`), replayed instead of `--input` at their recorded times.
+    /// Several are replayed in order through one pipeline, each continuing 500 ms after the last,
+    /// so IR trust earned in one carries into the next.
+    #[arg(long, num_args = 1.., conflicts_with_all = ["input", "fps"])]
+    ir_input: Vec<PathBuf>,
     /// Simulated frame rate: frame `i` gets `ts_ms = i * 1000 / fps`.
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..))]
     fps: u32,
@@ -181,7 +183,8 @@ fn run(
     let mut n = 0;
     for (seq, raw) in (0u64..).zip(frames) {
         let raw = raw.with_context(|| format!("frame {seq}"))?;
-        let rec = raw.recorded.as_ref();
+        let session = raw.recorded.as_ref().map_or(0, |r| r.0);
+        let rec = raw.recorded.as_ref().map(|r| &r.1);
         let ts_ms = rec.map_or(seq * 1000 / u64::from(fps), |r| r.step.rgb_ts_ms);
         let frame = Frame::new(seq, ts_ms, raw.width, raw.height, raw.data)?;
         let ir = rec.map(|r| (&r.lit, r.ambient.as_ref()));
@@ -192,7 +195,7 @@ fn run(
             (Some(r), Some(probe)) => probe
                 .measure(&r.lit, r.ambient.as_ref(), &out.report.tracks)
                 .with_context(|| format!("IR of frame {seq}"))?
-                .map(|f| IrLine::new(&r.step, &f, &out.ir)),
+                .map(|f| IrLine::new(session, &r.step, &f, &out.ir)),
             _ => None,
         };
         if let Some(e) = emb.as_deref_mut() {
@@ -218,18 +221,18 @@ fn replay(args: &RunArgs) -> Result<u64> {
     );
     // Gallery and input opened first so either fails before the models load.
     let tracker = args.gallery.as_deref().map(open_identity).transpose()?;
-    let frames = match (&args.ir_input, &args.input) {
-        (Some(dir), _) => input::open_recording(dir)?,
-        (None, Some(input)) => input::open(input, &Ffmpeg::default())?,
-        (None, None) => anyhow::bail!("--input or --ir-input is required"),
+    let frames = match (&args.ir_input[..], &args.input) {
+        ([], Some(input)) => input::open(input, &Ffmpeg::default())?,
+        ([], None) => anyhow::bail!("--input or --ir-input is required"),
+        (dirs, _) => input::open_recordings(dirs)?,
     };
     let rt = Runtime::new(args.ep.into())?;
     let cfg = PipelineConfig::default();
     let loading = || format!("loading models from {}", args.models.display());
     let mut p = Pipeline::from_models(&rt, &args.models, cfg).with_context(loading)?;
-    let mut probe = match &args.ir_input {
-        Some(_) => Some(IrProbe::from_models(&rt, &args.models, cfg.ir).with_context(loading)?),
-        None => None,
+    let mut probe = match &args.ir_input[..] {
+        [] => None,
+        _ => Some(IrProbe::from_models(&rt, &args.models, cfg.ir).with_context(loading)?),
     };
     match tracker {
         Some(tracker) => {
@@ -450,7 +453,7 @@ mod tests {
     fn args(out: Option<PathBuf>, with_embeddings: bool) -> RunArgs {
         RunArgs {
             input: Some(PathBuf::from("does-not-exist")),
-            ir_input: None,
+            ir_input: Vec::new(),
             fps: 10,
             models: PathBuf::from("does-not-exist"),
             ep: Ep::Cpu,
@@ -558,7 +561,7 @@ mod tests {
             let out = tmp.path().join(name);
             let args = RunArgs {
                 input: Some(root.join(".assets")),
-                ir_input: None,
+                ir_input: Vec::new(),
                 fps: 15,
                 models: root.join("models"),
                 ep: Ep::Cpu,
@@ -681,7 +684,7 @@ mod tests {
             let out = tmp.path().join(format!("{face}.jsonl"));
             let args = RunArgs {
                 input: Some(dir),
-                ir_input: None,
+                ir_input: Vec::new(),
                 fps: 2,
                 models: root.join("models"),
                 ep: Ep::Cpu,
@@ -718,7 +721,11 @@ mod tests {
     fn ir_input_replaces_input_and_fps() {
         let parse = |s: &str| Cli::try_parse_from(s.split_whitespace());
         let Cmd::Run(a) = parse("fasec-replay run --ir-input rec").unwrap().cmd;
-        assert_eq!((a.ir_input, a.input), (Some(PathBuf::from("rec")), None));
+        assert_eq!((a.ir_input, a.input), (vec![PathBuf::from("rec")], None));
+        let Cmd::Run(a) = parse("fasec-replay run --ir-input a b --ep cpu")
+            .unwrap()
+            .cmd;
+        assert_eq!(a.ir_input, [PathBuf::from("a"), PathBuf::from("b")]);
         for bad in [
             "fasec-replay run",
             "fasec-replay run --ir-input rec --input d",
@@ -823,7 +830,7 @@ mod tests {
             let rgb = Frame::new(100 + i, 5000 + i * 130, W, W, vec![0; 30_000]).unwrap();
             assert!(rec.write(&rgb, &lit, ambient.as_ref()).unwrap());
         }
-        let frames = input::open_recording(rec.dir()).unwrap();
+        let frames = input::open_recordings(&[rec.dir().to_owned()]).unwrap();
         let (det, emb, live, pose) = (OneFace, StubEmb, StubLive, StubPose);
         let cfg = PipelineConfig::default();
         let mut p = Pipeline::new(
@@ -903,5 +910,222 @@ mod tests {
             assert_eq!(track(i)["evidence"]["kind"], evidence, "{i}");
         }
         assert_eq!(track(9)["evidence"]["reason"], "FlatReflectance");
+    }
+
+    /// A face on any frame bright at its centre: the RGB frames below and a lit IR face, never
+    /// the dark IR frame of a phone.
+    struct BrightFace;
+    impl FaceDetector for BrightFace {
+        fn detect(&mut self, f: &Frame) -> Result<Vec<Detection>, VisionError> {
+            let centre = (50 * f.width as usize + 50) * 3;
+            Ok(if f.data[centre] > 100 {
+                vec![face()]
+            } else {
+                vec![]
+            })
+        }
+    }
+
+    #[test]
+    fn several_recordings_replay_through_one_pipeline() {
+        let root = tempfile::tempdir().unwrap();
+        // two app runs: each recording starts at the same RGB time and IR seq
+        let record = |label: &str, nose: Option<u8>| {
+            let mut rec = Recorder::create(root.path(), label, std::time::UNIX_EPOCH).unwrap();
+            for i in 0..6u64 {
+                let seq = 2 * i + 1;
+                let lit = nose.map_or_else(|| unlit_as_lit(seq), |n| lit_face(seq, n));
+                let rgb = Frame::new(100 + i, 5000 + i * 130, W, W, vec![200; 30_000]).unwrap();
+                assert!(rec.write(&rgb, &lit, None).unwrap());
+            }
+            rec.dir().to_owned()
+        };
+        let dirs = [record("real-50cm", Some(130)), record("phone-photo", None)];
+        let frames = input::open_recordings(&dirs).unwrap();
+        let cfg = PipelineConfig::default();
+        let mut p = Pipeline::new(
+            Box::new(BrightFace),
+            Box::new(StubEmb),
+            Box::new(StubLive),
+            Box::new(StubPose),
+            cfg,
+        );
+        let mut probe = IrProbe::new(Box::new(BrightFace), cfg.ir);
+        let mut out = Vec::new();
+        let opts = OutputOptions::default();
+        assert_eq!(
+            run(frames, &mut p, Some(&mut probe), 15, opts, &mut out, None).unwrap(),
+            12
+        );
+        let lines: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let ts: Vec<u64> = lines.iter().map(|l| l["ts_ms"].as_u64().unwrap()).collect();
+        // the second recording continues 500 ms after the first
+        assert_eq!(ts[..7], [5000, 5130, 5260, 5390, 5520, 5650, 6150]);
+        assert_eq!(ts[11], 6150 + 5 * 130);
+        let ir = |i: usize| &lines[i]["ir"];
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!(l["ir"]["session"], i / 6, "{i}");
+            assert_eq!(l["ir"]["n"], i % 6, "{i}");
+        }
+        assert_eq!(ir(5)["tracks"][0]["evidence"]["kind"], "Live");
+        // trust earned on the face carries into the phone recording: no IR face is a spoof,
+        // the pipeline's evidence after three lit frames in a row, beating the RGB Live
+        for (i, l) in lines.iter().enumerate().skip(6) {
+            let ir = &l["ir"];
+            assert_eq!((&ir["trusted"], &ir["ir_faces"]), (&true.into(), &0.into()));
+            let t = &ir["tracks"][0];
+            assert_eq!(t["verdict"]["reason"], "NoIrFace", "{i}");
+            let want = if i < 8 { "Absent" } else { "Spoof" };
+            assert_eq!(t["evidence"]["kind"], want, "{i}");
+            let live = &l["tracks"][0]["liveness"];
+            let want = if i < 8 { "Live" } else { "Spoof" };
+            assert!(live.get(want).is_some(), "{i}: {live}");
+        }
+    }
+
+    /// Task 7's exit criteria on the owner's recordings in `%LOCALAPPDATA%\fasec\recordings`
+    /// (`<label>-<yyyymmdd-hhmmss>` from `ir_debug`), per label, with the numbers printed:
+    /// - `real-*`, each replayed alone: Live on the IR tier on ≥ 95 % of the tracks on frames
+    ///   whose IR mapping is trusted (from the fifth lit frame on);
+    /// - `phone-*`, each replayed after each `real-*` through one pipeline: Spoof on ≥ 99 % of
+    ///   its tracks once the mapping is trusted and the spoof streak can be met (from its
+    ///   `spoof_frames`-th trusted frame with a face on).
+    #[test]
+    #[ignore = "needs local recordings"]
+    fn exit_criteria_on_the_owner_recordings() {
+        use fasec_replay::recording::{FRAMES_FILE, recordings_root};
+        type Line = serde_json::Value;
+        let root = recordings_root().expect("LOCALAPPDATA");
+        let mut dirs: Vec<(String, PathBuf)> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                let name = path.file_name()?.to_str()?;
+                let label = name
+                    .get(..name.len().checked_sub("-yyyymmdd-hhmmss".len())?)?
+                    .to_owned();
+                let steps = std::fs::metadata(path.join(FRAMES_FILE)).is_ok_and(|m| m.len() > 0);
+                steps.then_some((label, path))
+            })
+            .collect();
+        dirs.sort();
+        let of = |prefix: &str| -> Vec<(String, PathBuf)> {
+            let mut v = dirs.clone();
+            v.retain(|(l, _)| l.starts_with(prefix));
+            v
+        };
+        // The owner's face is in view beside the phone in this take (an IR face with live cues at
+        // the real-50cm box on its first 5 steps, a second large face later); re-recorded as
+        // phone-photo-20261122-103933.
+        const NOT_PHONE_ONLY: [&str; 1] = ["phone-photo-20261122-103919"];
+        let (real, mut phone) = (of("real-"), of("phone-"));
+        phone.retain(|(_, p)| !NOT_PHONE_ONLY.iter().any(|n| p.ends_with(n)));
+        assert!(
+            !real.is_empty() && !phone.is_empty(),
+            "no real-* and phone-* recordings in {}",
+            root.display()
+        );
+
+        let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        let rt = Runtime::new(ExecutionProvider::Cpu).unwrap();
+        let cfg = PipelineConfig::default();
+        let replay = |dirs: &[PathBuf]| -> Vec<Line> {
+            let mut p = Pipeline::from_models(&rt, &models, cfg).unwrap();
+            let mut probe = IrProbe::from_models(&rt, &models, cfg.ir).unwrap();
+            let frames = input::open_recordings(dirs).unwrap();
+            let mut out = Vec::new();
+            let opts = OutputOptions::default();
+            run(frames, &mut p, Some(&mut probe), 15, opts, &mut out, None).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let trusted = |l: &&Line| l["ir"]["trusted"] == true && l["tracks"][0].is_object();
+        let tracks = |l: &Line| l["tracks"].as_array().unwrap().clone();
+        let pct = |k: usize, n: usize| 100.0 * k as f64 / n as f64;
+
+        // label -> (tracks, Live on the IR tier)
+        let mut live: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for (label, dir) in &real {
+            let lines = replay(std::slice::from_ref(dir));
+            let t: Vec<Line> = lines.iter().filter(trusted).flat_map(tracks).collect();
+            let ok = t
+                .iter()
+                .filter(|t| t["liveness"]["Live"]["tier"] == "Ir")
+                .count();
+            eprintln!(
+                "{}: {} lines, {} trusted tracks, {ok} Live/Ir",
+                dir.file_name().unwrap().display(),
+                lines.len(),
+                t.len()
+            );
+            let e = live.entry(label.clone()).or_default();
+            (e.0, e.1) = (e.0 + t.len(), e.1 + ok);
+        }
+        // label -> (tracks, Spoof, of which by IR evidence)
+        let mut spoof: std::collections::BTreeMap<String, (usize, usize, usize)> =
+            Default::default();
+        let skip = usize::from(cfg.ir.spoof_frames) - 1;
+        for (_, r) in &real {
+            for (label, p) in &phone {
+                let lines = replay(&[r.clone(), p.clone()]);
+                let t: Vec<(Line, Line)> = lines
+                    .iter()
+                    .filter(|l| l["ir"]["session"] == 1)
+                    .filter(trusted)
+                    .skip(skip)
+                    .flat_map(|l| {
+                        let ir = l["ir"]["tracks"].as_array().unwrap().clone();
+                        tracks(l).into_iter().zip(ir)
+                    })
+                    .collect();
+                let s = t.iter().filter(|(t, _)| t["liveness"]["Spoof"].is_object());
+                let by_ir = s.clone().filter(|(_, i)| i["evidence"]["kind"] == "Spoof");
+                let (s, by_ir) = (s.count(), by_ir.count());
+                eprintln!(
+                    "{} -> {}: {} tracks, {s} Spoof ({by_ir} by IR)",
+                    r.file_name().unwrap().display(),
+                    p.file_name().unwrap().display(),
+                    t.len()
+                );
+                let e = spoof.entry(label.clone()).or_default();
+                (e.0, e.1, e.2) = (e.0 + t.len(), e.1 + s, e.2 + by_ir);
+            }
+        }
+        for (label, (n, ok)) in &live {
+            eprintln!("{label}: Live/Ir {ok} of {n} = {:.1} %", pct(*ok, *n));
+        }
+        for (label, (n, s, by_ir)) in &spoof {
+            eprintln!(
+                "{label}: Spoof {s} of {n} = {:.1} % (by IR {by_ir} = {:.1} %)",
+                pct(*s, *n),
+                pct(*by_ir, *n)
+            );
+        }
+        for (label, (n, ok)) in &live {
+            assert!(*n > 0 && pct(*ok, *n) >= 95.0, "{label}: {ok} of {n}");
+        }
+        for (label, (n, s, _)) in &spoof {
+            assert!(*n > 0 && pct(*s, *n) >= 99.0, "{label}: {s} of {n}");
+        }
+    }
+
+    /// What IR sees of a phone: a dark lit frame with no face.
+    fn unlit_as_lit(seq: u64) -> IrFrame {
+        IrFrame::new(
+            seq,
+            40_000 + seq * 64,
+            W,
+            W,
+            true,
+            vec![20; (W * W) as usize],
+        )
+        .unwrap()
     }
 }

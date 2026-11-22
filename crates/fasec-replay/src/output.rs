@@ -24,6 +24,8 @@ pub struct OutputOptions {
 /// written as `null`.
 #[derive(Debug, Serialize)]
 pub struct IrLine {
+    /// Which `--ir-input` recording, counting from 0.
+    session: usize,
     /// The recording step: its files are `rgb-<n>.png`, `ir-lit-<n>.png`, `ir-amb-<n>.png`.
     n: u64,
     ir_seq: u64,
@@ -102,8 +104,9 @@ struct Cues {
 }
 
 impl IrLine {
-    /// The probe's measurements of `step`, with the pipeline's evidence `ir` for each track.
-    pub fn new(step: &Step, f: &ProbeFrame, ir: &[TrackIr]) -> IrLine {
+    /// The probe's measurements of `step` of recording `session`, with the pipeline's evidence
+    /// `ir` for each track.
+    pub fn new(session: usize, step: &Step, f: &ProbeFrame, ir: &[TrackIr]) -> IrLine {
         let tracks = f
             .tracks
             .iter()
@@ -131,6 +134,7 @@ impl IrLine {
             })
             .collect();
         IrLine {
+            session,
             n: step.n,
             ir_seq: step.ir_seq,
             ir_w: step.ir_w,
