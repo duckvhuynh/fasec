@@ -43,14 +43,19 @@ Outcome values: `shared` (both see live video), `fasec Busy` (probe start fails 
 
 | Machine | Windows build | Camera | App + version | Scenario | Outcome | fps in probe | App self-view OK? | Notes |
 |---|---|---|---|---|---|---|---|---|
-| | | | | 1 app first | | | | |
-| | | | | 2 fasec first | | | | |
+| dev laptop | 26300 | ASUS FHD webcam | Windows Camera | 1 app first | fasec `start` fails: "camera is in use by another application" (Busy) | — | yes, unaffected | 2026-11-22, verified by screenshot + probe output |
+| dev laptop | 26300 | ASUS FHD webcam | Windows Camera | 2 fasec first | Camera app gets no video | 6–9 (debug build) | no | 2026-11-22, owner observed; probe stayed `health Ok` |
 | | | | | 3 app leaves | | | | |
 | | | | | 4 IR while app holds RGB | | | | |
 
 ## Decision
 
-_(empty, to be filled in after the results)_
+On this camera/driver the RGB stream is exclusive across processes in both directions. So fasec
+cannot keep watching during a video call: when a call app holds the camera, fasec gets `Busy` and
+must show the camera-loss popup with the "busy in another app" cause and Pause / Switch camera /
+Keep protecting (decision D2, FR-CAM-005b). When fasec holds it, call apps get no video, so the
+pause-in-call option matters. Not yet tried: Teams/Zoom specifically, WinRT `SharedReadOnly` for
+the RGB source.
 
 ## Observed on dev machine (2026-11-21, by the implementer)
 

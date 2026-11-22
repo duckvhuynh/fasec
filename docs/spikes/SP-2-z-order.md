@@ -28,17 +28,20 @@ below were opened during that run.
 
 | Surface | Win10: above overlay? (y/n) | Win11: above overlay? (y/n) | Notes (flicker, only for <250 ms, etc.) |
 |---|---|---|---|
-| Start menu | | | |
-| Alt-Tab | | | |
-| Win+Tab (Task View) | | | |
-| Action Center / Quick Settings / Notification Center | | | |
-| Toast notification | | | |
-| Task Manager with "Always on top" | | | |
+| Start menu | | y | 2026-11-22, Win11 26300, acrylic overlay |
+| Alt-Tab | | y | 2026-11-22; the switcher shows live window thumbnails, so content can leak |
+| Win+Tab (Task View) | | y | 2026-11-22; shows window thumbnails |
+| Action Center / Quick Settings / Notification Center | | | not tried |
+| Toast notification | | | not tried |
+| Task Manager | | n | 2026-11-22; stayed under the blur ("Always on top" state not recorded) |
 | Full-screen video (browser F11 / Movies & TV) | | | |
 | UAC prompt (secure desktop) | | | expected: y, the secure desktop is a different desktop |
 
 ## Conclusion
 
-_To be written after the table is filled: which surfaces leak, whether any need extra handling
-(e.g. `EVENT_SYSTEM_FOREGROUND` re-assert, band/UIAccess windows, or documenting as a known
-limitation)._
+Win11 (2026-11-22): Start, Alt-Tab and Task View draw above a normal top-most overlay, as
+expected from their higher z-order bands; Alt-Tab and Task View show live thumbnails, so they can
+reveal content. Ordinary windows (Task Manager here) stay under it. For M4: pair blur with
+`minimize_all` in stricter profiles, document the limitation (SRS §9 item 2), and keep the
+`uiAccess` build (FR-OV-010, M12) as the real fix. Notification panel, toasts, full-screen video
+and UAC are still untested.

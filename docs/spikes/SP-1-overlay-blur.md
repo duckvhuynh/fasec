@@ -71,11 +71,11 @@ content behind is readable (fails open, violates FR-OV-005).
 | Win10 | backdrop | on | yes | | | | | |
 | Win10 | backdrop | off | no | | | | | |
 | Win10 | backdrop | off | yes | | | | | |
-| Win11 (26300) | acrylic | on | no | | | | | |
-| Win11 (26300) | acrylic | on | yes | | | | | |
+| Win11 (26300) | acrylic | on | no | n | y | n | n | 2026-11-22, owner watched: content behind blurred and updating |
+| Win11 (26300) | acrylic | on | yes | y | y | n | n | 2026-11-22: clicked into a window behind; blur stayed live |
 | Win11 (26300) | acrylic | off | no | | | | | |
 | Win11 (26300) | acrylic | off | yes | | | | | |
-| Win11 (26300) | backdrop | on | no | | | | | |
+| Win11 (26300) | backdrop | on | no | n | n | y | n | 2026-11-22: solid colour only — system backdrop is not drawn for an inactive (NOACTIVATE) window |
 | Win11 (26300) | backdrop | on | yes | | | | | |
 | Win11 (26300) | backdrop | off | no | | | | | |
 | Win11 (26300) | backdrop | off | yes | | | | | |
@@ -86,5 +86,9 @@ behind the overlay?
 
 ## Conclusion
 
-_To be written after the table is filled: which backend to use as default on Win10 / Win11, and
-the conditions under which the app must fall back to solid._
+Win11 (2026-11-22, one machine, transparency on): **acrylic** (`SetWindowCompositionAttribute`,
+`ACCENT_ENABLE_ACRYLICBLURBEHIND`) gives a live blur on a top-most, non-activating,
+capture-excluded window, also while another app has focus and with click-through. The documented
+Win11 **backdrop** API falls back to a solid colour for such a window, so it is not usable for the
+overlay. Decision for M4: acrylic is backend 1, capture-based blur (SP-1b) backend 2, solid backend 3
+(FR-OV-004). Still open: Win10, transparency effects off, and multi-monitor/mixed DPI.
