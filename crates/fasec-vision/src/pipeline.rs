@@ -82,7 +82,8 @@ pub enum IrEvidence {
     /// IR unhealthy, untrusted, absent or stale.
     Absent,
     /// The latest lit frame judged the track `Unknown` while IR is healthy, trusted and fresh
-    /// (flooded frame, contested IR face, a face mostly off the IR frame or out of IR range).
+    /// (any no-verdict cue: e.g. a flooded frame, a contested IR face, a face mostly off the IR
+    /// frame or out of IR range, weak contrast, low relief or too little signal).
     Unknown,
     Live {
         score: f32,

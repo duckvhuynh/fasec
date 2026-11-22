@@ -97,9 +97,9 @@ How the verdict is fused:
 - An RGB face with no IR face, or a flat IR face, is a spoof after 3 lit IR frames in a row. Until
   then it is `Unknown`, never `Live`.
 - A new face is `Unknown` until the next lit IR frame judges it.
-- While the tier is `Ir`, a face that IR cannot judge is never `Live`. That covers a flooded lit
-  frame, an IR face that two RGB faces compete for, a face mostly off the IR frame and a face out
-  of IR range. Where MiniFASNet says live it is `Unknown`. A MiniFASNet spoof stands.
+- While the tier is `Ir`, a face that IR cannot judge is never `Live`. That covers, for example, a
+  flooded lit frame, an IR face that two RGB faces compete for, a face mostly off the IR frame, a
+  face out of IR range, and weak contrast or low relief. Where MiniFASNet says live it is `Unknown`. A MiniFASNet spoof stands.
 - An RGB face with no IR face counts as a spoof only within the measured IR range: at least
   150 px wide on a 1280 px wide RGB frame, the same fraction at other widths. The narrowest
   recorded real face was 188 px. A narrower face gets no IR verdict.

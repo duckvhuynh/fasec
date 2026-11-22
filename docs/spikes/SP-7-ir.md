@@ -147,8 +147,8 @@ evidence:
   IR is healthy, trusted and fresh, it reads `Unknown` until the next lit frame judges it. It
   used to take the RGB verdict for that gap.
 - **Final fix wave (F1): IR `Unknown` blocks an RGB `Live` while IR is trusted and fresh.** IR
-  `Unknown` comes from a flooded frame, a contested IR face, a face mostly off the IR frame or
-  out of range. A phone held close can flood the frame, so a fooled MiniFASNet must not decide
+  `Unknown` comes from any no-verdict cue, e.g. a flooded frame, a contested IR face, a face
+  mostly off the IR frame, out of range, weak contrast, low relief or too little signal. A phone held close can flood the frame, so a fooled MiniFASNet must not decide
   then. An RGB `Spoof` or `Unknown` stands. Untrusted, stale or unhealthy IR still falls back to
   RGB.
 - **F2: an IR face-detector error keeps the mapping.** It drops the last lit frame and every
