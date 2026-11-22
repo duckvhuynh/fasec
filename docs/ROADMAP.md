@@ -114,19 +114,21 @@ start in parallel with M2 if there are two contributors.
 **Goal:** know who is who, store it safely.
 
 ### Tasks
-- [ ] `fasec-platform::dpapi` (protect/unprotect bytes), `zeroize` on buffers.
-- [ ] `gallery.db` schema + migrations (`rusqlite`), owner uniqueness index.
-- [ ] Argon2id PIN set/verify.
-- [ ] Enrolment state machine: pose targets (front/left/right/up/down), per-sample quality gates (size, blur via Laplacian variance, single face, liveness).
-- [ ] Gallery matcher: cosine, max-over-templates, threshold + margin, per-track vote.
-- [ ] Model-ID tagging; force re-enrol on recogniser change.
-- [ ] Delete-all-biometrics.
-- [ ] Threshold tuning script: compute genuine/impostor score distributions from personal clips + LFW; pick threshold for target FAR.
-- [ ] Unit tests: matcher, vote, storage round-trip, tamper detection.
+- [x] `fasec-platform::dpapi` (protect/unprotect bytes), `zeroize` on buffers.
+- [x] `gallery.db` schema + migrations (`rusqlite`), owner uniqueness index.
+- [x] Argon2id PIN set/verify (4–12 digits, m = 19 MiB, t = 2, p = 1).
+- [x] Enrolment state machine: pose targets (front/left/right/up/down), per-sample quality gates (size, blur via Laplacian variance, single face, liveness). Guided UI: `cargo run -p fasec-ui --example enroll`.
+- [x] Gallery matcher: cosine, max-over-templates, threshold + margin, per-track vote (`IdentityTracker`; shown live by `live_debug --gallery`).
+- [x] Model-ID tagging; force re-enrol on recogniser change.
+- [x] Delete-all-biometrics (gallery: persons, templates, calibration, PIN; intruder snapshots do not exist yet).
+- [ ] Threshold tuning script: compute genuine/impostor score distributions from personal clips + LFW; pick threshold for target FAR. *Not done:* the SFace model-card default 0.363 / margin 0.05 is used.
+- [x] Unit tests: matcher, vote, storage round-trip, tamper detection.
 
 ### Exit criteria
-- Owner + 2 authorised users enrolled via a test harness; identity correct on personal replay set with ≥ 99 % frame-level accuracy for enrolled people at ≤ 1 m.
-- No plaintext template on disk (checked by grepping the DB file for float patterns / inspection).
+- [ ] Owner + 2 authorised users enrolled via a test harness; identity correct on personal replay set with ≥ 99 % frame-level accuracy for enrolled people at ≤ 1 m.
+- [ ] No plaintext template on disk (checked by grepping the DB file for float patterns / inspection).
+
+**Status (2026-11-22):** the harness is `enroll` + `live_debug --gallery` (see the README). Automated checks pass: `template_blob_is_not_plaintext`, tamper/wrong-key load failures, margin/vote tests, enrolment gate tests, and (ignored, local) the blur gate on the `.assets` portraits. Still needs a person: enrol the owner and 2 authorised users and check the names in `live_debug`, record the personal replay set and measure the ≥ 99 % rate, and inspect a real `gallery.db` with `sqlite3` (template blobs must be ciphertext only).
 
 ---
 

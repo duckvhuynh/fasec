@@ -600,7 +600,9 @@ calibration(camera_id TEXT PK, yaw_min REAL, yaw_max REAL, pitch_min REAL,
             pitch_max REAL, created_at INTEGER)
 secret(kind TEXT PK /*'pin'*/, hash TEXT /*argon2 PHC string*/)
 ```
-Exactly one `owner` row (enforced by a partial unique index).
+Exactly one `owner` row (enforced by a partial unique index). The owner PIN is 4–12 ASCII
+digits. An enrolment writes the person, all their templates and (first owner) the PIN in one
+transaction (`Gallery::enrol`), so a failed enrolment leaves nothing behind.
 
 ### 8.2 `events.db`
 ```

@@ -5,7 +5,7 @@ recognise you and the people you trust, notices when someone else is **actually
 looking** at your screen, and hides your content (blur, overlay, warning, minimise,
 lock) until they are gone.
 
-> Status: M0 + M1 (spikes, camera, vision core, replay). No end-user app yet. See the documents below.
+> Status: M0–M2 (spikes, camera, vision core, replay, identity and enrolment). No end-user app yet. See the documents below.
 
 ## Developer quick start
 
@@ -30,6 +30,7 @@ cargo test --workspace
 # Ignored tests: models and test images (after step 1).
 cargo test -p fasec-vision -- --ignored
 cargo test -p fasec-replay -- --ignored
+cargo test -p fasec-identity -- --ignored
 # Ignored tests: camera. They share one webcam, so run them one at a time.
 cargo test -p fasec-camera -- --ignored --test-threads=1
 
@@ -50,6 +51,24 @@ Live debug window (camera, boxes, track ids, liveness, pose, per-stage ms):
 ```sh
 cargo run -p fasec-ui --example live_debug --release [-- --seconds 30]
 ```
+
+### Enrol and see your name
+
+Needs the models from steps 0 and 1 (the MiniFASNet export too: enrolment rejects samples
+that are not judged live). Enrol the owner first: the window asks for a new owner PIN
+(4–12 digits), then guides you through five head poses. Authorised people are added the same
+way and need the owner PIN. Templates are DPAPI-encrypted for the current Windows user; no
+face image is stored.
+
+```sh
+cargo run -p fasec-ui --example enroll --release -- --gallery gallery.db --name "<your name>"
+cargo run -p fasec-ui --example enroll --release -- --gallery gallery.db --name "<name>" --role authorised
+cargo run -p fasec-ui --example live_debug --release -- --gallery gallery.db
+```
+
+`live_debug --gallery` labels each face `name (owner|authorised) score`, `stranger <best>` or
+`…` while the vote is still pending. A gallery that cannot be read is shown in the side panel
+and nobody is recognised. `*.db` is git-ignored; never commit a gallery.
 
 DirectML is used when available (`DirectML.dll` from `System32`; ort copies it next to the
 built examples). A packaged release has to ship it beside the exe.

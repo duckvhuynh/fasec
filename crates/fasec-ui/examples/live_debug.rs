@@ -1,14 +1,20 @@
 //! Live debug viewer (M1 exit check): the camera with every tracked face annotated.
 //!
-//! `cargo run -p fasec-ui --example live_debug --release [-- --seconds N]`
+//! `cargo run -p fasec-ui --example live_debug --release [-- --seconds N] [--gallery <path>]`
 //!
 //! The UI thread only draws. One worker thread owns the `Capture` and the `Pipeline`: it
 //! starts/stops cameras on request (stopping the old one first), runs `Pipeline::process` on
 //! every new frame and publishes the latest `(Frame, VisionReport)` plus stats. Once a second it
 //! also prints processed FPS and per-stage ms to stdout. `--seconds N` closes the window after
 //! N s (for unattended runs).
+//!
+//! `--gallery <path>` (made by the `enroll` example) adds identity: the worker opens it with
+//! DPAPI, builds an `IdentityTracker` and applies it to every frame, and each box shows
+//! `name (role) score`, `stranger best` or `…` (pending). A missing file is refused up front; any
+//! other gallery error is shown in the side panel and identity stays pending (fail safe).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -21,10 +27,12 @@ use eframe::egui::{
 };
 use fasec_camera::{CameraInfo, Capture, LatestFrame};
 use fasec_config::{CameraConfig, ExecutionProvider};
-use fasec_core::{CameraHealth, Frame, LivenessState, TrackObs, VisionReport};
-use fasec_vision::{Pipeline, PipelineConfig, Runtime};
+use fasec_core::{CameraHealth, Frame, IdentityState, LivenessState, TrackObs, VisionReport};
+use fasec_identity::{Gallery, IdentityTracker, MatcherConfig, Role, VoterConfig};
+use fasec_platform::Dpapi;
+use fasec_vision::{Pipeline, PipelineConfig, RECOGNISER_MODEL_ID, Runtime};
 
-const USAGE: &str = "usage: live_debug [--seconds N]";
+const USAGE: &str = "usage: live_debug [--seconds N] [--gallery <path>]";
 const MODELS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models");
 const FETCH_HINT: &str =
     "Models missing or invalid: run `cargo run -p fasec-models --example fetch`";
@@ -33,18 +41,47 @@ const FETCH_HINT: &str =
 const QUIT_TIMEOUT: Duration = Duration::from_secs(3);
 const STAGES: [&str; 4] = ["detect", "recognize", "liveness", "pose"];
 
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    seconds: Option<u64>,
+    gallery: Option<PathBuf>,
+}
+
+fn parse_args(args: &[String]) -> Result<Args> {
+    let mut a = Args::default();
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let value = it
+            .next()
+            .with_context(|| format!("{flag} needs a value\n{USAGE}"))?;
+        match flag.as_str() {
+            "--seconds" => a.seconds = Some(value.parse().context(USAGE)?),
+            "--gallery" => a.gallery = Some(PathBuf::from(value)),
+            _ => bail!("unknown argument {flag}\n{USAGE}"),
+        }
+    }
+    Ok(a)
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let close_after = match args.as_slice() {
-        [] => None,
-        [flag, n] if flag == "--seconds" => Some(Duration::from_secs(n.parse().context(USAGE)?)),
-        _ => bail!(USAGE),
-    };
+    let args = parse_args(&std::env::args().skip(1).collect::<Vec<_>>())?;
+    // `Gallery::open` would create an empty gallery; a typo must not silently mean "nobody".
+    if let Some(g) = args.gallery.as_ref().filter(|g| !g.is_file()) {
+        bail!(
+            "gallery {} not found: enrol first with \
+             `cargo run -p fasec-ui --example enroll -- --gallery <path> --name <name>`",
+            g.display()
+        );
+    }
+    let close_after = args.seconds.map(Duration::from_secs);
     let cams = fasec_camera::list().map_err(|e| e.to_string());
     eframe::run_native(
         "fasec live debug",
         eframe::NativeOptions::default(),
-        Box::new(move |cc| Ok(Box::new(App::new(cc.egui_ctx.clone(), cams, close_after)))),
+        Box::new(move |cc| {
+            let app = App::new(cc.egui_ctx.clone(), cams, close_after, args.gallery);
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }
@@ -66,6 +103,10 @@ struct Shared {
     health: Option<CameraHealth>,
     ep: &'static str,
     stats: Option<Stats>,
+    /// `None` without `--gallery`; otherwise the gallery state (`Err`: identity stays pending).
+    gallery: Option<Result<String, String>>,
+    /// Person id -> `name (role)`, loaded once with the tracker.
+    names: HashMap<String, String>,
 }
 
 /// One second of processed frames; stage ms in `STAGES` order.
@@ -94,13 +135,14 @@ impl App {
         ctx: egui::Context,
         cams: Result<Vec<CameraInfo>, String>,
         close_after: Option<Duration>,
+        gallery: Option<PathBuf>,
     ) -> App {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (tx, rx) = mpsc::channel();
         let w_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("live-debug-worker".into())
-            .spawn(move || worker(rx, w_shared, ctx));
+            .spawn(move || worker(rx, w_shared, ctx, gallery));
         let worker = match worker {
             Ok(w) => Some(w),
             Err(e) => {
@@ -194,6 +236,14 @@ impl App {
                 }
             });
         }
+        if let Some(g) = &s.gallery {
+            ui.separator();
+            ui.heading("Identity");
+            match g {
+                Ok(msg) => ui.label(msg),
+                Err(e) => ui.colored_label(Color32::RED, e),
+            };
+        }
     }
 
     fn video(&mut self, ui: &mut egui::Ui, s: &Shared) {
@@ -236,7 +286,11 @@ impl App {
             for p in &t.landmarks5 {
                 painter.circle_filled(at(p.x, p.y), 2.5, color);
             }
-            let galley = painter.layout_no_wrap(label(t), FontId::monospace(13.0), color);
+            let mut text = label(t);
+            if s.gallery.is_some() {
+                text = format!("{}\n{text}", identity_label(&t.identity, &s.names));
+            }
+            let galley = painter.layout_no_wrap(text, FontId::monospace(13.0), color);
             let text = Align2::LEFT_BOTTOM.anchor_size(rect.left_top(), galley.size());
             painter.rect_filled(text.expand(2.0), 2.0, Color32::from_black_alpha(170));
             painter.galley(text.min, galley, color);
@@ -290,6 +344,46 @@ fn label(t: &TrackObs) -> String {
     )
 }
 
+/// `name (role) score`, `stranger best` or `…`; never the embedding.
+fn identity_label(id: &IdentityState, names: &HashMap<String, String>) -> String {
+    match id {
+        IdentityState::Known { person, score } => {
+            let who = names
+                .get(person)
+                .map_or("? (not in gallery)", String::as_str);
+            format!("{who} {score:.2}")
+        }
+        IdentityState::Stranger { best } => format!("stranger {best:.2}"),
+        IdentityState::Pending | IdentityState::Unknown => "…".to_owned(),
+    }
+}
+
+/// Names by person id and the tracker for the current recogniser; any error means no tracker.
+fn load_identity(path: &Path) -> Result<(HashMap<String, String>, IdentityTracker)> {
+    let g = Gallery::open(path, Arc::new(Dpapi::new()))
+        .with_context(|| format!("opening gallery {}", path.display()))?;
+    let names = g
+        .persons()
+        .context("reading persons")?
+        .into_iter()
+        .map(|p| {
+            let role = match p.role {
+                Role::Owner => "owner",
+                Role::Authorised => "authorised",
+            };
+            (p.id.0, format!("{} ({role})", p.name))
+        })
+        .collect();
+    let tracker = IdentityTracker::from_gallery(
+        &g,
+        RECOGNISER_MODEL_ID,
+        MatcherConfig::default(),
+        VoterConfig::default(),
+    )
+    .context("loading templates")?;
+    Ok((names, tracker))
+}
+
 fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
 }
@@ -308,7 +402,12 @@ fn publish(shared: &Mutex<Shared>, ctx: &egui::Context, f: impl FnOnce(&mut Shar
 }
 
 /// Owns the camera and the pipeline; exits on `Quit` or when the UI side of the channel is gone.
-fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
+fn worker(
+    rx: Receiver<Cmd>,
+    shared: Arc<Mutex<Shared>>,
+    ctx: egui::Context,
+    gallery: Option<PathBuf>,
+) {
     publish(&shared, &ctx, |s| s.status = "loading models…".into());
     let load = || -> Result<(Runtime, Pipeline)> {
         let rt = Runtime::new(ExecutionProvider::Auto).context("onnx runtime")?;
@@ -332,6 +431,21 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
             return;
         }
     };
+    let mut tracker = gallery.and_then(|path| match load_identity(&path) {
+        Ok((names, t)) => {
+            let msg = format!("{}: {} person(s)", path.display(), names.len());
+            publish(&shared, &ctx, |s| {
+                (s.gallery, s.names) = (Some(Ok(msg)), names)
+            });
+            Some(t)
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            let msg = format!("{e:#}\nidentity stays pending");
+            publish(&shared, &ctx, |s| s.gallery = Some(Err(msg)));
+            None
+        }
+    });
     publish(&shared, &ctx, |s| s.status = "waiting for a camera".into());
     // Each capture gets its own slot so a frame from a previous camera is never handed out.
     let mut cap: Option<(Capture, Arc<LatestFrame>)> = None;
@@ -387,8 +501,13 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
         };
         seq = frame.seq;
         let health = c.health();
-        // The debug view shows no identity, so embeddings are dropped (and zeroised) here.
-        let result = pipeline.process(&frame, health.clone()).map(|o| o.report);
+        // Embeddings go only to the tracker, then are dropped (and zeroised) here.
+        let result = pipeline.process(&frame, health.clone()).map(|mut o| {
+            if let Some(t) = &mut tracker {
+                t.apply(&mut o.report, &o.embeddings);
+            }
+            o.report
+        });
         if let Ok(r) = &result {
             let t = &r.timings;
             window.add([t.detect_ms, t.recognize_ms, t.liveness_ms, t.pose_ms]);
@@ -464,5 +583,41 @@ impl StatsWindow {
         };
         *self = StatsWindow::new();
         Some(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn parses_args() {
+        assert_eq!(parse_args(&[]).unwrap(), Args::default());
+        let a = parse_args(&args("--gallery g.db --seconds 5")).unwrap();
+        assert_eq!((a.seconds, a.gallery), (Some(5), Some("g.db".into())));
+        for bad in ["--seconds", "--seconds x", "--gallery", "--pin 1234"] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn identity_labels() {
+        let names = HashMap::from([("id1".to_owned(), "Ann (owner)".to_owned())]);
+        let known = |person: &str| IdentityState::Known {
+            person: person.into(),
+            score: 0.714,
+        };
+        assert_eq!(identity_label(&known("id1"), &names), "Ann (owner) 0.71");
+        assert_eq!(
+            identity_label(&known("gone"), &names),
+            "? (not in gallery) 0.71"
+        );
+        let stranger = IdentityState::Stranger { best: 0.2 };
+        assert_eq!(identity_label(&stranger, &names), "stranger 0.20");
+        assert_eq!(identity_label(&IdentityState::Pending, &names), "…");
     }
 }

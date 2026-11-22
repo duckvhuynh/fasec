@@ -22,7 +22,11 @@ fasec-platform = { version = "0.0.1", path = "../fasec-platform", features = ["i
 fasec-vision = { version = "0.0.1", path = "../fasec-vision" }
 zeroize = "1.9.2"
 
-# Run the example's unit tests (reject messages, CLI parsing, gallery commit) in `cargo test`.
+# Run the examples' unit tests (reject messages, CLI parsing, gallery commit, labels) in `cargo test`.
 [[example]]
 name = "enroll"
+test = true
+
+[[example]]
+name = "live_debug"
 test = true
