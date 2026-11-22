@@ -55,7 +55,8 @@ struct IrTrack {
     cues: Option<Cues>,
 }
 
-/// `kind` is `Live`, `Spoof`, `Unknown` (a verdict) or `Absent` (no evidence).
+/// `kind` is `Live`, `Spoof`, `Unknown` (a verdict), `Suspect` (a pending spoof, or with no
+/// reason a track not judged yet) or `Absent` (no evidence).
 #[derive(Debug, Serialize)]
 struct Verdict {
     kind: &'static str,
@@ -85,8 +86,9 @@ impl Verdict {
         match e {
             IrEvidence::Live { score } => Verdict::new("Live", Some(score), None),
             IrEvidence::Spoof { score, reason } => Verdict::new("Spoof", Some(score), Some(reason)),
+            // no reason and no score: the track has not been judged yet
             IrEvidence::Suspect { score, reason } => {
-                Verdict::new("Suspect", Some(score), Some(reason))
+                Verdict::new("Suspect", reason.map(|_| score), reason)
             }
             IrEvidence::Absent => Verdict::new("Absent", None, None),
         }

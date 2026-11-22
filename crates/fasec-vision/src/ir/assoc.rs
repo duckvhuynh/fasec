@@ -22,7 +22,7 @@ const TRUST_STREAK: u8 = 5;
 /// EMA weight of one single-face frame: about 10 frames to settle after a move.
 const ALPHA: f32 = 0.2;
 /// Bezel geometry as per-axis IR/RGB box-size ratio and face-centre displacement (normalised).
-/// Placeholders until Task 7 measures the pair. The bootstrap prior is tight so that a second
+/// Set by hand: Task 7 did not measure the pair. The bootstrap prior is tight so that a second
 /// face beside the RGB one (about a face width away) can never seed the mapping.
 const BOOT_SCALE: RangeInclusive<f32> = 0.85..=1.18;
 const BOOT_SHIFT: f32 = 0.08;

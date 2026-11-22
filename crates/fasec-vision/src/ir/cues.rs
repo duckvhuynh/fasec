@@ -132,7 +132,9 @@ impl Default for IrLivenessConfig {
     }
 }
 
-/// Live score without glints, and the bonus per glinting eye. Placeholders until Task 7.
+/// The reported IR `Live` score without glints, and the bonus per glinting eye (at most two).
+/// Fixed by hand, not measured: no gate compares an IR score, and glints were 0–2 on every
+/// recorded real face (Task 7), so they only raise the shown score.
 const LIVE_SCORE: f32 = 0.8;
 const GLINT_BONUS: f32 = 0.1;
 

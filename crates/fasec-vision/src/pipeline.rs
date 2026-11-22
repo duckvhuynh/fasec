@@ -83,10 +83,12 @@ pub enum IrEvidence {
     Live {
         score: f32,
     },
-    /// A fresh IR `Spoof` verdict whose streak is still short of `IrLivenessConfig::spoof_frames`.
+    /// A fresh IR `Spoof` verdict whose streak is still short of `IrLivenessConfig::spoof_frames`,
+    /// or (`reason: None`) a track the latest lit frame has not judged while IR is healthy, trusted
+    /// and fresh: it appeared after that frame.
     Suspect {
         score: f32,
-        reason: IrSpoofReason,
+        reason: Option<IrSpoofReason>,
     },
     Spoof {
         score: f32,
@@ -415,6 +417,8 @@ impl Pipeline {
             now.checked_sub(l.at_ms)
                 .is_some_and(|age| age <= cfg.ir_max_age_ms)
         });
+        // `last_lit` is cleared whenever IR is not healthy, so a fresh lit frame implies IR Ok.
+        let ir_on = lit_fresh && self.ir_assoc.is_trusted();
         for obs in &mut out.report.tracks {
             let st = &self.tracks[&obs.id];
             let seen = st.ir.filter(|s| lit_fresh && s.lit == self.lit_index);
@@ -425,7 +429,15 @@ impl Pipeline {
                 {
                     IrEvidence::Spoof { score, reason }
                 }
-                Some(IrVerdict::Spoof { score, reason }) => IrEvidence::Suspect { score, reason },
+                Some(IrVerdict::Spoof { score, reason }) => IrEvidence::Suspect {
+                    score,
+                    reason: Some(reason),
+                },
+                // a new track must wait for the next lit frame: the RGB verdict may be fooled
+                None if ir_on => IrEvidence::Suspect {
+                    score: 0.0,
+                    reason: None,
+                },
                 _ => IrEvidence::Absent,
             };
             let (liveness, tier) = fuse(&st.liveness, evidence);
@@ -463,6 +475,8 @@ impl Pipeline {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "IR face detection failed");
+                // as for an unhealthy IR camera: the previous lit frame's evidence is not current
+                self.reset_ir();
                 return;
             }
         };
@@ -534,7 +548,8 @@ impl Pipeline {
 ///
 /// A pending IR spoof (`Suspect`) blocks Live (ruling R10): a moving phone keeps getting new RGB
 /// track ids, each starting its streak over, so on those first lit frames a fooled RGB model
-/// must not decide. A real face with a single-frame IR miss reads Unknown for that frame.
+/// must not decide. A real face with a single-frame IR miss reads Unknown for that frame. A track
+/// that appeared after the latest lit frame is `Suspect` too while IR is trusted and fresh.
 ///
 /// IR `Live` overrides an RGB `Spoof` (owner decision, Task 7): MiniFASNet calls the owner
 /// `Spoof` on most frames at laptop distance (real-30cm 15 of 22, real-80cm 17 of 17), while
@@ -1373,16 +1388,15 @@ mod tests {
             assert_eq!(fuse(rgb, ir_spoof), (IR_SPOOF, LivenessTier::Ir), "{rgb:?}");
         }
         // IR spoof pending (streak short): never Live, never Spoof, whatever RGB says
-        let ir_suspect = IrEvidence::Suspect {
-            score: 0.0,
-            reason: IrSpoofReason::NoIrFace,
-        };
-        for rgb in &all {
-            assert_eq!(
-                fuse(rgb, ir_suspect),
-                (LivenessState::Unknown, LivenessTier::Ir),
-                "{rgb:?}"
-            );
+        for reason in [Some(IrSpoofReason::NoIrFace), None] {
+            let ir_suspect = IrEvidence::Suspect { score: 0.0, reason };
+            for rgb in &all {
+                assert_eq!(
+                    fuse(rgb, ir_suspect),
+                    (LivenessState::Unknown, LivenessTier::Ir),
+                    "{rgb:?}"
+                );
+            }
         }
         // IR live overrides any RGB verdict: MiniFASNet calls the owner Spoof at a laptop
         for rgb in &all {
@@ -1507,6 +1521,60 @@ mod tests {
             );
         }
         assert_eq!(live0(&r.lit(Scene::Empty)), IR_SPOOF);
+    }
+
+    #[test]
+    fn a_track_new_since_the_latest_lit_frame_is_unknown_until_judged() {
+        let mut r = IrRig::new();
+        // untrusted: a face not yet judged by IR takes the RGB verdict
+        *r.rgb.lock().unwrap() = Vec::new();
+        assert!(r.lit(Scene::Face).report.tracks.is_empty());
+        *r.rgb.lock().unwrap() = vec![rgb_face(0.3)];
+        let out = r.dark();
+        assert_eq!(
+            (live0(&out), out.ir[0].evidence),
+            (RGB_LIVE, IrEvidence::Absent)
+        );
+        let first = r.warm().report.tracks[0].id;
+        // the face leaves and the tracker drops it while lit frames keep coming
+        *r.rgb.lock().unwrap() = Vec::new();
+        r.ts += 1000;
+        assert!(r.lit(Scene::Face).report.tracks.is_empty());
+        // a face appears on a call without a new lit frame, RGB Live
+        *r.rgb.lock().unwrap() = vec![rgb_face(0.3)];
+        let out = r.dark();
+        assert_ne!(out.report.tracks[0].id, first);
+        assert_eq!(live0(&out), LivenessState::Unknown);
+        assert_eq!(out.ir[0].tier, LivenessTier::Ir);
+        let unjudged = IrEvidence::Suspect {
+            score: 0.0,
+            reason: None,
+        };
+        assert_eq!(out.ir[0].evidence, unjudged);
+        // the next lit frame judges it
+        assert_eq!(live0(&r.lit(Scene::Face)), IR_LIVE);
+    }
+
+    #[test]
+    fn an_ir_face_detection_error_falls_back_to_rgb() {
+        let mut r = IrRig::new();
+        assert_eq!(live0(&r.warm()), IR_LIVE);
+        // an unlit frame in the lit slot makes IR face detection fail
+        r.ts += 33;
+        let bad = ir_frame(r.seq + 1, false, Scene::Face, r.size);
+        let out =
+            r.p.process_with_ir(
+                &frame(r.ts),
+                Some((&bad, None)),
+                CameraHealth::Ok,
+                CameraHealth::Ok,
+            )
+            .unwrap();
+        assert_eq!(
+            (live0(&out), out.ir[0].evidence),
+            (RGB_LIVE, IrEvidence::Absent)
+        );
+        assert_eq!(out.report.liveness_tier, LivenessTier::Rgb);
     }
 
     #[test]
