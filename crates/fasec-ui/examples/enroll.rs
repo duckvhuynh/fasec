@@ -159,13 +159,11 @@ fn commit(
 ) -> Result<PersonId, IdentityError> {
     let templates: Vec<NewTemplate<'_>> = samples
         .iter()
-        .map(|s| {
-            (
-                RECOGNISER_MODEL_ID,
-                s.pose,
-                s.quality,
-                s.embedding.as_slice(),
-            )
+        .map(|s| NewTemplate {
+            model_id: RECOGNISER_MODEL_ID,
+            pose: s.pose,
+            quality: s.quality,
+            embedding: s.embedding.as_slice(),
         })
         .collect();
     g.enrol(name, role, new_pin, &templates)

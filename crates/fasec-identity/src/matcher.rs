@@ -76,10 +76,15 @@ impl Matcher {
                 "matcher threshold must be in (0, 1] and margin in [0, 1), got {cfg:?}"
             )));
         }
-        let dim = templates.first().map(|t| t.2.len());
+        let dim = templates.first().map(|t| t.embedding.len());
         let mut valid = true;
         let mut persons: Vec<PersonTemplates> = Vec::new();
-        for (person, role, t) in templates {
+        for DecryptedTemplate {
+            person,
+            role,
+            embedding: t,
+        } in templates
+        {
             if persons.iter().any(|p| p.0 == person && p.1 != role) {
                 return Err(IdentityError::InconsistentGallery(format!(
                     "person {} is listed with two roles",
@@ -179,6 +184,14 @@ mod tests {
         PersonId(s.into())
     }
 
+    fn tpl(person: PersonId, role: Role, embedding: Zeroizing<Vec<f32>>) -> DecryptedTemplate {
+        DecryptedTemplate {
+            person,
+            role,
+            embedding,
+        }
+    }
+
     fn query() -> Vec<f32> {
         at(1.0, 1).to_vec()
     }
@@ -186,7 +199,7 @@ mod tests {
     #[test]
     fn exact_template_is_known() {
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(1.0, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(1.0, 1))],
             MatcherConfig::default(),
         )
         .unwrap();
@@ -208,7 +221,11 @@ mod tests {
     fn unnormalised_template_and_query_still_match() {
         let t = Zeroizing::new(at(0.9, 1).iter().map(|x| x * 7.0).collect());
         let q: Vec<f32> = query().iter().map(|x| x * 0.01).collect();
-        let m = Matcher::new(vec![(pid("a"), Role::Owner, t)], MatcherConfig::default()).unwrap();
+        let m = Matcher::new(
+            vec![tpl(pid("a"), Role::Owner, t)],
+            MatcherConfig::default(),
+        )
+        .unwrap();
         match m.best(&q) {
             MatchResult::Known { score, .. } => assert!((score - 0.9).abs() < 1e-5),
             other => panic!("expected Known, got {other:?}"),
@@ -218,7 +235,7 @@ mod tests {
     #[test]
     fn below_threshold_is_stranger() {
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(0.30, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(0.30, 1))],
             MatcherConfig::default(),
         )
         .unwrap();
@@ -232,8 +249,8 @@ mod tests {
     fn margin_too_small_is_ambiguous() {
         let m = Matcher::new(
             vec![
-                (pid("a"), Role::Owner, at(0.50, 1)),
-                (pid("b"), Role::Authorised, at(0.47, 2)),
+                tpl(pid("a"), Role::Owner, at(0.50, 1)),
+                tpl(pid("b"), Role::Authorised, at(0.47, 2)),
             ],
             MatcherConfig::default(),
         )
@@ -251,8 +268,8 @@ mod tests {
     fn margin_large_enough_is_known() {
         let m = Matcher::new(
             vec![
-                (pid("a"), Role::Owner, at(0.50, 1)),
-                (pid("b"), Role::Authorised, at(0.40, 2)),
+                tpl(pid("a"), Role::Owner, at(0.50, 1)),
+                tpl(pid("b"), Role::Authorised, at(0.40, 2)),
             ],
             MatcherConfig::default(),
         )
@@ -268,10 +285,10 @@ mod tests {
         // Margin is measured between persons, so a's two templates never compete.
         let m = Matcher::new(
             vec![
-                (pid("a"), Role::Owner, at(0.20, 1)),
-                (pid("b"), Role::Authorised, at(0.60, 2)),
-                (pid("a"), Role::Owner, at(0.90, 3)),
-                (pid("a"), Role::Owner, at(0.88, 4)),
+                tpl(pid("a"), Role::Owner, at(0.20, 1)),
+                tpl(pid("b"), Role::Authorised, at(0.60, 2)),
+                tpl(pid("a"), Role::Owner, at(0.90, 3)),
+                tpl(pid("a"), Role::Owner, at(0.88, 4)),
             ],
             MatcherConfig::default(),
         )
@@ -294,7 +311,7 @@ mod tests {
     #[test]
     fn nan_embedding_is_stranger() {
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(1.0, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(1.0, 1))],
             MatcherConfig::default(),
         )
         .unwrap();
@@ -310,7 +327,7 @@ mod tests {
     #[test]
     fn wrong_length_embedding_is_stranger() {
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(1.0, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(1.0, 1))],
             MatcherConfig::default(),
         )
         .unwrap();
@@ -326,8 +343,8 @@ mod tests {
         for b in [bad, Zeroizing::new(vec![0.0; DIM]), short] {
             let m = Matcher::new(
                 vec![
-                    (pid("a"), Role::Owner, at(0.50, 1)),
-                    (pid("b"), Role::Authorised, b),
+                    tpl(pid("a"), Role::Owner, at(0.50, 1)),
+                    tpl(pid("b"), Role::Authorised, b),
                 ],
                 MatcherConfig::default(),
             )
@@ -343,7 +360,7 @@ mod tests {
         let _: fn(Vec<DecryptedTemplate>, MatcherConfig) -> Result<Matcher, IdentityError> =
             Matcher::new;
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(0.9, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(0.9, 1))],
             MatcherConfig::default(),
         )
         .unwrap();
@@ -354,7 +371,7 @@ mod tests {
     #[test]
     fn debug_omits_templates() {
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(0.123_456, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(0.123_456, 1))],
             MatcherConfig::default(),
         )
         .unwrap();
@@ -366,7 +383,7 @@ mod tests {
     /// Score of `at(cos, axis)` against the query exactly as the matcher computes it.
     fn score_of(cos: f32) -> f32 {
         let m = Matcher::new(
-            vec![(pid("a"), Role::Owner, at(cos, 1))],
+            vec![tpl(pid("a"), Role::Owner, at(cos, 1))],
             MatcherConfig {
                 threshold: f32::MIN_POSITIVE, // lowest valid threshold
                 margin: 0.0,
@@ -389,7 +406,7 @@ mod tests {
         let s = score_of(0.5);
         let at_t = |threshold| {
             Matcher::new(
-                vec![(pid("a"), Role::Owner, at(0.5, 1))],
+                vec![tpl(pid("a"), Role::Owner, at(0.5, 1))],
                 MatcherConfig {
                     threshold,
                     margin: 0.05,
@@ -403,12 +420,12 @@ mod tests {
         // default threshold 0.363 itself
         let d = MatcherConfig::default();
         assert_eq!((d.threshold, d.margin), (0.363, 0.05));
-        let just_below = Matcher::new(vec![(pid("a"), Role::Owner, at(0.362, 1))], d).unwrap();
+        let just_below = Matcher::new(vec![tpl(pid("a"), Role::Owner, at(0.362, 1))], d).unwrap();
         assert!(matches!(
             just_below.best(&query()),
             MatchResult::Stranger { .. }
         ));
-        let above = Matcher::new(vec![(pid("a"), Role::Owner, at(0.364, 1))], d).unwrap();
+        let above = Matcher::new(vec![tpl(pid("a"), Role::Owner, at(0.364, 1))], d).unwrap();
         assert!(matches!(above.best(&query()), MatchResult::Known { .. }));
     }
 
@@ -417,8 +434,8 @@ mod tests {
         // FR-ID-009: margin over second-best >= match_margin. Use the computed gap as margin.
         let pair = || {
             vec![
-                (pid("a"), Role::Owner, at(0.60, 1)),
-                (pid("b"), Role::Authorised, at(0.50, 2)),
+                tpl(pid("a"), Role::Owner, at(0.60, 1)),
+                tpl(pid("b"), Role::Authorised, at(0.50, 2)),
             ]
         };
         let (best, second) = match Matcher::new(
@@ -454,8 +471,8 @@ mod tests {
     fn identical_templates_for_two_people_are_ambiguous() {
         let m = Matcher::new(
             vec![
-                (pid("a"), Role::Owner, at(0.9, 1)),
-                (pid("b"), Role::Authorised, at(0.9, 1)),
+                tpl(pid("a"), Role::Owner, at(0.9, 1)),
+                tpl(pid("b"), Role::Authorised, at(0.9, 1)),
             ],
             MatcherConfig::default(),
         )
@@ -474,7 +491,12 @@ mod tests {
                 MatchResult::Stranger { best: 0.0 }
             }
         };
-        let one = |cfg| best(Matcher::new(vec![(pid("a"), Role::Owner, at(0.0, 1))], cfg));
+        let one = |cfg| {
+            best(Matcher::new(
+                vec![tpl(pid("a"), Role::Owner, at(0.0, 1))],
+                cfg,
+            ))
+        };
         // query is orthogonal to the template: a real stranger
         let r = one(MatcherConfig {
             threshold: f32::NAN,
@@ -486,8 +508,8 @@ mod tests {
         );
         let two = Matcher::new(
             vec![
-                (pid("a"), Role::Owner, at(0.50, 1)),
-                (pid("b"), Role::Authorised, at(0.50, 2)),
+                tpl(pid("a"), Role::Owner, at(0.50, 1)),
+                tpl(pid("b"), Role::Authorised, at(0.50, 2)),
             ],
             MatcherConfig {
                 threshold: 0.363,
@@ -502,7 +524,7 @@ mod tests {
     fn config_outside_bounds_is_refused() {
         let new = |threshold, margin| {
             Matcher::new(
-                vec![(pid("a"), Role::Owner, at(0.9, 1))],
+                vec![tpl(pid("a"), Role::Owner, at(0.9, 1))],
                 MatcherConfig { threshold, margin },
             )
         };
@@ -532,8 +554,8 @@ mod tests {
         let role_of = |first: Role, second: Role| {
             let m = Matcher::new(
                 vec![
-                    (pid("x"), first, at(0.9, 1)),
-                    (pid("x"), second, at(0.9, 2)),
+                    tpl(pid("x"), first, at(0.9, 1)),
+                    tpl(pid("x"), second, at(0.9, 2)),
                 ],
                 MatcherConfig::default(),
             );

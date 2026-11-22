@@ -18,11 +18,49 @@ pub const EMBEDDING_DIM: usize = 128;
 const SCHEMA: &str = include_str!("schema.sql");
 const SCHEMA_VERSION: u32 = 1;
 
-/// One decrypted template: owner, role and embedding (zeroised on drop).
-pub type DecryptedTemplate = (PersonId, Role, Zeroizing<Vec<f32>>);
+/// One decrypted template: owner, role and embedding (zeroised on drop). `Debug` prints only
+/// the embedding's length (NFR-PRIV-003).
+pub struct DecryptedTemplate {
+    pub person: PersonId,
+    pub role: Role,
+    pub embedding: Zeroizing<Vec<f32>>,
+}
 
-/// One template for [`Gallery::enrol`]: model id, pose, quality and embedding.
-pub type NewTemplate<'a> = (&'a str, Pose, f32, &'a [f32]);
+impl std::fmt::Debug for DecryptedTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecryptedTemplate")
+            .field("person", &self.person)
+            .field("role", &self.role)
+            .field(
+                "embedding",
+                &format_args!("<{} floats>", self.embedding.len()),
+            )
+            .finish()
+    }
+}
+
+/// One template for [`Gallery::enrol`]. `Debug` prints only the embedding's length.
+#[derive(Clone, Copy)]
+pub struct NewTemplate<'a> {
+    pub model_id: &'a str,
+    pub pose: Pose,
+    pub quality: f32,
+    pub embedding: &'a [f32],
+}
+
+impl std::fmt::Debug for NewTemplate<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewTemplate")
+            .field("model_id", &self.model_id)
+            .field("pose", &self.pose)
+            .field("quality", &self.quality)
+            .field(
+                "embedding",
+                &format_args!("<{} floats>", self.embedding.len()),
+            )
+            .finish()
+    }
+}
 
 /// UUID v4 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -169,20 +207,20 @@ impl Gallery {
         if role == Role::Owner && self.has_owner()? {
             return Err(IdentityError::OwnerExists);
         }
-        for (_, _, quality, embedding) in templates {
-            check_template(*quality, embedding)?;
+        for t in templates {
+            check_template(t.quality, t.embedding)?;
         }
         let blobs = templates
             .iter()
-            .map(|(_, _, _, e)| self.encrypt(e))
+            .map(|t| self.encrypt(t.embedding))
             .collect::<Result<Vec<_>>>()?;
         let phc = new_pin
             .map(|p| crate::pin::hash(p).map(Zeroizing::new))
             .transpose()?;
         let tx = self.conn.transaction()?;
         let id = insert_person(&tx, name, role)?;
-        for ((model_id, pose, quality, _), blob) in templates.iter().zip(&blobs) {
-            insert_template(&tx, &id, model_id, *pose, *quality, blob)?;
+        for (t, blob) in templates.iter().zip(&blobs) {
+            insert_template(&tx, &id, t.model_id, t.pose, t.quality, blob)?;
         }
         if let Some(phc) = &phc {
             store_pin(&tx, phc)?;
@@ -329,7 +367,11 @@ impl Gallery {
             if !emb.iter().all(|v| v.is_finite()) {
                 return Err(corrupt());
             }
-            out.push((person, role, emb));
+            out.push(DecryptedTemplate {
+                person,
+                role,
+                embedding: emb,
+            });
         }
         Ok(out)
     }
@@ -549,12 +591,12 @@ mod tests {
         g.add_template(&bob, MODEL, Pose::Left, 0.8, &eb).unwrap();
 
         let mut got = g.templates_for_model(MODEL).unwrap();
-        got.sort_by_key(|(_, role, _)| *role != Role::Owner);
+        got.sort_by_key(|t| t.role != Role::Owner);
         assert_eq!(got.len(), 2);
-        assert_eq!((&got[0].0, got[0].1), (&alice, Role::Owner));
-        assert_eq!(&got[0].2[..], &ea[..]);
-        assert_eq!((&got[1].0, got[1].1), (&bob, Role::Authorised));
-        assert_eq!(&got[1].2[..], &eb[..]);
+        assert_eq!((&got[0].person, got[0].role), (&alice, Role::Owner));
+        assert_eq!(&got[0].embedding[..], &ea[..]);
+        assert_eq!((&got[1].person, got[1].role), (&bob, Role::Authorised));
+        assert_eq!(&got[1].embedding[..], &eb[..]);
 
         let meta = g.templates(&bob).unwrap();
         assert_eq!(meta.len(), 1);
@@ -619,7 +661,7 @@ mod tests {
         assert_eq!(count(&g, "template"), 1);
         let left = g.templates_for_model(MODEL).unwrap();
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].0, bob);
+        assert_eq!(left[0].person, bob);
         assert!(matches!(
             g.remove_person(&alice),
             Err(IdentityError::NotFound)
@@ -639,7 +681,7 @@ mod tests {
 
         let got = g.templates_for_model(MODEL).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(&got[0].2[..], &embedding(0.2)[..]);
+        assert_eq!(&got[0].embedding[..], &embedding(0.2)[..]);
         assert!(g.templates_for_model("never-used").unwrap().is_empty());
         assert_eq!(g.model_ids_in_use().unwrap(), vec!["old-model", MODEL]);
     }
@@ -691,7 +733,7 @@ mod tests {
         );
         assert!(persons[0].created_at > 0);
         let got = g.templates_for_model(MODEL).unwrap();
-        assert_eq!(&got[0].2[..], &e[..]);
+        assert_eq!(&got[0].embedding[..], &e[..]);
     }
 
     fn stored_pin(g: &Gallery) -> String {
@@ -958,7 +1000,12 @@ mod tests {
         let poses = [Pose::Front, Pose::Left, Pose::Right, Pose::Up, Pose::Down];
         embs.iter()
             .enumerate()
-            .map(|(i, e)| (MODEL, poses[i % 5], 0.9, e.as_slice()))
+            .map(|(i, e)| NewTemplate {
+                model_id: MODEL,
+                pose: poses[i % 5],
+                quality: 0.9,
+                embedding: e.as_slice(),
+            })
             .collect()
     }
 
@@ -973,7 +1020,7 @@ mod tests {
         assert_eq!(g.templates(&id).unwrap().len(), 10);
         let back = g.templates_for_model(MODEL).unwrap();
         assert_eq!(back.len(), 10);
-        assert_eq!(back[3].2.as_slice(), embs[3].as_slice());
+        assert_eq!(back[3].embedding.as_slice(), embs[3].as_slice());
         assert!(g.verify_pin("2468").unwrap());
         // An authorised person needs no PIN argument and keeps the owner's PIN.
         g.enrol("Bob", Role::Authorised, None, &five_poses(&embs[..2]))
@@ -991,17 +1038,17 @@ mod tests {
         let cases: Vec<(Role, Option<&str>, Vec<NewTemplate<'_>>)> = vec![
             (Role::Owner, Some("2468"), {
                 let mut t = five_poses(&embs);
-                t[7].3 = &short;
+                t[7].embedding = &short;
                 t
             }),
             (Role::Owner, Some("2468"), {
                 let mut t = five_poses(&embs);
-                t[9].3 = &nan;
+                t[9].embedding = &nan;
                 t
             }),
             (Role::Owner, Some("2468"), {
                 let mut t = five_poses(&embs);
-                t[2].2 = 1.5;
+                t[2].quality = 1.5;
                 t
             }),
             (Role::Owner, Some("12"), five_poses(&embs)),
@@ -1030,5 +1077,25 @@ mod tests {
         assert_eq!(count(&g, "template"), 10);
         assert_eq!(g.persons().unwrap()[0].id, first);
         assert!(g.verify_pin("2468").unwrap() && !g.verify_pin("1357").unwrap());
+    }
+
+    #[test]
+    fn template_debug_redacts_embedding() {
+        let e = vec![0.123_456_f32; EMBEDDING_DIM];
+        let decrypted = DecryptedTemplate {
+            person: PersonId("p".into()),
+            role: Role::Owner,
+            embedding: Zeroizing::new(e.clone()),
+        };
+        let new = NewTemplate {
+            model_id: MODEL,
+            pose: Pose::Front,
+            quality: 0.9,
+            embedding: &e,
+        };
+        for s in [format!("{decrypted:?}"), format!("{new:?}")] {
+            assert!(!s.contains("0.123"), "{s}");
+            assert!(s.contains("<128 floats>"), "{s}");
+        }
     }
 }
