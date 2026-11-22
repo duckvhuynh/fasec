@@ -40,8 +40,9 @@ pub fn liveness_fits(frame_w: u32, frame_h: u32, bbox: RectF) -> bool {
     const SCALE: f32 = 2.7;
     const MIN_FRACTION: f32 = 0.9;
     let (bw, bh) = (bbox.w * frame_w as f32, bbox.h * frame_h as f32);
-    let cap = ((frame_h as f32 - 1.0) / bh).min((frame_w as f32 - 1.0) / bw);
-    cap >= SCALE * MIN_FRACTION
+    let min = SCALE * MIN_FRACTION;
+    // one comparison per side: `f32::min` would drop a NaN side, and `>=` is false for NaN
+    (frame_h as f32 - 1.0) / bh >= min && (frame_w as f32 - 1.0) / bw >= min
 }
 
 /// Head pose in degrees.
@@ -239,5 +240,15 @@ mod tests {
         assert!(!liveness_fits(1280, 720, b(297.0)));
         assert!(!liveness_fits(1280, 720, b(400.0)));
         assert!(!liveness_fits(1280, 720, b(f32::NAN)));
+        // one NaN side with the other small enough to fit
+        for (w, h) in [(f32::NAN, 0.1), (0.1, f32::NAN)] {
+            let nan = RectF {
+                x: 0.4,
+                y: 0.3,
+                w,
+                h,
+            };
+            assert!(!liveness_fits(1280, 720, nan), "{w} {h}");
+        }
     }
 }

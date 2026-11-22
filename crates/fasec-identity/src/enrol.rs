@@ -18,6 +18,13 @@ use crate::store::Pose;
 /// 2.2..9.7; the log-space midpoint of 48.7 and 9.7 is 21.7, rounded down to 20.
 pub const DEFAULT_MIN_SHARPNESS: f32 = 20.0;
 
+/// Cosine every new sample must reach against the L2-normalised mean of the accepted Front
+/// samples, an anchor a second person cannot move. Measured with SFace on the `.assets`
+/// portraits against the mean of face-a-1 and face-a-2: same person under flips and 0.5..0.8
+/// horizontal or vertical squashes (a stand-in for pose) 0.64..0.92; face-b-1 and its variants
+/// 0.10..0.25. 0.30 sits above every different-person value and under half the lowest same one.
+pub const MIN_FRONT_COSINE: f32 = 0.30;
+
 /// Accepted head-pose range in degrees, inclusive on both ends.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PoseWindow {
@@ -121,6 +128,8 @@ pub struct Enrolment {
     units: Vec<Zeroizing<Vec<f32>>>,
     /// (yaw, pitch) of each accepted Front sample.
     front: Vec<(f32, f32)>,
+    /// Sum of the accepted Front units; empty before the first Front sample.
+    front_sum: Zeroizing<Vec<f32>>,
 }
 
 impl Enrolment {
@@ -133,6 +142,7 @@ impl Enrolment {
             last_ts: None,
             units: Vec::new(),
             front: Vec::new(),
+            front_sum: Zeroizing::new(Vec::new()),
         }
     }
 
@@ -174,6 +184,16 @@ impl Enrolment {
                 // `judge` accepted exactly one track, with a pose
                 if let (Pose::Front, Some(hp)) = (want, report.tracks[0].head_pose) {
                     self.front.push((hp.yaw, hp.pitch));
+                }
+                if want == Pose::Front {
+                    if self.front_sum.is_empty() {
+                        self.front_sum.extend_from_slice(&unit);
+                    } else {
+                        self.front_sum
+                            .iter_mut()
+                            .zip(unit.iter())
+                            .for_each(|(s, u)| *s += u);
+                    }
                 }
                 self.last_ts = Some(te.ts_ms);
                 self.units.push(unit);
@@ -254,14 +274,17 @@ impl Enrolment {
     }
 
     /// Cosine of `unit` against its most similar accepted sample is at least the matcher's
-    /// acceptance threshold. The closest sample (not the mean) tolerates the pose change from
-    /// one side to the other; another person stays far below the threshold for every sample.
+    /// acceptance threshold, and against the Front mean at least `MIN_FRONT_COSINE`. The
+    /// closest sample tolerates the pose change from one side to the other; the Front floor
+    /// stops a chain where each sample only resembles the one before it.
     fn like_accepted(&self, unit: &[f32]) -> bool {
-        self.units.iter().any(|u| {
-            let cos: f32 = u.iter().zip(unit).map(|(a, b)| a * b).sum();
-            // `>=` is false for NaN
-            u.len() == unit.len() && cos >= DEFAULT_THRESHOLD
-        })
+        // `>=` is false for NaN
+        let at_least = |u: &[f32], min: f32| {
+            u.len() == unit.len() && u.iter().zip(unit).map(|(a, b)| a * b).sum::<f32>() >= min
+        };
+        let near_front = self.front_sum.is_empty()
+            || normalised(&self.front_sum).is_some_and(|m| at_least(&m, MIN_FRONT_COSINE));
+        near_front && self.units.iter().any(|u| at_least(u, DEFAULT_THRESHOLD))
     }
 
     /// All samples, in target order; an error unless every pose has its samples.
@@ -1127,5 +1150,103 @@ mod tests {
         assert_eq!(offer_at(&mut e, ts + 7, 54.0, 10.0), wrong(Pose::Right));
         assert_eq!(offer_at(&mut e, ts + 8, 53.0, 10.0), accepted(Pose::Right));
         assert_eq!(e.current_target(), Some(Pose::Up));
+    }
+
+    /// Unit embedding with `parts` on axes 0.. and the remainder on the next axis.
+    fn emb_on(ts_ms: u64, parts: &[f32]) -> TrackEmbedding {
+        let mut v = vec![0.0f32; 128];
+        v[..parts.len()].copy_from_slice(parts);
+        v[parts.len()] = (1.0 - parts.iter().map(|x| x * x).sum::<f32>())
+            .max(0.0)
+            .sqrt();
+        TrackEmbedding {
+            track: TrackId(1),
+            ts_ms,
+            embedding: Embedding::from(v),
+        }
+    }
+
+    fn offer_emb(e: &mut Enrolment, yaw: f32, te: &TrackEmbedding) -> SampleVerdict {
+        e.offer(
+            &frame(te.ts_ms, true),
+            &report(te.ts_ms, vec![track(1, yaw, 0.0)]),
+            Some(te),
+        )
+    }
+
+    /// Two Front samples along axis 0.
+    fn fronted() -> Enrolment {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        for ts in [1, 2] {
+            assert_eq!(
+                offer_emb(&mut e, 0.0, &emb_on(ts, &[1.0])),
+                accepted(Pose::Front)
+            );
+        }
+        e
+    }
+
+    #[test]
+    fn a_chain_drifting_from_the_front_samples_is_rejected() {
+        let mut e = fronted();
+        // c1: cosine 0.4 to the Front samples
+        let c1 = emb_on(3, &[0.4]);
+        assert_eq!(offer_emb(&mut e, -25.0, &c1), accepted(Pose::Left));
+        // c2: cosine 0.4 to c1 (enough for the closest-sample rule alone) but 0.1 to Front
+        let b = (0.4 - 0.1 * 0.4) / (1.0f32 - 0.16).sqrt();
+        let c2 = emb_on(4, &[0.1, b]);
+        let cos = |x: &TrackEmbedding, y: &TrackEmbedding| -> f32 {
+            x.embedding
+                .as_slice()
+                .iter()
+                .zip(y.embedding.as_slice())
+                .map(|(a, b)| a * b)
+                .sum()
+        };
+        assert!((cos(&c1, &c2) - 0.4).abs() < 1e-4);
+        assert_eq!(
+            offer_emb(&mut e, -25.0, &c2),
+            SampleVerdict::Rejected(RejectReason::DifferentPerson)
+        );
+        assert_eq!(e.progress(), (3, 10));
+    }
+
+    #[test]
+    fn a_side_pose_at_the_front_floor_passes() {
+        let mut e = fronted();
+        assert_eq!(
+            offer_emb(&mut e, -25.0, &emb_on(3, &[0.5])),
+            accepted(Pose::Left)
+        );
+        // both are 0.6 to the first Left sample; only the Front cosine differs
+        let side = |ts: u64, front: f32| {
+            let b = (0.6 - 0.5 * front) / (0.75f32).sqrt();
+            emb_on(ts, &[front, b])
+        };
+        assert_eq!(
+            offer_emb(&mut e, -25.0, &side(4, MIN_FRONT_COSINE - 0.01)),
+            SampleVerdict::Rejected(RejectReason::DifferentPerson)
+        );
+        assert_eq!(
+            offer_emb(&mut e, -25.0, &side(5, MIN_FRONT_COSINE + 0.01)),
+            accepted(Pose::Left)
+        );
+    }
+    #[test]
+    fn the_floor_is_against_the_mean_of_the_front_samples() {
+        let mut e = Enrolment::new(EnrolConfig::default());
+        assert_eq!(
+            offer_emb(&mut e, 0.0, &emb_on(1, &[1.0])),
+            accepted(Pose::Front)
+        );
+        assert_eq!(
+            offer_emb(&mut e, 0.0, &emb_on(2, &[0.6])),
+            accepted(Pose::Front)
+        );
+        // 0.25 to the first Front sample, 0.47 to the second, 0.40 to their mean
+        assert_eq!(
+            offer_emb(&mut e, -25.0, &emb_on(3, &[0.25, 0.4])),
+            accepted(Pose::Left)
+        );
     }
 }
