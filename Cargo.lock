@@ -1448,6 +1448,7 @@ name = "fasec-identity"
 version = "0.0.1"
 dependencies = [
  "argon2",
+ "fasec-core",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.21",
