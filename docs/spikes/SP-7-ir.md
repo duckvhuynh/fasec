@@ -42,7 +42,138 @@ Checks, one table row each:
 
 ## Decision
 
-_(empty, to be filled in after the results)_
+Decided 2026-11-22 (Task 7) from recordings of the owner on the dev machine (below). One
+subject, one device, one room. Only numbers are kept here: the recordings stay on that PC.
+
+**IR is read with `SharedReadOnly`, and IR liveness is on by default (`[liveness] ir =
+"prefer"`).** The thresholds in `IrLivenessConfig::default()` are set from the table below. Each
+constant's comment names the measurement it came from.
+
+### Recordings and method
+
+`ir_debug --record <label>` on the ASUS laptop (RGB 1280×720, IR 640×360 lit frames, about 2.2
+recorded steps/s in a debug build). Labels: `real-30cm`, `real-50cm`, `real-80cm`, `real-turning`
+(2 sessions), `phone-photo` (2 sessions), `phone-video` (1 session). No monitor and no printed
+photo were recorded: the owner has no printer, and the monitor case was not recorded.
+
+Each session was replayed with `fasec-replay run --ir-input <dir> --ep cpu`. The cues are those
+of the trusted frames, that is from the fifth lit frame on, once the IR↔RGB mapping is learned.
+"(rgb, ir)" counts RGB tracks and IR faces per frame.
+
+Cues before tuning (placeholder thresholds: relief ≥ 1.15 for Live):
+
+| label | IR verdicts | RGB MiniFASNet | face_vs_bg min-med-max | relief | lit_face | lit_bg | (rgb, ir) |
+|---|---|---|---|---|---|---|---|
+| real-30cm | 17 FlatRefl, 5 Unknown | 15 Spoof, 7 Unknown | 2.31-2.35-2.61 | 0.87-0.90-0.91 | 109-117-126 | 46-49-52 | (1,1)×22 |
+| real-50cm | 17 FlatRefl, 4 Unknown | 17 Spoof, 4 Live | 2.07-2.10-2.13 | 0.83-0.84-0.85 | 126-128-130 | 60-61-62 | (1,1)×21 |
+| real-80cm | 13 FlatRefl, 4 Unknown | 17 Spoof | 1.72-1.74-1.76 | 0.81-0.82-0.84 | 128-129-133 | 74-74-76 | (1,1)×17 |
+| real-turning a | 11 FlatRefl, 4 Unknown | 9 Spoof, 6 Unknown | 2.01-2.08-2.34 | 0.83-0.86-0.91 | 129-133-137 | 57-62-68 | (1,1)×15 |
+| real-turning b | 15 Unknown (never trusted) | 12 Live | n/a | n/a | | | (1,1)×15 |
+| phone-photo b | 26 Unknown (untrusted) | 26 Spoof | n/a | | | | (1,0)×24 |
+| phone-video | 22 Unknown (untrusted) | 22 Spoof | n/a | | | | (1,0)×22 |
+
+- The unlit (ambient) frame was blank on every recorded frame, so `lit_minus_ambient` and the
+  self-emission cue were never measured.
+- Glints were 0–2 per frame on real faces, so they do not separate anything here.
+- A phone shows a face to RGB and none to IR. Replayed alone, a phone session never trusts the
+  mapping, since that needs a face on both cameras. So the phone case is measured after a real
+  session through one pipeline (below), as it happens live: trust is earned on the owner and
+  then the phone is held up.
+- On this camera the nose reads darker than the cheeks (relief 0.81–0.91). The assumption that
+  the nose is brighter (relief ≥ 1.15) was wrong here, so every real face was called flat.
+
+### Owner decisions
+
+- **D1, IR overrides RGB.** MiniFASNet called the real owner `Spoof` on most frames at laptop
+  distance. So IR `Live` now beats an RGB `Spoof` (result `Live`, tier `Ir`). This is the bar
+  Windows Hello holds since CVE-2025-26644: an IR face that looks live plus an RGB camera that
+  sees the same face. IR alone still never gives `Live`: fusion runs per RGB track. With IR
+  unknown, absent, untrusted, stale or unhealthy, the RGB verdict still decides, `Spoof`
+  included. An IR `Spoof` (3 lit frames in a row) still beats everything.
+  - *Residual risk:* a screen that emits the owner's NIR image as well as a visible face. The
+    self-emission cue that should catch it needs a usable ambient frame, and this laptop blanks
+    every one.
+- **D2, relief from real faces only.** Live needs relief in `[0.70, 0.97]`.
+  - Relief above 0.97 is `Spoof(FlatReflectance)`. This rule is meant for a flat print, which
+    should read about 1.0. **It is not verified against a printed photo, since none was
+    recorded.**
+  - Relief below 0.70 is `Unknown`.
+  - The other thresholds keep their values, with margin:
+    - `face_vs_background ≥ 1.5`: real minimum 1.72, at 80 cm.
+    - `max_background 100`: real maximum 76.
+    - `min_lit_face 20`: real minimum 109.
+  - `min_emitter_fraction` and `self_emit_contrast` stay unmeasured placeholders.
+
+### Result after tuning
+
+From the ignored test `exit_criteria_on_the_owner_recordings` (`fasec-replay`, CPU EP, debug
+build). Its output is copied below.
+
+**Real face.** Each session was replayed alone. Counts are tracks on trusted frames, that is
+after the 4-frame warm-up.
+
+| label | trusted tracks | Live, tier Ir |
+|---|---|---|
+| real-30cm | 17 | 17 (100 %) |
+| real-50cm | 17 | 17 (100 %) |
+| real-80cm | 13 | 13 (100 %) |
+| real-turning (2 sessions) | 11 + 0 | 11 (100 %) |
+
+- Replayed alone, real-turning session b never trusts the IR mapping, so it stays on the RGB
+  tier (12 RGB Live). The cause was not measured: the IR face box is not logged when it is not
+  matched.
+- Replayed after real-50cm through one pipeline, the same session is Live on tier Ir on 13 of 15
+  frames. One frame is RGB Spoof: IR gave a single FlatReflectance frame, under the 3-frame
+  streak. One frame is RGB Live.
+
+**Phone.** Each phone session was replayed after each real session, through one pipeline. Trust
+is earned on the owner first, as it would be live. Counts are tracks of the phone session from
+the 3rd trusted frame with a face, so that the spoof streak can be met.
+
+| label | tracks (4 predecessors) | Spoof (fused) | of which IR evidence Spoof |
+|---|---|---|---|
+| phone-photo (session b) | 92 (23 distinct frames × 4) | 92 (100 %) | 22 (23.9 %) |
+| phone-video | 80 (20 × 4) | 80 (100 %) | 27 (33.8 %) |
+
+- When the predecessor is real-turning session b, the phone sessions add nothing: no trust was
+  earned.
+- Phone-photo session a (8 steps) is left out of the criterion, because the owner's real face is
+  in view during it. Its first 5 steps show an IR face with live cues at the real-50cm box, and a
+  second large face with live IR cues appears later. Replayed after real-50cm, it reads Live on
+  tier Ir for the owner's track, and the small phone face is RGB Spoof.
+- **IR catches the phone on only a quarter to a third of its frames. MiniFASNet catches the
+  rest.**
+  - With trust earned, the IR verdict on the phone track is NoIrFace on 13 of 26 frames
+    (photo, after real-50cm) and 16 of 22 (video).
+  - Most other frames read `Unknown`. A phone held close reflects the emitter, so the
+    background ring under the mapped box reads `lit_background` 100–255, against a real-face
+    maximum of 76. The flood rule (`> 100` → `Unknown`) then fires before NoIrFace.
+  - Those Unknown frames, and new RGB track ids as the phone moves, keep breaking the 3-frame
+    streak.
+  - Under D1 the RGB verdict decides while IR is Unknown. So a phone that fooled MiniFASNet and
+    also flooded the ring would pass as RGB Live. This is the open item below.
+
+### In ISO/IEC 30107-3 terms
+
+Frame-level rates, one subject and one device. The counts above come from overlapping replays, so
+the distinct frame counts are given here.
+
+- **BPCER** (bona fide presentations classified as attacks), on trusted frames of the real
+  sessions replayed alone: 0 of 58.
+  - real-turning session b replayed after real-50cm: 1 of 15. That frame was RGB Spoof while IR
+    was below its streak.
+- **APCER, phone photo (session b):** 0 of 23 distinct frames accepted as Live. IR evidence
+  alone called a spoof on 22 of 92 frame-replays (24 %).
+- **APCER, phone video:** 0 of 20 distinct frames accepted as Live. IR alone: 27 of 80 (34 %).
+- **Open item:** IR alone does not yet hold the phone. The flood check reads the ring around the
+  mapped box, so a phone close to the emitter looks like sunlight. Telling a local reflection
+  apart from a flooded scene needs a frame-wide flood measure, and that is a design decision for
+  the owner.
+
+Not measured, so no claim is made:
+- printed photo, monitor, NIR-emitting screen, mask;
+- other subjects, other cameras, strong sunlight;
+- attempt-level (per presentation) rates. The rates above count frames.
 
 ## Observed on dev machine (2026-11-21, by the implementer)
 
@@ -148,3 +279,8 @@ What this shows:
   through nokhwa/MF (see SP-5).
 - Not tested here: interaction with Windows Hello itself (checks 2 and 3), and whether the
   0.0 frames are truly all zeros (only the mean was computed).
+- **Correction (Tasks 1 and 7):** they are not all zeros. The unlit frames are near-black, with
+  mean ≈ 0.00 and a maximum pixel of 1–4 (Task 1). "Mean 0.0" was rounded to one decimal.
+  `fasec_vision::ir::ambient_is_blank` (mean < 1 and 99th percentile ≤ 8) detects them;
+  `IrFrame::is_blank` (every pixel 0) does not. In the Task 7 recordings every unlit frame was
+  blank in this sense.

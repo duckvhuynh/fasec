@@ -15,7 +15,7 @@
 **Spec:** `docs/SRS.md` §4.3 (FR-LV-001…006), §5.1, §7.1–7.4; `docs/ROADMAP.md` §M7; `docs/spikes/SP-7-ir.md`; **`docs/research/liveness-landscape.md`** (how Windows Hello, Face ID, Android and the PAD literature do it — read its Summary first).
 
 **Design decisions taken from the research (binding):**
-- Windows Hello is 2D NIR with alternating lit/unlit IR, and since April 2025 (CVE-2025-26644, "Red Bleed" NIR-emitting LCD replay) it also requires the RGB camera to see the face. So in fasec **IR alone never yields `Live`**: `Live` (tier `Ir`) needs IR cues live **and** a geometrically consistent RGB face whose RGB verdict is not `Spoof`. An IR `Spoof` overrides any RGB `Live`.
+- Windows Hello is 2D NIR with alternating lit/unlit IR, and since April 2025 (CVE-2025-26644, "Red Bleed" NIR-emitting LCD replay) it also requires the RGB camera to see the face. So in fasec **IR alone never yields `Live`**: `Live` (tier `Ir`) needs IR cues live **and** a geometrically consistent RGB face whose RGB verdict is not `Spoof`. An IR `Spoof` overrides any RGB `Live`. *Changed in Task 7 (owner decision D1, see SP-7):* IR `Live` now also overrides an RGB `Spoof`, because MiniFASNet called the real owner `Spoof` on most recorded frames; the RGB face is still required, and with IR absent the RGB verdict decides.
 - No depth / 3D now (Hello and Android Class 3 phones reach their bar without it; Windows laptops lack depth sensors). Depth stays a P2 plugin via `MediaFrameSourceKind::Depth`.
 - ESS is on for the dev laptop yet SharedReadOnly IR reads work while Hello is idle; behaviour during an active Hello sign-in is unknown → an IR stall is `Lost` and the RGB tier takes over.
 - No permissively licensed RGB+IR anti-spoof model exists (all trained on research-only datasets) → hand-built cues now; a small model trained on the owner's opt-in recordings is a later option.
@@ -46,6 +46,8 @@
 
 ### Task 0 (resolved by measurement): unlit frames are blanked on the dev laptop
 SP-7 measured mean 0.0 on every unlit Gray8 frame; u8 pixels are non-negative, so every unlit pixel is 0 — the driver blanks them. Task 3's lit−unlit cue must detect an all-zero unlit frame at runtime and switch itself off (other devices may deliver real ambient frames), so on this laptop the decision rests on the lit-frame cues plus RGB↔IR consistency.
+
+*Correction (Tasks 1 and 7):* the unlit frames are near-black, not all-zero: mean ≈ 0.00 with a maximum pixel of 1–4 (Task 1). "Mean 0.0" was rounded to one decimal. The blank check is `ambient_is_blank` (mean < 1 and 99th percentile ≤ 8), not `IrFrame::is_blank`.
 
 ### Task 1: IR capture in `fasec-camera`
 
