@@ -45,6 +45,8 @@ jobs:
           cargo test
           -p fasec-core -p fasec-config -p fasec-vision -p fasec-identity
           -p fasec-policy -p fasec-models -p fasec-replay
+      # fasec-platform's non-Windows stub and its `identity` adapter must compile.
+      - run: cargo check -p fasec-platform --features identity
 
   deny:
     runs-on: ubuntu-latest
